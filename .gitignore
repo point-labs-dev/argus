@@ -1,0 +1,19 @@
+node_modules/
+dist/
+.env
+*.log
+.DS_Store
+
+# go2rtc binary
+go2rtc
+
+# Recording storage
+recordings/
+
+# SQLite
+*.db
+*.db-journal
+*.db-wal
+
+# HomeKit persistence
+.homekit/
