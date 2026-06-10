@@ -8,7 +8,8 @@
     "node": ">=20.0.0"
   },
   "bin": {
-    "argus": "./dist/cli.js"
+    "argus": "./dist/cli.js",
+    "argus-serve": "./dist/serve.js"
   },
   "exports": {
     ".": "./dist/index.js"
@@ -16,9 +17,11 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "dev": "tsx src/cli.ts",
+    "serve": "tsx src/serve.ts",
     "test": "vitest run"
   },
   "dependencies": {
+    "hap-nodejs": "^0.14.3",
     "yaml": "^2.8.1",
     "zod": "^4.1.12"
   },

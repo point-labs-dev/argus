@@ -8,7 +8,10 @@
     "strict": true,
     "declaration": true,
     "sourceMap": true,
-    "verbatimModuleSyntax": true,
+    // hap-nodejs ships ambient `const enum`s (SRTPCryptoSuites, H264Profile, …)
+    // which are incompatible with verbatimModuleSyntax (TS2748). Our own code
+    // keeps using explicit `import type`, so this only relaxes enforcement.
+    "verbatimModuleSyntax": false,
     "resolveJsonModule": true,
     "esModuleInterop": false,
     "forceConsistentCasingInFileNames": true,

@@ -35,3 +35,16 @@ export type { SnapshotHttpServerOptions } from "./snapshot-http-server.js";
 export { createSnapshotHttpServer } from "./snapshot-http-server.js";
 export type { CachedSnapshot, SnapshotCacheOptions, SnapshotProfile } from "./snapshot-cache.js";
 export { SnapshotCache, SnapshotCacheError } from "./snapshot-cache.js";
+export type {
+  CameraAccessoryHandle,
+  LiveFfmpegInput,
+  StreamingDelegateOptions,
+} from "./homekit.js";
+export {
+  ArgusStreamingDelegate,
+  buildCameraControllerOptions,
+  buildLiveFfmpegArgs,
+  createCameraAccessory,
+} from "./homekit.js";
+export type { ArgusServer } from "./serve.js";
+export { startArgusServer } from "./serve.js";
