@@ -408,11 +408,14 @@ export function buildCameraControllerOptions(
           profiles: [H264Profile.BASELINE, H264Profile.MAIN, H264Profile.HIGH],
           levels: [H264Level.LEVEL3_1, H264Level.LEVEL3_2, H264Level.LEVEL4_0],
         },
+        // Capped to <=640x480 for live view: large (720p+) keyframes burst into
+        // many UDP packets that WiFi clients drop, leaving an undecodable frame
+        // (spinner). Low-res keyframes are small enough to arrive intact. HKSV
+        // recording can use the full-res main stream later.
         resolutions: [
-          [1920, 1080, 30],
-          [1280, 720, 30],
           [640, 480, 30],
           [640, 360, 30],
+          [480, 270, 30],
           [320, 240, 15],
         ],
       },

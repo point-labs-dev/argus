@@ -102,7 +102,9 @@ describe("buildCameraControllerOptions", () => {
     expect(opts.cameraStreamCount).toBe(2);
     expect(opts.streamingOptions.supportedCryptoSuites).toContain(0); // AES_CM_128_HMAC_SHA1_80
     const resolutions = opts.streamingOptions.video.resolutions.map((r) => `${r[0]}x${r[1]}`);
-    expect(resolutions).toContain("1280x720");
+    // Live view is capped at <=640x480 for WiFi reliability (large keyframes drop).
+    expect(resolutions).toContain("640x480");
+    expect(resolutions.some((r) => r.startsWith("1280"))).toBe(false);
     expect(opts.streamingOptions.audio?.codecs?.[0]?.type).toBe("OPUS");
   });
 });
