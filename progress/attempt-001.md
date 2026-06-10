@@ -113,9 +113,21 @@ quality (replace Reolink's noisy AI with Apple HKSV), not recording.
 - 27 tests green (+5). Verified: runtime accessory construction; real-camera H.264+Opus
   transcode (~6× realtime). NOT yet verified on-device (needs Peter to pair in Home app).
 
+### Live-view bug found + fixed on first on-device test (commit 789f70b)
+Peter paired Garage Door; snapshot showed but live view spun forever → "No Response."
+Reproduced locally (0 SRTP packets from the exact serve FFmpeg command). Root cause:
+**FFmpeg's default RTSP stream analysis (~5s) ran past HomeKit's stream-start window**, so
+no packets reached the device. Fix = low-latency INPUT flags before `-i`
+(`-fflags nobuffer -flags low_delay -probesize 500000 -analyzeduration 1000000`).
+Verified on the real Garage Door camera: 0 → 210 video + 128 audio SRTP packets.
+Also added FFmpeg stderr logging (was silent — the reason we were blind), a single-callback
+guard, early-exit failure reporting, and HomeKit keyframe flags. Debug method that worked:
+bind a local UDP socket, run the generated FFmpeg command targeting it, count packets +
+read verbose stderr — isolates FFmpeg/SRTP from device negotiation without a phone.
+
 ### Next attempt
-1. **On-device pairing** (Peter): `npm run serve` → add each camera in Home app via pair
-   code → confirm live view + snapshot. This validates the SRTP path end-to-end.
+1. **On-device re-test** (Peter): rebuild + restart `serve` (pairing persists in `.homekit/`,
+   no re-pair needed) → tap Garage Door → live view should now play. Validates SRTP end-to-end.
 2. **Motion events** → HAP MotionSensor (Reolink API poll; direct for standalone, via NVR
    for the 3 D-series).
 3. **HKSV** — the payoff: prebuffer → IDR-aligned fMP4 (main stream, transcode H.265) →
