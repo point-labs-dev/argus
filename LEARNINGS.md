@@ -44,3 +44,15 @@
 - Tiered retention: continuous → motion → alerts (separate day counts)
 - Emergency pruning when disk < 1hr remaining
 - This is the proven pattern — we adopt it directly
+
+## 2026-04-25 — Current Best-Practice Refresh
+
+### Reolink Stream Transport
+- Keep go2rtc as the stream proxy, but make Reolink HTTP-FLV the default input path.
+- Current Frigate Reolink guidance favors HTTP-FLV for many Reolink cameras and NVR channels because RTSP can be inconsistent across models/hardware generations.
+- Keep RTSP as a first-class fallback and for cases where two-way audio needs go2rtc-native RTSP handling.
+- Generate channel numbers carefully: HTTP-FLV uses zero-based `channel0_*`; RTSP URLs use one-based `Preview_01_*`.
+
+### Implementation Order
+- Do not start with HKSV. First prove the stream spine: one camera → go2rtc health → cached snapshots → raw 1-minute MP4 segments → SQLite metadata → `ffprobe` verification.
+- HKSV remains the hardest integration point because it requires strict fMP4, IDR alignment, correct HomeKit services, and 4s+ prebuffer. It should sit on top of a stable stream/recording layer, not be the first milestone.

@@ -21,15 +21,15 @@ A reliable, open-source camera platform that does three things well:
 ```
 ┌─────────────────────────────────────────────────────┐
 │                    Reolink Cameras                    │
-│              (RTSP + Reolink HTTP API)               │
+│     (HTTP-FLV primary + RTSP fallback + HTTP API)     │
 └──────────────────────┬──────────────────────────────┘
                        │
 ┌──────────────────────▼──────────────────────────────┐
 │              go2rtc (Go binary)                       │
-│  • Single RTSP connection per camera                  │
+│  • Single upstream stream per camera/profile          │
 │  • Rebroadcast to N consumers                         │
 │  • WebRTC for browser live view                       │
-│  • Protocol conversion (RTSP→WebRTC, HLS, MP4)       │
+│  • Protocol conversion (HTTP-FLV/RTSP→WebRTC/HLS/MP4)│
 │  • Zero-copy passthrough when codecs match            │
 └──────────┬───────────┬───────────┬──────────────────┘
            │           │           │
@@ -42,10 +42,11 @@ A reliable, open-source camera platform that does three things well:
 ### Component Breakdown
 
 **go2rtc** (external Go binary)
-- Stream proxy — one connection to camera, unlimited consumers
+- Stream proxy — one upstream stream per camera/profile, unlimited consumers
 - Prebuffer for instant stream startup
 - WebRTC server for browser live view
-- H.265→H.264 transcoding when needed (via FFmpeg)
+- HTTP-FLV and RTSP ingestion; Reolink HTTP-FLV is the default because current Frigate guidance reports better Reolink stability than raw RTSP on many models/NVR setups
+- H.265→H.264 transcoding when needed (via FFmpeg, hardware-accelerated when available)
 - Battle-tested (used by Frigate, Home Assistant, thousands of deployments)
 
 **Argus Core** (TypeScript + Effect.ts)
@@ -61,7 +62,7 @@ A reliable, open-source camera platform that does three things well:
 
 | Choice | Rationale |
 |---|---|
-| **go2rtc** | Industry-standard stream proxy. Replaces Scrypted's 1500-line prebuffer plugin with a single binary. Already handles RTSP, WebRTC, HLS, codec negotiation. |
+| **go2rtc** | Industry-standard stream proxy. Replaces Scrypted's 1500-line prebuffer plugin with a single binary. Handles HTTP-FLV, RTSP, WebRTC, HLS, codec negotiation, and FFmpeg handoff. |
 | **TypeScript** | HAP-NodeJS (only mature HKSV implementation) is Node.js. Staying in one language for everything above the stream layer. |
 | **Effect.ts** | Typed errors for dozens of failure modes. Structured concurrency for camera lifecycle management. Resource safety (Scope) for stream cleanup. Retry/backoff/circuit breaker primitives. "Rust-like reliability in TypeScript." |
 | **HAP-NodeJS** | Only library with working HomeKit camera streaming + HKSV. 10+ years of battle-testing via Homebridge ecosystem. |
@@ -108,7 +109,7 @@ A reliable, open-source camera platform that does three things well:
 - **macOS + Linux** target platforms (Mac mini, Raspberry Pi, NAS, Docker)
 - **Apple Home Hub required** for HKSV (Apple TV or HomePod on same subnet)
 - **mDNS required** — HomeKit discovery relies on it. No VLAN isolation between Argus and Home Hub without mDNS reflector.
-- **H.264 required for HomeKit** — Cameras should be configured for H.264 main stream, or go2rtc transcodes H.265→H.264.
+- **H.264 required for HomeKit** — Cameras should be configured for H.264 when possible, or go2rtc/FFmpeg transcodes H.265→H.264 only for HomeKit paths.
 - **No cloud dependency** — Everything runs locally. No accounts, no subscriptions, no phone-home.
 
 ## HKSV Specification (from reverse-engineering)
@@ -132,11 +133,11 @@ Based on the [unofficial HKSV spec](https://github.com/Supereg/secure-video-spec
 
 ## Reolink Camera Capabilities
 
-Features to integrate via Reolink HTTP API + RTSP:
+Features to integrate via Reolink HTTP API + go2rtc-managed streams:
 
 | Feature | API | HomeKit Mapping |
 |---|---|---|
-| Live streaming | RTSP (via go2rtc) | Camera RTP stream |
+| Live streaming | HTTP-FLV primary / RTSP fallback (via go2rtc) | Camera RTP stream |
 | Motion detection | Reolink API events | MotionSensor service |
 | Person/vehicle/pet detection | Reolink AI events | HKSV event classification |
 | Two-way audio | RTSP + Reolink audio API | HomeKit audio backchannel |
@@ -153,7 +154,7 @@ Features to integrate via Reolink HTTP API + RTSP:
 ### MVP (v0.1)
 Ship the core loop: cameras appear in Apple Home, streams work, HKSV records, local NVR saves footage.
 
-- [ ] go2rtc integration (stream proxy + WebRTC)
+- [ ] go2rtc integration (HTTP-FLV-first stream proxy + RTSP fallback + WebRTC)
 - [ ] Reolink camera discovery and configuration
 - [ ] HomeKit live streaming (SRTP via HAP-NodeJS)
 - [ ] HKSV recording pipeline (motion → fMP4 → HomeKit Data Stream)
@@ -168,6 +169,18 @@ Ship the core loop: cameras appear in Apple Home, streams work, HKSV records, lo
 - [ ] Graceful reconnection + startup recovery
 - [ ] YAML configuration
 - [ ] CLI for setup and management
+
+### First Implementation Slice
+Before tackling HomeKit/HKSV, prove the camera spine with one real camera:
+
+- [ ] Load validated YAML config
+- [ ] Generate HTTP-FLV-first go2rtc config with RTSP fallback URLs
+- [ ] Start/supervise go2rtc and query stream health
+- [ ] Capture and cache JPEG snapshots under 200ms response time
+- [ ] Record raw 1-minute MP4 segments without re-encoding
+- [ ] Write segment metadata to SQLite
+- [ ] Run a minimal retention/emergency-prune pass
+- [ ] Verify output with `ffprobe`
 
 ### v0.2
 Reolink-native features + better UX.
@@ -231,13 +244,15 @@ argus/
 
 3. **Effect.ts for reliability** — Camera systems have dozens of concurrent failure modes. Effect gives us typed errors, structured concurrency (Fibers for camera lifecycles), resource safety (Scope for stream cleanup), and built-in retry/backoff. The "Rust-like reliability in TypeScript" argument is real for this use case.
 
-4. **No re-encoding for NVR** — Record raw camera streams directly. H.264/H.265 as-is from the camera. Saves CPU, preserves quality. Only transcode for HomeKit if camera outputs H.265.
+4. **HTTP-FLV-first for Reolink, RTSP fallback** — Current Frigate/Reolink practice favors HTTP-FLV for many Reolink cameras and NVR channels because it is often more stable than RTSP. Argus should generate both URL styles and fall back cleanly. Important channel mismatch: HTTP-FLV uses zero-based `channel0`, while Reolink RTSP URLs use one-based `Preview_01`.
 
-5. **Reolink-only scope** — Deep integration with one brand beats shallow integration with many. We can handle firmware quirks, model-specific capabilities, and API edge cases properly. Expand to other brands one at a time in the future.
+5. **No re-encoding for NVR** — Record raw camera streams directly. H.264/H.265 as-is from the camera. Saves CPU, preserves quality. Only transcode for HomeKit if camera outputs H.265.
 
-6. **Snapshot caching** — The #1 UX improvement over Homebridge camera plugins. Warm snapshots served instantly instead of spawning FFmpeg on every Home app request.
+6. **Reolink-only scope** — Deep integration with one brand beats shallow integration with many. We can handle firmware quirks, model-specific capabilities, and API edge cases properly. Expand to other brands one at a time in the future.
 
-7. **HKSV over local analysis** — Apple Home Hub (Apple TV/HomePod) does person/vehicle/package detection on-device. We don't need to run ML models. We just need to deliver clean fMP4 fragments with correct IDR alignment.
+7. **Snapshot caching** — The #1 UX improvement over Homebridge camera plugins. Warm snapshots served instantly instead of spawning FFmpeg on every Home app request.
+
+8. **HKSV over local analysis** — Apple Home Hub (Apple TV/HomePod) does person/vehicle/package detection on-device. We don't need to run ML models. We just need to deliver clean fMP4 fragments with correct IDR alignment.
 
 ## References
 

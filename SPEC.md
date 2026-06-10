@@ -2,7 +2,7 @@
 
 ## Overview
 
-Argus connects Reolink IP cameras to Apple HomeKit with live streaming, HomeKit Secure Video (HKSV) recording, and local NVR recording. It uses go2rtc as the stream proxy and HAP-NodeJS for HomeKit integration.
+Argus connects Reolink IP cameras to Apple HomeKit with live streaming, HomeKit Secure Video (HKSV) recording, and local NVR recording. It uses go2rtc as the stream proxy and HAP-NodeJS for HomeKit integration. For Reolink streams, Argus defaults to HTTP-FLV via go2rtc with RTSP as a fallback.
 
 ## System Behavior
 
@@ -13,12 +13,13 @@ When Argus starts:
 2. Start go2rtc as a managed child process with generated config
 3. For each configured camera:
    a. Probe camera via Reolink HTTP API (model, firmware, capabilities)
-   b. Verify RTSP stream is accessible via go2rtc
-   c. Start snapshot cache (grab frame every 5 seconds from go2rtc)
-   d. Create standalone HAP accessory (own mDNS + TCP port)
-   e. Expose: Camera, MotionSensor, CameraOperatingMode, CameraEventRecordingManagement
-   f. Start NVR recording (raw RTSP → MP4 segments via go2rtc)
-   g. Start motion event listener (Reolink API polling or ONVIF events)
+   b. Generate HTTP-FLV primary and RTSP fallback stream definitions for go2rtc
+   c. Verify stream accessibility via go2rtc health/API endpoints
+   d. Start snapshot cache (grab frame every 5 seconds from go2rtc)
+   e. Create standalone HAP accessory (own mDNS + TCP port)
+   f. Expose: Camera, MotionSensor, CameraOperatingMode, CameraEventRecordingManagement
+   g. Start NVR recording (raw go2rtc stream → MP4 segments; no re-encoding)
+   h. Start motion event listener (Reolink API polling or ONVIF events)
 4. Start REST API server
 5. Log system health summary
 
@@ -26,7 +27,7 @@ When Argus starts:
 
 When an Apple device requests a live stream:
 1. HomeKit sends SRTP session request to HAP accessory
-2. Argus requests stream from go2rtc (RTSP URL for the camera)
+2. Argus requests stream from go2rtc (local RTSP/WebRTC endpoint for the camera)
 3. FFmpeg transcodes (if needed) and sends RTP/SRTP to the Apple device
 4. Stream ends when HomeKit closes the session
 
@@ -82,7 +83,7 @@ When HomeKit Home Hub requests recording (triggered by motion):
 ### 6. Local NVR Recording
 
 Continuous recording independent of HomeKit:
-1. go2rtc provides RTSP stream
+1. go2rtc provides the selected camera stream (HTTP-FLV primary, RTSP fallback)
 2. Argus recorder writes raw stream to MP4 segments (no re-encoding)
 3. Segments: 1 minute each, stored at `recordings/YYYY-MM-DD/HH/camera-name/MM.SS.mp4`
 4. SQLite tracks: segment path, start/end time, camera, has_motion flag, file size
@@ -122,11 +123,13 @@ When a camera goes offline:
 cameras:
   - name: "Front Door"
     host: 192.168.1.100
+    channel: 0              # Reolink zero-based channel for HTTP-FLV; RTSP Preview number is channel + 1
     username: admin
     password: secret
+    transport: auto         # auto = HTTP-FLV primary, RTSP fallback
     streams:
-      main: /h264Preview_01_main    # 4K for recording
-      sub: /h264Preview_01_sub      # 720p for remote/analysis
+      main: main            # 4K/high-quality for recording
+      sub: sub              # lower-quality for remote/analysis
 
 recording:
   path: ./recordings
@@ -175,7 +178,14 @@ server:
 ### go2rtc Integration
 - Generate `go2rtc.yaml` from Argus config on startup
 - Start as child process, monitor health via API (GET /api)
-- Consume streams via RTSP URLs: `rtsp://localhost:8554/{camera-name}`
+- Prefer Reolink HTTP-FLV inputs:
+  - Main: `http://{host}/flv?port=1935&app=bcs&stream=channel{channel}_main.bcs&user={username}&password={password}`
+  - Sub: `http://{host}/flv?port=1935&app=bcs&stream=channel{channel}_ext.bcs&user={username}&password={password}`
+- Generate RTSP fallback inputs:
+  - Main: `rtsp://{username}:{password}@{host}:554/Preview_{channel+1 padded}_main`
+  - Sub: `rtsp://{username}:{password}@{host}:554/Preview_{channel+1 padded}_sub`
+- Consume go2rtc restreams locally via: `rtsp://localhost:8554/{camera-name}`
+- URL-encode credentials before writing go2rtc config
 
 ## Non-Goals (MVP)
 

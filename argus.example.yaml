@@ -1,0 +1,30 @@
+# Copy this to argus.yaml and replace the placeholder values.
+# argus.yaml is gitignored because it contains camera credentials.
+
+cameras:
+  - name: "Front Door"
+    host: 192.168.1.100
+    channel: 0              # Reolink zero-based channel for HTTP-FLV; RTSP Preview number is channel + 1
+    username: admin
+    password: change-me
+    transport: auto         # auto = HTTP-FLV primary, RTSP fallback
+    streams:
+      main: main            # high-quality stream for recording
+      sub: sub              # lower-quality stream for snapshots/remote paths
+
+recording:
+  path: ./recordings
+  retention:
+    continuous: 3
+    motion: 7
+    alerts: 30
+
+homekit:
+  pin: "123-45-678"        # Change before real pairing
+
+go2rtc:
+  binary: ./go2rtc
+  api_port: 1984
+
+server:
+  port: 8080

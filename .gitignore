@@ -4,6 +4,11 @@ dist/
 *.log
 .DS_Store
 
+# Local config with camera credentials
+argus.yaml
+go2rtc.generated.yaml
+go2rtc.yaml
+
 # go2rtc binary
 go2rtc
 
