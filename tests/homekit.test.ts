@@ -67,6 +67,16 @@ describe("buildLiveFfmpegArgs", () => {
     expect(args).toContain("-b:v 299k");
   });
 
+  it("caps RTSP input analysis so the stream starts fast (else HomeKit times out)", () => {
+    const args = buildLiveFfmpegArgs(liveInput());
+    // Low-latency flags must come BEFORE -i to apply to the input.
+    const inputIndex = args.indexOf("-i");
+    const head = args.slice(0, inputIndex).join(" ");
+    expect(head).toContain("-fflags nobuffer");
+    expect(head).toContain("-probesize 500000");
+    expect(head).toContain("-analyzeduration 1000000");
+  });
+
   it("targets the device address with matching SRTP params and SSRCs", () => {
     const args = buildLiveFfmpegArgs(liveInput());
     const joined = args.join(" ");

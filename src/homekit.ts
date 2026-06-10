@@ -77,6 +77,13 @@ export function buildLiveFfmpegArgs(input: LiveFfmpegInput): string[] {
   return [
     "-hide_banner",
     "-loglevel", "error",
+    // Low-latency input: cap RTSP stream analysis so FFmpeg starts emitting within
+    // ~1s. Without these, its default ~5s analysis runs past HomeKit's stream-start
+    // window and the iOS client spins forever then drops to "No Response".
+    "-fflags", "nobuffer",
+    "-flags", "low_delay",
+    "-probesize", "500000",
+    "-analyzeduration", "1000000",
     "-rtsp_transport", "tcp",
     "-i", inputUrl,
 
@@ -90,6 +97,12 @@ export function buildLiveFfmpegArgs(input: LiveFfmpegInput): string[] {
     "-color_range", "tv",
     "-r", String(video.fps),
     "-vf", `scale=${video.width}:${video.height}`,
+    // HomeKit needs frequent keyframes and no B-frames, or the iOS client waits
+    // forever for a decodable IDR (the "spinner that never resolves" symptom).
+    "-bf", "0",
+    "-g", String(video.fps * 2),
+    "-keyint_min", String(video.fps),
+    "-force_key_frames", "expr:gte(t,n_forced*1)",
     "-b:v", `${video.maxBitrateKbps}k`,
     "-maxrate", `${video.maxBitrateKbps}k`,
     "-bufsize", `${2 * video.maxBitrateKbps}k`,
@@ -154,6 +167,8 @@ export interface StreamingDelegateOptions {
   liveProfile?: SnapshotProfile;
   /** Override FFmpeg binary path (default "ffmpeg"). */
   ffmpegPath?: string;
+  /** Log the FFmpeg command + stderr to the console. Default true. */
+  verbose?: boolean;
   /** Injectable spawn for tests. */
   spawnFn?: typeof spawn;
 }
@@ -168,6 +183,7 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
   private readonly sessions = new Map<string, ActiveSession>();
   private readonly liveProfile: SnapshotProfile;
   private readonly ffmpegPath: string;
+  private readonly verbose: boolean;
   private readonly spawnFn: typeof spawn;
 
   public constructor(
@@ -179,6 +195,7 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
   ) {
     this.liveProfile = options.liveProfile ?? "sub";
     this.ffmpegPath = options.ffmpegPath ?? "ffmpeg";
+    this.verbose = options.verbose ?? true;
     this.spawnFn = options.spawnFn ?? spawn;
   }
 
@@ -282,16 +299,45 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
       },
     });
 
+    const log = (msg: string): void => {
+      if (this.verbose) process.stderr.write(`[argus ${this.cameraName}] ${msg}\n`);
+    };
+    log(`ffmpeg ${this.ffmpegPath} ${args.join(" ")}`);
+
     const ffmpeg = this.spawnFn(this.ffmpegPath, args, { stdio: ["ignore", "ignore", "pipe"] });
     session.ffmpeg = ffmpeg;
-    ffmpeg.on("error", (error) => callback(error));
+
+    // Drain stderr both to surface failures and to avoid the pipe filling and
+    // stalling FFmpeg (a silent cause of a stream that "starts" but never flows).
+    ffmpeg.stderr?.on("data", (chunk: Buffer) => log(`ffmpeg: ${chunk.toString().trimEnd()}`));
+
+    let answered = false;
+    const answer = (error?: Error): void => {
+      if (answered) return;
+      answered = true;
+      callback(error);
+    };
+
+    ffmpeg.on("error", (error: Error) => {
+      log(`ffmpeg spawn error: ${error.message}`);
+      answer(error);
+    });
     ffmpeg.once("exit", (code, signal) => {
+      log(`ffmpeg exited code=${code} signal=${signal}`);
+      if (!answered) {
+        // Died before we acknowledged START — report failure to HomeKit.
+        answer(new Error(`ffmpeg exited code=${code} signal=${signal}`));
+        return;
+      }
       // A non-zero exit that isn't from our SIGKILL teardown means the stream broke.
       if (code !== 0 && signal !== "SIGKILL") {
         this.controller?.forceStopStreamingSession(request.sessionID);
       }
     });
-    callback();
+
+    // Give FFmpeg a beat to fail fast (bad args / unreachable source) before we
+    // tell HomeKit the stream is live; otherwise report success so it starts pulling.
+    setTimeout(() => answer(), 500);
   }
 
   private stopStream(sessionID: string): void {
