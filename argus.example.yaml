@@ -1,16 +1,37 @@
 # Copy this to argus.yaml and replace the placeholder values.
 # argus.yaml is gitignored because it contains camera credentials.
 
+# Reolink fleets are commonly hybrid: some cameras answer directly on their own IP
+# (standalone), others are reached only through an NVR on a channel. Argus generates
+# go2rtc sources per camera. Verified rule of thumb (see LEARNINGS.md):
+#   - RTSP paths should be CODEC-PREFIXED (h264Preview_0N_* / h265Preview_0N_main).
+#     The bare Preview_0N form 404s on newer 4K/H.265 models (e.g. RLC-812A).
+#   - H.264 sub streams work over bare HTTP-FLV; H.265 4K main streams need RTSP.
+#   - FLV channel is 0-based (channelN); RTSP Preview is 1-based (Preview_0{N+1}).
 cameras:
-  - name: "Front Door"
-    host: 192.168.1.100
-    channel: 0              # Reolink zero-based channel for HTTP-FLV; RTSP Preview number is channel + 1
+  # Standalone camera — host is the camera's own IP, channel 0.
+  - name: "Garage Door"
+    kind: standalone
+    host: 192.168.1.107
+    channel: 0
     username: admin
     password: change-me
-    transport: auto         # auto = HTTP-FLV primary, RTSP fallback
+    transport: auto         # auto = FLV-sub primary, codec-prefixed RTSP for main
     streams:
-      main: main            # high-quality stream for recording
-      sub: sub              # lower-quality stream for snapshots/remote paths
+      main: main            # high-quality stream for recording (H.265 on 4K models)
+      sub: sub              # lower-quality stream for snapshots/prebuffer
+
+  # NVR-fronted camera — host is the NVR; channel selects the camera on the NVR.
+  - name: "Front L"
+    kind: nvr-channel
+    host: 192.168.1.113     # the NVR's IP
+    channel: 2              # NVR channel (RTSP path becomes Preview_03_*)
+    username: admin
+    password: change-me
+    transport: auto
+    streams:
+      main: main
+      sub: sub
 
 recording:
   path: ./recordings

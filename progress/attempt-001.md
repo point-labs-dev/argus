@@ -60,3 +60,24 @@ Research verdict (web + this hardware) — see LEARNINGS.md 2026-06-10 section:
 
 Next attempt should START by reworking `go2rtc.ts` URL generation (+ tests) against
 this evidence, THEN resume the recorder slice once Peter settles the NVR reset/topology.
+
+## Topology resolved — fleet is hybrid (2026-06-10, post-NVR-reset, authorized sweep)
+The old "NVR fronts all cameras" model is dead. Two device classes coexist (Peter's
+specific IP/name map lives in private memory, not here):
+- **Standalone cameras** — each on its own IP, `channel 0`. Includes newer 4K/H.265
+  models (RLC-812A) and older H.264 models (RLC-520A), plus a standalone PoE doorbell.
+- **NVR-fronted cameras** — reached via the NVR host on channels N (older D-series
+  cams that don't serve their own IP).
+
+Verified URL rule across the whole fleet (RLC-812A, RLC-520A, doorbell, NVR):
+- **Always emit codec-prefixed RTSP** (`h264Preview_0N_sub`, `h264/h265Preview_0N_main`).
+  It works everywhere. The **bare** `Preview_0N_*` form is the trap — 404s on the
+  RLC-812A even though it works on the RLC-520A and the NVR. Codec-prefixed is the
+  strictly-safer universal default.
+- Channel numbering: FLV 0-based (`channelN`), RTSP 1-based (`Preview_0{N+1}`).
+- H.265 4K main → RTSP only (FLV main fails). H.264 sub → bare FLV is fine.
+
+→ `go2rtc.ts` rework: take a per-camera `{ kind: "standalone" | "nvr-channel", host,
+channel, mainCodec }` and generate codec-prefixed RTSP for main + FLV-sub, with the
+NVR cases pointed at the NVR host. The doorbell is a standalone camera that also needs
+the HomeKit Doorbell service later (feature #9).
