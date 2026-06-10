@@ -48,3 +48,7 @@ export {
 } from "./homekit.js";
 export type { ArgusServer } from "./serve.js";
 export { startArgusServer } from "./serve.js";
+export type { ReolinkClientOptions } from "./reolink.js";
+export { ReolinkClient, ReolinkError } from "./reolink.js";
+export type { MotionMonitorOptions } from "./motion.js";
+export { MotionMonitor } from "./motion.js";

@@ -9,6 +9,7 @@ import { loadArgusConfig, type ArgusConfig } from "./config.js";
 import { buildGo2RtcStreamNames } from "./go2rtc.js";
 import { startGo2Rtc, type Go2RtcSupervisor } from "./go2rtc-supervisor.js";
 import { createCameraAccessory } from "./homekit.js";
+import { MotionMonitor } from "./motion.js";
 import { SnapshotCache } from "./snapshot-cache.js";
 
 const HOMEKIT_PORT_BASE = 51200;
@@ -39,12 +40,14 @@ export async function startArgusServer(config: ArgusConfig, configDir = process.
   cache.startPolling(5_000, ["sub"]);
 
   const streamNames = buildGo2RtcStreamNames(config.cameras);
+  const setMotionByCamera = new Map<string, (detected: boolean) => void>();
   const published = config.cameras.map((camera, index) => {
     const names = streamNames[index]!;
     const liveUrl = `${RTSP_RESTREAM_BASE}/${names.sub}`;
     // ARGUS_AUDIO=0 publishes video-only accessories (diagnostic isolation).
     const includeAudio = process.env.ARGUS_AUDIO !== "0";
-    const { accessory } = createCameraAccessory(camera, liveUrl, cache, { includeAudio });
+    const { accessory, setMotion } = createCameraAccessory(camera, liveUrl, cache, { includeAudio });
+    setMotionByCamera.set(camera.name, setMotion);
     const username = macFromName(camera.name);
     const port = HOMEKIT_PORT_BASE + index;
 
@@ -56,10 +59,22 @@ export async function startArgusServer(config: ArgusConfig, configDir = process.
     return accessory;
   });
 
+  // Drive the HomeKit motion sensors from the Reolink motion API.
+  const motion = new MotionMonitor(
+    config.cameras,
+    (cameraName, detected) => {
+      setMotionByCamera.get(cameraName)?.(detected);
+      process.stdout.write(`[argus ${cameraName}] motion ${detected ? "DETECTED" : "cleared"}\n`);
+    },
+    { onError: (cameraName, error) => process.stderr.write(`[argus ${cameraName}] motion poll error: ${error.message}\n`) },
+  );
+  motion.start();
+
   process.stdout.write(`\nArgus is live. Add each camera in the Home app → Add Accessory → "More options" → enter the pair code above.\n`);
 
   return {
     async stop() {
+      motion.stop();
       for (const accessory of published) {
         accessory.unpublish();
       }

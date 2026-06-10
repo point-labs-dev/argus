@@ -433,6 +433,8 @@ export function buildCameraControllerOptions(
 export interface CameraAccessoryHandle {
   accessory: Accessory;
   delegate: ArgusStreamingDelegate;
+  /** Update the camera's HomeKit MotionSensor (triggers HKSV recording). */
+  setMotion: (detected: boolean) => void;
 }
 
 /**
@@ -459,5 +461,15 @@ export function createCameraAccessory(
   delegate.controller = controller;
   accessory.configureController(controller);
 
-  return { accessory, delegate };
+  // Motion sensor: HomeKit shows it, sends notifications, and uses it to trigger
+  // HKSV recording. Argus drives it from the Reolink motion API (see MotionMonitor).
+  const motionSensor = accessory.addService(Service.MotionSensor, camera.name);
+
+  return {
+    accessory,
+    delegate,
+    setMotion: (detected: boolean) => {
+      motionSensor.updateCharacteristic(Characteristic.MotionDetected, detected);
+    },
+  };
 }
