@@ -75,8 +75,12 @@ export function buildRtspUrl(camera: CameraConfig, profile: CameraProfile): stri
   const previewChannel = String(camera.channel + 1).padStart(2, "0");
   const username = encodeCredential(camera.username);
   const password = encodeCredential(camera.password);
+  // Codec-prefixed paths (h264/h265Preview_0N) work on every Reolink device class
+  // tested — standalone cams, NVR channels, doorbell. The bare Preview_0N form
+  // 404s on newer 4K/H.265 models (RLC-812A), so always prefix. Sub is H.264.
+  const codec = profile === "main" ? camera.mainCodec : "h264";
 
-  return `rtsp://${username}:${password}@${camera.host}:554/Preview_${previewChannel}_${profile}`;
+  return `rtsp://${username}:${password}@${camera.host}:554/${codec}Preview_${previewChannel}_${profile}`;
 }
 
 export function buildTransportSources(camera: CameraConfig, profile: CameraProfile): string[] {
@@ -85,6 +89,12 @@ export function buildTransportSources(camera: CameraConfig, profile: CameraProfi
 
   switch (camera.transport) {
     case "auto":
+      // H.265 main streams don't work over Reolink HTTP-FLV (verified: bare and
+      // ffmpeg-wrapped FLV both fail on the RLC-812A) — use RTSP only. Everything
+      // else (all subs, H.264 mains) keeps HTTP-FLV first with RTSP fallback.
+      if (profile === "main" && camera.mainCodec === "h265") {
+        return [rtspUrl];
+      }
       return [httpFlvUrl, rtspUrl];
     case "http-flv":
       return [httpFlvUrl];

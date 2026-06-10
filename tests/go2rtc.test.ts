@@ -8,13 +8,18 @@ import {
   generateGo2RtcConfig,
 } from "../src/go2rtc.js";
 
-function createCameraConfig(transport: "auto" | "http-flv" | "rtsp" = "auto", channel = 0) {
+function createCameraConfig(
+  transport: "auto" | "http-flv" | "rtsp" = "auto",
+  channel = 0,
+  mainCodec: "h264" | "h265" = "h264",
+) {
   return parseArgusConfig({
     cameras: [
       {
         name: "Front Door",
         host: "192.168.1.100",
         channel,
+        mainCodec,
         username: "user+name@example.com",
         password: "pa:ss/wo?rd&1",
         transport,
@@ -46,14 +51,31 @@ function createCameraConfig(transport: "auto" | "http-flv" | "rtsp" = "auto", ch
 }
 
 describe("go2rtc generation", () => {
-  it("uses zero-based HTTP-FLV channels and one-based RTSP preview channels", () => {
+  it("uses zero-based HTTP-FLV channels and one-based, codec-prefixed RTSP preview channels", () => {
     const config = createCameraConfig("auto", 7);
     const camera = config.cameras[0]!;
 
     expect(buildHttpFlvUrl(camera, "main")).toContain("channel7_main.bcs");
     expect(buildHttpFlvUrl(camera, "sub")).toContain("channel7_ext.bcs");
-    expect(buildRtspUrl(camera, "main")).toContain("/Preview_08_main");
-    expect(buildRtspUrl(camera, "sub")).toContain("/Preview_08_sub");
+    // RTSP paths are codec-prefixed (bare Preview_0N 404s on newer Reolink models);
+    // sub is always H.264, main follows mainCodec (default h264 here).
+    expect(buildRtspUrl(camera, "main")).toContain("/h264Preview_08_main");
+    expect(buildRtspUrl(camera, "sub")).toContain("/h264Preview_08_sub");
+  });
+
+  it("prefixes the RTSP main path with the camera mainCodec and serves H.265 mains over RTSP only", () => {
+    const camera = createCameraConfig("auto", 0, "h265").cameras[0]!;
+
+    expect(buildRtspUrl(camera, "main")).toContain("/h265Preview_01_main");
+    // Sub stays H.264 even on an H.265-main camera.
+    expect(buildRtspUrl(camera, "sub")).toContain("/h264Preview_01_sub");
+    // H.265 main can't use HTTP-FLV — auto mode must yield RTSP only.
+    expect(buildTransportSources(camera, "main")).toEqual([buildRtspUrl(camera, "main")]);
+    // The sub stream still leads with HTTP-FLV.
+    expect(buildTransportSources(camera, "sub")).toEqual([
+      buildHttpFlvUrl(camera, "sub"),
+      buildRtspUrl(camera, "sub"),
+    ]);
   });
 
   it("URL-encodes credentials in both transport URL formats", () => {

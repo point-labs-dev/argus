@@ -16,6 +16,10 @@ const cameraSchema = z.object({
     .number()
     .int("cameras[].channel must be an integer")
     .nonnegative("cameras[].channel must be zero or greater"),
+  // Codec of the camera's MAIN stream. Sub streams are always H.264 on Reolink.
+  // Drives the RTSP path prefix (h264/h265Preview_0N) and main-stream transport:
+  // H.265 mains don't work over Reolink HTTP-FLV, so they go RTSP-only (see go2rtc.ts).
+  mainCodec: z.enum(["h264", "h265"]).default("h264"),
   username: z.string().min(1, "cameras[].username is required"),
   password: z.string().min(1, "cameras[].password is required"),
   transport: transportSchema,

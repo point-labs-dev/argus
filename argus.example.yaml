@@ -10,22 +10,23 @@
 #   - FLV channel is 0-based (channelN); RTSP Preview is 1-based (Preview_0{N+1}).
 cameras:
   # Standalone camera — host is the camera's own IP, channel 0.
-  - name: "Garage Door"
-    kind: standalone
-    host: 192.168.1.107
+  # A 4K model: set mainCodec: h265 so the main stream is served over RTSP.
+  - name: "Backyard Left"
+    host: 192.168.1.105
     channel: 0
+    mainCodec: h265         # 4K H.265 main -> RTSP-only; omit/set h264 for 1080p models
     username: admin
     password: change-me
-    transport: auto         # auto = FLV-sub primary, codec-prefixed RTSP for main
+    transport: auto         # auto = FLV-sub primary; main = FLV(H.264) or RTSP(H.265)
     streams:
-      main: main            # high-quality stream for recording (H.265 on 4K models)
+      main: main            # high-quality stream for recording
       sub: sub              # lower-quality stream for snapshots/prebuffer
 
   # NVR-fronted camera — host is the NVR; channel selects the camera on the NVR.
   - name: "Front L"
-    kind: nvr-channel
     host: 192.168.1.113     # the NVR's IP
-    channel: 2              # NVR channel (RTSP path becomes Preview_03_*)
+    channel: 2              # NVR channel (RTSP path becomes h264Preview_03_*)
+    mainCodec: h264         # most NVR-attached D-series cams are H.264
     username: admin
     password: change-me
     transport: auto
