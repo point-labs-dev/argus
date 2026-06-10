@@ -29,6 +29,8 @@ export class ReolinkError extends Error {
 export class ReolinkClient {
   private token: string | undefined;
   private tokenExpiresAt = 0;
+  /** undefined = not probed; false = GetAiState unsupported here (e.g. via the NVR). */
+  private aiSupported: boolean | undefined;
   private readonly fetchFn: typeof fetch;
   private readonly now: () => number;
 
@@ -79,20 +81,42 @@ export class ReolinkClient {
     return this.token;
   }
 
-  /** True if the channel currently reports motion. Re-logs in once on token expiry. */
+  /**
+   * True if the channel currently reports motion via EITHER basic motion detection
+   * (GetMdState) OR AI person/vehicle/animal detection (GetAiState). Many Reolink
+   * cameras run in AI mode where GetMdState stays 0 but the AI alarm fires.
+   * Re-logs in once on token expiry. GetAiState isn't available via the NVR, so it's
+   * probed once and then skipped if unsupported.
+   */
   public async getMotionState(channel: number): Promise<boolean> {
     let token = await this.ensureToken();
-    let result = await this.call("GetMdState", { channel }, token);
+    let md = await this.call("GetMdState", { channel }, token);
 
     // "please login first" (rspCode -6): token died early — force a fresh login and retry once.
-    if (result.code !== 0 && result.error?.rspCode === -6) {
+    if (md.code !== 0 && md.error?.rspCode === -6) {
       this.token = undefined;
       token = await this.ensureToken();
-      result = await this.call("GetMdState", { channel }, token);
+      md = await this.call("GetMdState", { channel }, token);
     }
-    if (result.code !== 0 || !result.value) {
-      throw new ReolinkError(`GetMdState ch${channel} on ${this.options.host} failed: ${result.error?.detail ?? `code ${result.code}`}`);
+    if (md.code !== 0 || !md.value) {
+      throw new ReolinkError(`GetMdState ch${channel} on ${this.options.host} failed: ${md.error?.detail ?? `code ${md.code}`}`);
     }
-    return result.value["state"] === 1;
+    if (md.value["state"] === 1) {
+      return true;
+    }
+
+    if (this.aiSupported === false) {
+      return false;
+    }
+    const ai = await this.call("GetAiState", { channel }, token);
+    if (ai.code !== 0 || !ai.value) {
+      this.aiSupported = false; // e.g. NVR-fronted channel — fall back to MD only
+      return false;
+    }
+    this.aiSupported = true;
+    return (["people", "vehicle", "dog_cat"] as const).some((type) => {
+      const detection = ai.value?.[type] as { alarm_state?: number; support?: number } | undefined;
+      return detection?.alarm_state === 1;
+    });
   }
 }
