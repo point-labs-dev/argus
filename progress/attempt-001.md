@@ -94,9 +94,31 @@ default h264), which the verified RTSP-prefix finding actually requires.
   Garage Door, Doorbell, Backyard) and 3 NVR-fronted through 10.0.0.13 (Front L ch2→
   Preview_03, Front R ch3→Preview_04, Backyard Right ch6→Preview_07). SMOKE PASSED.
 
+### Recording architecture decided (Peter, 2026-06-10) — Argus recorder DROPPED
+Path A: recording/retention = HKSV/iCloud (all 7, Apple One Premier = unlimited HKSV
+cams, Home Hub does detection) + the Reolink NVR (continuous, all 7 once the 4
+standalone are re-added as NVR IP channels). Argus is the HomeKit BRIDGE only — it does
+not build its own NVR recorder. The "unified all-7-direct" topology is blocked by the 3
+D-series being Reolink add-on cameras (no UID, can't do RTSP off the NVR) — so it's
+unified in software (one per-camera host code path), hybrid in wiring. Goal is detection
+quality (replace Reolink's noisy AI with Apple HKSV), not recording.
+
+### HomeKit live-streaming slice DONE (commit 2374cfa)
+- `src/homekit.ts`: standalone HAP camera accessory per camera. Snapshots from the warm
+  SnapshotCache; live via FFmpeg SRTP from the go2rtc **sub** restream, transcoded to
+  H.264 (libx264) + Opus (libopus — avoids AAC-ELD/libfdk). SRTP key/salt advertised to
+  the device == the bytes FFmpeg encrypts with.
+- `src/serve.ts`: `argus serve` — starts go2rtc + snapshot polling, publishes one
+  standalone accessory per camera with pair codes; `.homekit/` pairing store gitignored.
+- 27 tests green (+5). Verified: runtime accessory construction; real-camera H.264+Opus
+  transcode (~6× realtime). NOT yet verified on-device (needs Peter to pair in Home app).
+
 ### Next attempt
-Stream layer is solid across the whole fleet. Resume the SPEC execution order:
-NVR recorder slice (raw 1-min MP4 segments + SQLite + retention + ffprobe) → motion
-events → HAP live streaming (one accessory, then all 7) → HKSV. Doorbell (.9) gets the
-HomeKit Doorbell service in the HAP/HKSV phase. Ops: DHCP-reserve every device, rotate
-the admin password (currently shared + burned).
+1. **On-device pairing** (Peter): `npm run serve` → add each camera in Home app via pair
+   code → confirm live view + snapshot. This validates the SRTP path end-to-end.
+2. **Motion events** → HAP MotionSensor (Reolink API poll; direct for standalone, via NVR
+   for the 3 D-series).
+3. **HKSV** — the payoff: prebuffer → IDR-aligned fMP4 (main stream, transcode H.265) →
+   HomeKit Data Stream on motion; verify Apple's person/vehicle/animal labels in the Home
+   timeline. Confirm a Home Hub (Apple TV/HomePod) is present first.
+4. **Doorbell** service for .9. Ops: re-add 4 standalone to NVR; DHCP-reserve; rotate password.
