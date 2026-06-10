@@ -134,7 +134,8 @@ describe("ArgusStreamingDelegate", () => {
     await new Promise<void>((resolve, reject) => {
       delegate.prepareStream(
         { sessionID: "s1", targetAddress: "192.168.1.50",
-          video: { port: 50000 }, audio: { port: 50002 } } as never,
+          video: { port: 50000, srtp_key: Buffer.alloc(16, 1), srtp_salt: Buffer.alloc(14, 2) },
+          audio: { port: 50002, srtp_key: Buffer.alloc(16, 3), srtp_salt: Buffer.alloc(14, 4) } } as never,
         (error) => (error ? reject(error) : resolve()),
       );
     });
@@ -153,5 +154,9 @@ describe("ArgusStreamingDelegate", () => {
     expect(bin).toBe("ffmpeg");
     expect(args.join(" ")).toContain("-i rtsp://127.0.0.1:8554/backyard-left-sub");
     expect(args.join(" ")).toContain("srtp://192.168.1.50:50000");
+    // FFmpeg must encrypt with the CONTROLLER's key from the request (not a
+    // generated one), or the device can't decrypt — the forever-spinner bug.
+    const expectedVideoSrtp = Buffer.concat([Buffer.alloc(16, 1), Buffer.alloc(14, 2)]).toString("base64");
+    expect(args.join(" ")).toContain(`-srtp_out_params ${expectedVideoSrtp}`);
   });
 });

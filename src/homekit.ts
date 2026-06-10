@@ -140,17 +140,15 @@ async function reserveUdpPort(): Promise<number> {
   });
 }
 
-interface SrtpKey {
-  key: Buffer;
-  salt: Buffer;
-  /** base64 of key+salt for FFmpeg srtp_out_params — derived from the SAME bytes. */
-  params: string;
-}
-
-function newSrtpKey(): SrtpKey {
-  const key = randomBytes(16);
-  const salt = randomBytes(14);
-  return { key, salt, params: Buffer.concat([key, salt]).toString("base64") };
+/**
+ * FFmpeg srtp_out_params for the stream WE send to the controller. Critically,
+ * HomeKit encrypts/decrypts each direction with the controller's OWN key material
+ * (supplied in the prepareStream request) — we must encrypt outbound with that
+ * exact key, not a freshly generated one, or the iOS client can't decrypt and the
+ * live view spins forever. We echo the same key back in the response.
+ */
+function srtpParamsFromRequest(key: Buffer, salt: Buffer): string {
+  return Buffer.concat([key, salt]).toString("base64");
 }
 
 interface ActiveSession {
@@ -219,16 +217,17 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
       const audioSsrc = randomBytes(4).readUInt32BE(0) >>> 1;
       const videoRtcp = await reserveUdpPort();
       const audioRtcp = await reserveUdpPort();
-      // The key/salt we advertise to the device MUST be the same bytes FFmpeg
-      // encrypts with, or the device can't decrypt the stream.
-      const videoSrtp = newSrtpKey();
-      const audioSrtp = newSrtpKey();
+      // Encrypt outbound with the controller's own key material (from the request),
+      // and echo it back in the response. Generating fresh keys here is the classic
+      // "stream sends but the device shows a forever-spinner" bug.
+      const videoSrtpParams = srtpParamsFromRequest(request.video.srtp_key, request.video.srtp_salt);
+      const audioSrtpParams = srtpParamsFromRequest(request.audio.srtp_key, request.audio.srtp_salt);
 
       this.sessions.set(request.sessionID, {
         prepared: {
           targetAddress: request.targetAddress,
-          video: { port: request.video.port, localRtcpPort: videoRtcp, ssrc: videoSsrc, srtpParams: videoSrtp.params },
-          audio: { port: request.audio.port, localRtcpPort: audioRtcp, ssrc: audioSsrc, srtpParams: audioSrtp.params },
+          video: { port: request.video.port, localRtcpPort: videoRtcp, ssrc: videoSsrc, srtpParams: videoSrtpParams },
+          audio: { port: request.audio.port, localRtcpPort: audioRtcp, ssrc: audioSsrc, srtpParams: audioSrtpParams },
         },
       });
 
@@ -236,14 +235,14 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
         video: {
           port: videoRtcp,
           ssrc: videoSsrc,
-          srtp_key: videoSrtp.key,
-          srtp_salt: videoSrtp.salt,
+          srtp_key: request.video.srtp_key,
+          srtp_salt: request.video.srtp_salt,
         },
         audio: {
           port: audioRtcp,
           ssrc: audioSsrc,
-          srtp_key: audioSrtp.key,
-          srtp_salt: audioSrtp.salt,
+          srtp_key: request.audio.srtp_key,
+          srtp_salt: request.audio.srtp_salt,
         },
       };
       callback(undefined, response);
