@@ -29,6 +29,20 @@ import {
 import type { CameraConfig } from "./config.js";
 import type { SnapshotCache, SnapshotProfile } from "./snapshot-cache.js";
 
+// HomeKit negotiates ONE H.264 profile/level during stream setup and rejects video
+// encoded outside it (the device receives SRTP but can't decode → forever-spinner).
+// Map its choice to the matching libx264 strings.
+const H264_PROFILE_TO_X264: Record<number, string> = {
+  [H264Profile.BASELINE]: "baseline",
+  [H264Profile.MAIN]: "main",
+  [H264Profile.HIGH]: "high",
+};
+const H264_LEVEL_TO_X264: Record<number, string> = {
+  [H264Level.LEVEL3_1]: "3.1",
+  [H264Level.LEVEL3_2]: "3.2",
+  [H264Level.LEVEL4_0]: "4.0",
+};
+
 // Argus serves HomeKit live view from go2rtc's local RTSP restream. We pull the
 // H.264 sub stream (light, always H.264 on Reolink — no H.265 transcode) and let
 // FFmpeg transcode to the resolution/bitrate HomeKit negotiates. Audio is Opus
@@ -54,6 +68,10 @@ export interface LiveFfmpegInput {
     width: number;
     height: number;
     mtu: number;
+    /** libx264 profile string HomeKit negotiated: "baseline" | "main" | "high". */
+    profile: string;
+    /** libx264 level string HomeKit negotiated: e.g. "3.1", "4.0". */
+    level: string;
     srtpParams: string;
   };
   audio: {
@@ -71,10 +89,10 @@ export interface LiveFfmpegInput {
  * Pure builder for the FFmpeg live-streaming command (video + Opus audio over SRTP).
  * Kept side-effect free so it can be unit-tested without spawning anything.
  */
-export function buildLiveFfmpegArgs(input: LiveFfmpegInput): string[] {
+export function buildLiveFfmpegArgs(input: LiveFfmpegInput, includeAudio = true): string[] {
   const { inputUrl, targetAddress, video, audio } = input;
 
-  return [
+  const videoArgs = [
     "-hide_banner",
     "-loglevel", "error",
     // Low-latency input: cap RTSP stream analysis so FFmpeg starts emitting within
@@ -92,7 +110,8 @@ export function buildLiveFfmpegArgs(input: LiveFfmpegInput): string[] {
     "-c:v", "libx264",
     "-preset", "veryfast",
     "-tune", "zerolatency",
-    "-profile:v", "high",
+    "-profile:v", video.profile,
+    "-level", video.level,
     "-pix_fmt", "yuv420p",
     "-color_range", "tv",
     "-r", String(video.fps),
@@ -112,10 +131,19 @@ export function buildLiveFfmpegArgs(input: LiveFfmpegInput): string[] {
     "-srtp_out_suite", "AES_CM_128_HMAC_SHA1_80",
     "-srtp_out_params", video.srtpParams,
     `srtp://${targetAddress}:${video.port}?rtcpport=${video.port}&localrtcpport=${video.localRtcpPort}&pkt_size=${video.mtu}`,
+  ];
 
+  if (!includeAudio) {
+    return videoArgs;
+  }
+
+  return [
+    ...videoArgs,
     // --- audio: transcode to Opus, SRTP out ---
     "-vn",
     "-c:a", "libopus",
+    "-application", "lowdelay",
+    "-frame_duration", "20",
     "-ac", "1",
     "-ar", `${audio.sampleRateKhz}k`,
     "-b:a", `${audio.maxBitrateKbps}k`,
@@ -167,6 +195,8 @@ export interface StreamingDelegateOptions {
   ffmpegPath?: string;
   /** Log the FFmpeg command + stderr to the console. Default true. */
   verbose?: boolean;
+  /** Send audio (Opus) alongside video. Default true; set false for a video-only stream. */
+  includeAudio?: boolean;
   /** Injectable spawn for tests. */
   spawnFn?: typeof spawn;
 }
@@ -182,6 +212,7 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
   private readonly liveProfile: SnapshotProfile;
   private readonly ffmpegPath: string;
   private readonly verbose: boolean;
+  private readonly includeAudio: boolean;
   private readonly spawnFn: typeof spawn;
 
   public constructor(
@@ -194,6 +225,7 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
     this.liveProfile = options.liveProfile ?? "sub";
     this.ffmpegPath = options.ffmpegPath ?? "ffmpeg";
     this.verbose = options.verbose ?? true;
+    this.includeAudio = options.includeAudio ?? true;
     this.spawnFn = options.spawnFn ?? spawn;
   }
 
@@ -272,6 +304,16 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
       return;
     }
 
+    const profile = H264_PROFILE_TO_X264[request.video.profile] ?? "high";
+    const level = H264_LEVEL_TO_X264[request.video.level] ?? "4.0";
+    if (this.verbose) {
+      process.stderr.write(
+        `[argus ${this.cameraName}] HomeKit negotiated video: ${request.video.width}x${request.video.height}@${request.video.fps} ` +
+          `profile=${profile} level=${level} ptype=${request.video.pt} bitrate=${request.video.max_bit_rate}k mtu=${request.video.mtu}; ` +
+          `audio: codec=${request.audio.codec} ${request.audio.sample_rate}kHz ptype=${request.audio.pt}\n`,
+      );
+    }
+
     const args = buildLiveFfmpegArgs({
       inputUrl: this.liveUrl,
       targetAddress: session.prepared.targetAddress,
@@ -285,6 +327,8 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
         width: request.video.width,
         height: request.video.height,
         mtu: request.video.mtu,
+        profile,
+        level,
         srtpParams: session.prepared.video.srtpParams,
       },
       audio: {
@@ -296,7 +340,7 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
         maxBitrateKbps: request.audio.max_bit_rate,
         srtpParams: session.prepared.audio.srtpParams,
       },
-    });
+    }, this.includeAudio);
 
     const log = (msg: string): void => {
       if (this.verbose) process.stderr.write(`[argus ${this.cameraName}] ${msg}\n`);
@@ -350,7 +394,10 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
  * HomeKit streaming/recording option block for a camera. Extracted so the codec
  * envelope is unit-testable. Video resolutions cover HomeKit's mandatory set.
  */
-export function buildCameraControllerOptions(delegate: ArgusStreamingDelegate): CameraControllerOptions {
+export function buildCameraControllerOptions(
+  delegate: ArgusStreamingDelegate,
+  includeAudio = true,
+): CameraControllerOptions {
   return {
     cameraStreamCount: 2, // allow two concurrent viewers
     delegate,
@@ -369,13 +416,12 @@ export function buildCameraControllerOptions(delegate: ArgusStreamingDelegate): 
           [320, 240, 15],
         ],
       },
+      // Omitting audio entirely makes HomeKit treat this as a video-only camera —
+      // useful for isolating whether audio negotiation is what stalls a session.
       audio: {
-        codecs: [
-          {
-            type: AudioStreamingCodecType.OPUS,
-            samplerate: AudioStreamingSamplerate.KHZ_24,
-          },
-        ],
+        codecs: includeAudio
+          ? [{ type: AudioStreamingCodecType.OPUS, samplerate: AudioStreamingSamplerate.KHZ_24 }]
+          : [],
       },
     },
   };
@@ -406,7 +452,7 @@ export function createCameraAccessory(
     .setCharacteristic(Characteristic.SerialNumber, `argus-${camera.host}-${camera.channel}`);
 
   const delegate = new ArgusStreamingDelegate(camera.name, liveUrl, snapshots, options);
-  const controller = new CameraController(buildCameraControllerOptions(delegate));
+  const controller = new CameraController(buildCameraControllerOptions(delegate, options.includeAudio ?? true));
   delegate.controller = controller;
   accessory.configureController(controller);
 

@@ -42,7 +42,9 @@ export async function startArgusServer(config: ArgusConfig, configDir = process.
   const published = config.cameras.map((camera, index) => {
     const names = streamNames[index]!;
     const liveUrl = `${RTSP_RESTREAM_BASE}/${names.sub}`;
-    const { accessory } = createCameraAccessory(camera, liveUrl, cache);
+    // ARGUS_AUDIO=0 publishes video-only accessories (diagnostic isolation).
+    const includeAudio = process.env.ARGUS_AUDIO !== "0";
+    const { accessory } = createCameraAccessory(camera, liveUrl, cache, { includeAudio });
     const username = macFromName(camera.name);
     const port = HOMEKIT_PORT_BASE + index;
 

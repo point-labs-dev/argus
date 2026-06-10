@@ -24,6 +24,8 @@ function liveInput(overrides: Partial<LiveFfmpegInput> = {}): LiveFfmpegInput {
       width: 1280,
       height: 720,
       mtu: 1378,
+      profile: "high",
+      level: "4.0",
       srtpParams: "VIDEOKEY==",
     },
     audio: {
@@ -143,8 +145,8 @@ describe("ArgusStreamingDelegate", () => {
     await new Promise<void>((resolve, reject) => {
       delegate.handleStreamRequest(
         { type: "start", sessionID: "s1",
-          video: { pt: 99, max_bit_rate: 299, fps: 30, width: 1280, height: 720, mtu: 1378 },
-          audio: { pt: 110, sample_rate: 24, max_bit_rate: 24 } } as never,
+          video: { pt: 99, max_bit_rate: 299, fps: 30, width: 1280, height: 720, mtu: 1378, profile: 2, level: 2 },
+          audio: { pt: 110, sample_rate: 24, max_bit_rate: 24, codec: 3 } } as never,
         (error) => (error ? reject(error) : resolve()),
       );
     });
