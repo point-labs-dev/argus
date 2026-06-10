@@ -125,9 +125,36 @@ guard, early-exit failure reporting, and HomeKit keyframe flags. Debug method th
 bind a local UDP socket, run the generated FFmpeg command targeting it, count packets +
 read verbose stderr — isolates FFmpeg/SRTP from device negotiation without a phone.
 
+### HomeKit live view WORKING on-device (2026-06-10, commit c5b368c)
+After a long debug, live video renders on Peter's iPhone. Root causes, in the order they
+mattered (all real):
+1. **SRTP key** (commit 9cd9271): prepareStream generated a fresh key/salt and used it for
+   FFmpeg's `-srtp_out_params`; HomeKit decrypts with the key IT supplied in the request.
+   Must use `request.{video,audio}.srtp_key/salt` for both the FFmpeg encryption and the
+   echoed response. THE primary bug.
+2. **RTSP analysis latency** (789f70b): add `-fflags nobuffer -probesize -analyzeduration`
+   before `-i` so FFmpeg emits within ~1s, not past HomeKit's ~5s start window.
+3. **Resolution over WiFi** (c5b368c): HomeKit negotiated 1280x720 locally; large keyframes
+   burst into many UDP packets that WiFi drops → undecodable frame → spinner. Wired Apple TV
+   hub (and the lower-res remote path) worked, which pinned it. Cap live view to <=640x480.
+
+Dead ends that cost time (don't repeat): `localrtpport` pin (makes FFmpeg fail to bind —
+same port for RTP+RTCP); in-band SPS/PPS repeat via dump_extra/repeat-headers/no-global-header
+(none worked AND it was a red herring — iOS is present at stream start so it catches the
+first keyframe's headers; the late-join failure doesn't model iOS).
+
+Debug methods that WORKED: (a) self-receive — a 2nd FFmpeg decrypts+decodes our own SRTP
+stream, proving sender-side validity (151 frames) and isolating device-side; (b) reading the
+serve terminal via `cmux read-screen` to see FFmpeg stderr + HAP debug; (c) `DEBUG=HAP-NodeJS:*`.
+Gotcha: Ctrl-C'ing serve ORPHANS its FFmpeg children → false "sustained stream" readings;
+always `kill -9 $(pgrep -f 'ffmpeg.*-sub')` before trusting longevity checks.
+
+Live-view quality is soft (HomeKit caps bitrate ~132k at 640x360). Acceptable: HKSV recording
+uses the full-res main stream. Quality bump options if wanted: pull main stream as the live
+source (sharper downscale), or x264 intra-refresh to survive higher res over WiFi.
+
 ### Next attempt
-1. **On-device re-test** (Peter): rebuild + restart `serve` (pairing persists in `.homekit/`,
-   no re-pair needed) → tap Garage Door → live view should now play. Validates SRTP end-to-end.
+1. Roll live view out to all 7 cameras (already published; verify each pairs + streams).
 2. **Motion events** → HAP MotionSensor (Reolink API poll; direct for standalone, via NVR
    for the 3 D-series).
 3. **HKSV** — the payoff: prebuffer → IDR-aligned fMP4 (main stream, transcode H.265) →
