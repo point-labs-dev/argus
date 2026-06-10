@@ -41,3 +41,22 @@ Do not build the NVR recorder slice on the NVR-ingest assumption until Peter
 confirms the real fleet topology (NVR removed/moved? all cameras now standalone?
 mix?). The recorder code is topology-agnostic (records a go2rtc stream), but the
 config model, channel numbering, and URL builder decisions depend on the answer.
+
+## Peter's call + "treat docs as legacy" research pass (2026-06-10)
+Peter: the NVR still exists (may need a reset); treat the existing impl/docs as
+legacy and verify we're on the most up-to-date implementation before building more.
+
+Research verdict (web + this hardware) — see LEARNINGS.md 2026-06-10 section:
+- **Architecture still current, keep it:** go2rtc (latest v1.9.14, 2026-01-19, I'm
+  on it) + HAP-NodeJS for HKSV + standalone accessories. Frigate STILL has no
+  native HKSV (live-only via go2rtc's HAP server), so Argus's niche is intact.
+  Incumbent to beat is still Scrypted (HKSV plugin now $19 one-time).
+- **Implementation details to rework (verified on the RLC-812A):** go2rtc URL
+  generation is the main legacy gap. 4K H.265 main works over **RTSP
+  `h265Preview_01_main`**, NOT bare FLV and NOT even the community
+  `ffmpeg:`-prefixed FLV (both failed here). Sub is fine over bare FLV. RTSP path
+  style is per-device (NVR `Preview_0N` vs standalone `h264/h265Preview_0N`).
+  → Rework `go2rtc.ts` into a per-device/per-codec source strategy.
+
+Next attempt should START by reworking `go2rtc.ts` URL generation (+ tests) against
+this evidence, THEN resume the recorder slice once Peter settles the NVR reset/topology.
