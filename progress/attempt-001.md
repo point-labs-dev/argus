@@ -81,3 +81,22 @@ Verified URL rule across the whole fleet (RLC-812A, RLC-520A, doorbell, NVR):
 channel, mainCodec }` and generate codec-prefixed RTSP for main + FLV-sub, with the
 NVR cases pointed at the NVR host. The doorbell is a standalone camera that also needs
 the HomeKit Doorbell service later (feature #9).
+
+## go2rtc.ts rework DONE + full-fleet validation (2026-06-10, commit 239e6d3)
+Landed the rework. Kept it minimal/honest: the standalone-vs-NVR distinction is
+already expressed by `host`+`channel` (standalone = cam IP + ch0; NVR = NVR IP + chN),
+so no `kind` field was added — the only NEW config field is `mainCodec` (h264|h265,
+default h264), which the verified RTSP-prefix finding actually requires.
+- RTSP paths now codec-prefixed (`h264/h265Preview_0N`); H.265 mains go RTSP-only in
+  auto mode; subs + H.264 mains keep FLV-first → RTSP fallback. 22 unit tests green.
+- **Validated against ALL 7 real cameras** via `scripts/smoke-spine.mjs`: live
+  snapshot + clean RTSP sub-restream for each — 4 standalone (Backyard Left H.265,
+  Garage Door, Doorbell, Backyard) and 3 NVR-fronted through 10.0.0.13 (Front L ch2→
+  Preview_03, Front R ch3→Preview_04, Backyard Right ch6→Preview_07). SMOKE PASSED.
+
+### Next attempt
+Stream layer is solid across the whole fleet. Resume the SPEC execution order:
+NVR recorder slice (raw 1-min MP4 segments + SQLite + retention + ffprobe) → motion
+events → HAP live streaming (one accessory, then all 7) → HKSV. Doorbell (.9) gets the
+HomeKit Doorbell service in the HAP/HKSV phase. Ops: DHCP-reserve every device, rotate
+the admin password (currently shared + burned).
