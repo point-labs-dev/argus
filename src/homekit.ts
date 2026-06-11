@@ -27,6 +27,7 @@ import {
 } from "hap-nodejs";
 
 import type { CameraConfig } from "./config.js";
+import { ArgusRecordingDelegate, buildRecordingOptions } from "./recording.js";
 import type { SnapshotCache, SnapshotProfile } from "./snapshot-cache.js";
 
 // HomeKit negotiates ONE H.264 profile/level during stream setup and rejects video
@@ -397,10 +398,19 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
 export function buildCameraControllerOptions(
   delegate: ArgusStreamingDelegate,
   includeAudio = true,
+  recordingDelegate?: ArgusRecordingDelegate,
 ): CameraControllerOptions {
   return {
     cameraStreamCount: 2, // allow two concurrent viewers
     delegate,
+    // The controller-managed motion sensor is what links motion to HKSV recording
+    // (EventTriggerOption.MOTION). A manually-added MotionSensor would NOT trigger it.
+    ...(recordingDelegate
+      ? {
+          sensors: { motion: true },
+          recording: { options: buildRecordingOptions(), delegate: recordingDelegate },
+        }
+      : {}),
     streamingOptions: {
       supportedCryptoSuites: [SRTPCryptoSuites.AES_CM_128_HMAC_SHA1_80],
       video: {
@@ -444,6 +454,7 @@ export interface CameraAccessoryHandle {
 export function createCameraAccessory(
   camera: CameraConfig,
   liveUrl: string,
+  mainUrl: string,
   snapshots: SnapshotCache,
   options: StreamingDelegateOptions = {},
 ): CameraAccessoryHandle {
@@ -457,19 +468,26 @@ export function createCameraAccessory(
     .setCharacteristic(Characteristic.SerialNumber, `argus-${camera.host}-${camera.channel}`);
 
   const delegate = new ArgusStreamingDelegate(camera.name, liveUrl, snapshots, options);
-  const controller = new CameraController(buildCameraControllerOptions(delegate, options.includeAudio ?? true));
+  // HKSV recording delegate records the full-res MAIN stream on motion.
+  const recordingDelegate = new ArgusRecordingDelegate(camera.name, mainUrl, {
+    ...(options.ffmpegPath ? { ffmpegPath: options.ffmpegPath } : {}),
+    ...(options.verbose !== undefined ? { verbose: options.verbose } : {}),
+  });
+  const controller = new CameraController(
+    buildCameraControllerOptions(delegate, options.includeAudio ?? true, recordingDelegate),
+  );
   delegate.controller = controller;
   accessory.configureController(controller);
 
-  // Motion sensor: HomeKit shows it, sends notifications, and uses it to trigger
-  // HKSV recording. Argus drives it from the Reolink motion API (see MotionMonitor).
-  const motionSensor = accessory.addService(Service.MotionSensor, camera.name);
+  // The controller (sensors.motion) created the MotionSensor service and linked it
+  // to HKSV recording. Argus drives it from the Reolink motion API (MotionMonitor).
+  const motionSensor = accessory.getService(Service.MotionSensor);
 
   return {
     accessory,
     delegate,
     setMotion: (detected: boolean) => {
-      motionSensor.updateCharacteristic(Characteristic.MotionDetected, detected);
+      motionSensor?.updateCharacteristic(Characteristic.MotionDetected, detected);
     },
   };
 }

@@ -52,3 +52,7 @@ export type { ReolinkClientOptions } from "./reolink.js";
 export { ReolinkClient, ReolinkError } from "./reolink.js";
 export type { MotionMonitorOptions } from "./motion.js";
 export { MotionMonitor } from "./motion.js";
+export type { Mp4Segment } from "./mp4.js";
+export { readFragmentedMp4 } from "./mp4.js";
+export type { RecordingDelegateOptions } from "./recording.js";
+export { ArgusRecordingDelegate, buildRecordingFfmpegArgs, buildRecordingOptions } from "./recording.js";

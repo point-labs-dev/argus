@@ -43,10 +43,11 @@ export async function startArgusServer(config: ArgusConfig, configDir = process.
   const setMotionByCamera = new Map<string, (detected: boolean) => void>();
   const published = config.cameras.map((camera, index) => {
     const names = streamNames[index]!;
-    const liveUrl = `${RTSP_RESTREAM_BASE}/${names.sub}`;
+    const liveUrl = `${RTSP_RESTREAM_BASE}/${names.sub}`; // live view = light sub stream
+    const mainUrl = `${RTSP_RESTREAM_BASE}/${names.main}`; // HKSV recording = full-res main stream
     // ARGUS_AUDIO=0 publishes video-only accessories (diagnostic isolation).
     const includeAudio = process.env.ARGUS_AUDIO !== "0";
-    const { accessory, setMotion } = createCameraAccessory(camera, liveUrl, cache, { includeAudio });
+    const { accessory, setMotion } = createCameraAccessory(camera, liveUrl, mainUrl, cache, { includeAudio });
     setMotionByCamera.set(camera.name, setMotion);
     const username = macFromName(camera.name);
     const port = HOMEKIT_PORT_BASE + index;
