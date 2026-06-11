@@ -10,6 +10,14 @@ export interface Go2RtcConfig {
     listen: string;
   };
   streams: Record<string, string[]>;
+  /**
+   * Streams whose producers go2rtc connects at startup and keeps connected
+   * (stream name → probe query; "" = default video&audio). Without this a
+   * producer only exists while a consumer is attached, so every HomeKit live
+   * tap pays the cold camera connect (~1-3s) before the keyframe wait even
+   * starts. Sub streams are preloaded; mains stay on-demand (HKSV only).
+   */
+  preload: Record<string, string>;
 }
 
 export type CameraProfile = "main" | "sub";
@@ -106,6 +114,7 @@ export function buildTransportSources(camera: CameraConfig, profile: CameraProfi
 export function generateGo2RtcConfig(config: ArgusConfig): Go2RtcConfig {
   const streamNames = buildGo2RtcStreamNames(config.cameras);
   const streams: Record<string, string[]> = {};
+  const preload: Record<string, string> = {};
 
   config.cameras.forEach((camera, index) => {
     const streamName = streamNames[index];
@@ -116,6 +125,7 @@ export function generateGo2RtcConfig(config: ArgusConfig): Go2RtcConfig {
 
     streams[streamName.main] = buildTransportSources(camera, "main");
     streams[streamName.sub] = buildTransportSources(camera, "sub");
+    preload[streamName.sub] = "";
   });
 
   return {
@@ -126,6 +136,7 @@ export function generateGo2RtcConfig(config: ArgusConfig): Go2RtcConfig {
       listen: "127.0.0.1:8554",
     },
     streams,
+    preload,
   };
 }
 

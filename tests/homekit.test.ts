@@ -7,6 +7,7 @@ import {
   ArgusStreamingDelegate,
   buildCameraControllerOptions,
   buildLiveFfmpegArgs,
+  resolveSrtpTargetAddress,
   type LiveFfmpegInput,
 } from "../src/homekit.js";
 
@@ -14,6 +15,7 @@ function liveInput(overrides: Partial<LiveFfmpegInput> = {}): LiveFfmpegInput {
   return {
     inputUrl: "rtsp://127.0.0.1:8554/backyard-left-sub",
     targetAddress: "192.168.1.50",
+    videoMode: "transcode",
     video: {
       port: 50000,
       localRtcpPort: 60000,
@@ -69,6 +71,25 @@ describe("buildLiveFfmpegArgs", () => {
     expect(args).toContain("-b:v 299k");
   });
 
+  it("passes video through untouched in copy mode (no encode, no scaling, no keyframe forcing)", () => {
+    const args = buildLiveFfmpegArgs(liveInput({ videoMode: "copy" })).join(" ");
+
+    expect(args).toContain("-c:v copy");
+    expect(args).not.toContain("libx264");
+    expect(args).not.toContain("scale=");
+    expect(args).not.toContain("-force_key_frames");
+    expect(args).not.toContain("-b:v");
+    // Copy trims input analysis to ~0.2s — every analysis ms delays the keyframe
+    // that stream-copy waits for (bench 2026-06-11: 1s analysis ≈ +1s start).
+    expect(args).toContain("-analyzeduration 200000");
+    expect(args).toContain("-probesize 100000");
+    // Audio is still transcoded to Opus, and SRTP targeting is unchanged.
+    expect(args).toContain("-c:a libopus");
+    expect(args).toContain("-srtp_out_params VIDEOKEY==");
+    expect(args).toContain("srtp://192.168.1.50:50000?rtcpport=50000&localrtcpport=60000&pkt_size=1378");
+    expect(args).toContain("-payload_type 99");
+  });
+
   it("caps RTSP input analysis so the stream starts fast (else HomeKit times out)", () => {
     const args = buildLiveFfmpegArgs(liveInput());
     // Low-latency flags must come BEFORE -i to apply to the input.
@@ -94,6 +115,23 @@ describe("buildLiveFfmpegArgs", () => {
   });
 });
 
+describe("resolveSrtpTargetAddress", () => {
+  const fakeInterfaces = (() => ({
+    en0: [{ address: "10.0.0.46" }],
+    ipsec1: [{ address: "10.0.0.46" }],
+  })) as never;
+
+  it("rewrites a controller address that belongs to this host to loopback", () => {
+    // Self-addressed ipsec interfaces hijack the route to one's own LAN IP and
+    // swallow the UDP — local viewers must be fed via loopback.
+    expect(resolveSrtpTargetAddress("10.0.0.46", fakeInterfaces)).toBe("127.0.0.1");
+  });
+
+  it("leaves external controller addresses untouched", () => {
+    expect(resolveSrtpTargetAddress("10.0.0.15", fakeInterfaces)).toBe("10.0.0.15");
+  });
+});
+
 describe("buildCameraControllerOptions", () => {
   it("advertises the HomeKit-required crypto suite, H.264 levels, and Opus audio", () => {
     const delegate = new ArgusStreamingDelegate("Backyard Left", "rtsp://x", cacheWith(Buffer.from([0xff, 0xd8])));
@@ -102,10 +140,28 @@ describe("buildCameraControllerOptions", () => {
     expect(opts.cameraStreamCount).toBe(2);
     expect(opts.streamingOptions.supportedCryptoSuites).toContain(0); // AES_CM_128_HMAC_SHA1_80
     const resolutions = opts.streamingOptions.video.resolutions.map((r) => `${r[0]}x${r[1]}`);
-    // Live view is capped at <=640x480 for WiFi reliability (large keyframes drop).
+    // Without a probed native size, the conservative <=640x480 set is advertised.
     expect(resolutions).toContain("640x480");
     expect(resolutions.some((r) => r.startsWith("1280"))).toBe(false);
     expect(opts.streamingOptions.audio?.codecs?.[0]?.type).toBe("OPUS");
+  });
+
+  it("advertises ONLY the native resolution in copy mode (mismatch kills the session)", () => {
+    const delegate = new ArgusStreamingDelegate("Backyard Left", "rtsp://x", cacheWith(Buffer.from([0xff, 0xd8])));
+    const opts = buildCameraControllerOptions(delegate, true, undefined, { width: 896, height: 512 }, "copy");
+
+    expect(opts.streamingOptions.video.resolutions).toEqual([[896, 512, 30]]);
+  });
+
+  it("advertises the native size on top of the standard set in transcode mode", () => {
+    const delegate = new ArgusStreamingDelegate("Backyard Right", "rtsp://x", cacheWith(Buffer.from([0xff, 0xd8])));
+    const opts = buildCameraControllerOptions(delegate, true, undefined, { width: 896, height: 672 }, "transcode");
+
+    const resolutions = opts.streamingOptions.video.resolutions;
+    // Apple clients START small and RECONFIGURE up to the best advertised size,
+    // so the native entry is what makes full-screen exceed 640x480.
+    expect(resolutions[0]).toEqual([896, 672, 30]);
+    expect(resolutions.map((r) => `${r[0]}x${r[1]}`)).toContain("640x480");
   });
 });
 
@@ -158,9 +214,59 @@ describe("ArgusStreamingDelegate", () => {
     expect(bin).toBe("ffmpeg");
     expect(args.join(" ")).toContain("-i rtsp://127.0.0.1:8554/backyard-left-sub");
     expect(args.join(" ")).toContain("srtp://192.168.1.50:50000");
+    // Transcode is the default live mode (validated on real devices).
+    expect(args.join(" ")).toContain("-c:v libx264");
+    expect(args.join(" ")).toContain("scale=1280:720");
     // FFmpeg must encrypt with the CONTROLLER's key from the request (not a
     // generated one), or the device can't decrypt — the forever-spinner bug.
     const expectedVideoSrtp = Buffer.concat([Buffer.alloc(16, 1), Buffer.alloc(14, 2)]).toString("base64");
     expect(args.join(" ")).toContain(`-srtp_out_params ${expectedVideoSrtp}`);
+  });
+
+  it("respawns the encoder at the upgraded resolution on RECONFIGURE", async () => {
+    const procs: Array<EventEmitter & { kill: ReturnType<typeof vi.fn> }> = [];
+    const spawnFn = vi.fn(() => {
+      const proc = Object.assign(new EventEmitter(), { kill: vi.fn() });
+      procs.push(proc);
+      return proc;
+    }) as unknown as typeof import("node:child_process").spawn;
+    const delegate = new ArgusStreamingDelegate(
+      "Backyard Left",
+      "rtsp://127.0.0.1:8554/backyard-left-sub",
+      cacheWith(Buffer.from([0xff, 0xd8])),
+      { spawnFn },
+    );
+
+    await new Promise<void>((resolve, reject) => {
+      delegate.prepareStream(
+        { sessionID: "s2", targetAddress: "192.168.1.50",
+          video: { port: 50000, srtp_key: Buffer.alloc(16, 1), srtp_salt: Buffer.alloc(14, 2) },
+          audio: { port: 50002, srtp_key: Buffer.alloc(16, 3), srtp_salt: Buffer.alloc(14, 4) } } as never,
+        (error) => (error ? reject(error) : resolve()),
+      );
+    });
+    await new Promise<void>((resolve, reject) => {
+      delegate.handleStreamRequest(
+        { type: "start", sessionID: "s2",
+          video: { pt: 99, max_bit_rate: 132, fps: 30, width: 640, height: 360, mtu: 1378, profile: 2, level: 2 },
+          audio: { pt: 110, sample_rate: 24, max_bit_rate: 24, codec: 3 } } as never,
+        (error) => (error ? reject(error) : resolve()),
+      );
+    });
+
+    // Full-screen upgrade: Apple sends RECONFIGURE on the SAME session.
+    await new Promise<void>((resolve, reject) => {
+      delegate.handleStreamRequest(
+        { type: "reconfigure", sessionID: "s2",
+          video: { width: 896, height: 672, fps: 30, max_bit_rate: 600, rtcp_interval: 0.5 } } as never,
+        (error) => (error ? reject(error) : resolve()),
+      );
+    });
+
+    expect(spawnFn).toHaveBeenCalledTimes(2);
+    expect(procs[0]!.kill).toHaveBeenCalledWith("SIGKILL");
+    const secondArgs = (spawnFn as unknown as { mock: { calls: [string, string[]][] } }).mock.calls[1]![1].join(" ");
+    expect(secondArgs).toContain("scale=896:672");
+    expect(secondArgs).toContain("-b:v 600k");
   });
 });

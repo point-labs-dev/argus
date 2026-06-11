@@ -115,4 +115,12 @@ describe("go2rtc generation", () => {
     expect(go2rtcConfig.streams["front-door"]).toBeDefined();
     expect(go2rtcConfig.streams["front-door-sub"]).toBeDefined();
   });
+
+  it("preloads every sub stream (warm producers for fast live starts) but not mains", () => {
+    const config = createCameraConfig();
+    const go2rtcConfig = generateGo2RtcConfig(config);
+
+    expect(Object.keys(go2rtcConfig.preload)).toEqual(["front-door-sub"]);
+    expect(go2rtcConfig.preload["front-door-sub"]).toBe("");
+  });
 });

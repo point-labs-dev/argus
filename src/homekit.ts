@@ -1,6 +1,7 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { createSocket } from "node:dgram";
+import { networkInterfaces } from "node:os";
 
 import {
   Accessory,
@@ -59,6 +60,15 @@ export interface LiveFfmpegInput {
   /** go2rtc local restream, e.g. rtsp://127.0.0.1:8554/backyard-left-sub */
   inputUrl: string;
   targetAddress: string;
+  /**
+   * "transcode" (default) re-encodes to the negotiated envelope — the validated
+   * path on real devices. "copy" passes the camera's H.264 sub stream through
+   * untouched (no encode latency, native quality, ~zero CPU) but EXPERIMENTAL:
+   * macOS Home negotiates 640x360 regardless of what is advertised, receives the
+   * native-size stream, renders one frame and stops the session (2026-06-11).
+   * Enable via ARGUS_LIVE_COPY=1 to test against other clients (iPhone).
+   */
+  videoMode: "copy" | "transcode";
   video: {
     port: number;
     localRtcpPort: number;
@@ -91,41 +101,55 @@ export interface LiveFfmpegInput {
  * Kept side-effect free so it can be unit-tested without spawning anything.
  */
 export function buildLiveFfmpegArgs(input: LiveFfmpegInput, includeAudio = true): string[] {
-  const { inputUrl, targetAddress, video, audio } = input;
+  const { inputUrl, targetAddress, videoMode, video, audio } = input;
+
+  // Transcode re-encodes to the negotiated H.264 params. Copy needs none of it.
+  const videoCodecArgs =
+    videoMode === "copy"
+      ? ["-c:v", "copy"]
+      : [
+          "-c:v", "libx264",
+          "-preset", "veryfast",
+          "-tune", "zerolatency",
+          "-profile:v", video.profile,
+          "-level", video.level,
+          "-pix_fmt", "yuv420p",
+          "-color_range", "tv",
+          "-r", String(video.fps),
+          "-vf", `scale=${video.width}:${video.height}`,
+          // HomeKit needs frequent keyframes and no B-frames, or the iOS client waits
+          // forever for a decodable IDR (the "spinner that never resolves" symptom).
+          "-bf", "0",
+          "-g", String(video.fps * 2),
+          "-keyint_min", String(video.fps),
+          "-force_key_frames", "expr:gte(t,n_forced*1)",
+          "-b:v", `${video.maxBitrateKbps}k`,
+          "-maxrate", `${video.maxBitrateKbps}k`,
+          "-bufsize", `${2 * video.maxBitrateKbps}k`,
+        ];
+
+  // Cap RTSP stream analysis: FFmpeg's default ~5s runs past HomeKit's stream-start
+  // window (spinner → "No Response"). Copy mode goes much lower (0.2s): codec params
+  // come from go2rtc's SDP, and every analysis millisecond delays the keyframe that
+  // stream-copy waits for (bench: 1s analysis ≈ +1s start). 0.2s still reliably
+  // catches the AAC audio stream; probesize 32 did not (flaky "no stream" aborts).
+  const analyzeArgs =
+    videoMode === "copy"
+      ? ["-probesize", "100000", "-analyzeduration", "200000"]
+      : ["-probesize", "500000", "-analyzeduration", "1000000"];
 
   const videoArgs = [
     "-hide_banner",
     "-loglevel", "error",
-    // Low-latency input: cap RTSP stream analysis so FFmpeg starts emitting within
-    // ~1s. Without these, its default ~5s analysis runs past HomeKit's stream-start
-    // window and the iOS client spins forever then drops to "No Response".
     "-fflags", "nobuffer",
     "-flags", "low_delay",
-    "-probesize", "500000",
-    "-analyzeduration", "1000000",
+    ...analyzeArgs,
     "-rtsp_transport", "tcp",
     "-i", inputUrl,
 
-    // --- video: transcode to the negotiated H.264 params, SRTP out ---
+    // --- video: SRTP out ---
     "-an",
-    "-c:v", "libx264",
-    "-preset", "veryfast",
-    "-tune", "zerolatency",
-    "-profile:v", video.profile,
-    "-level", video.level,
-    "-pix_fmt", "yuv420p",
-    "-color_range", "tv",
-    "-r", String(video.fps),
-    "-vf", `scale=${video.width}:${video.height}`,
-    // HomeKit needs frequent keyframes and no B-frames, or the iOS client waits
-    // forever for a decodable IDR (the "spinner that never resolves" symptom).
-    "-bf", "0",
-    "-g", String(video.fps * 2),
-    "-keyint_min", String(video.fps),
-    "-force_key_frames", "expr:gte(t,n_forced*1)",
-    "-b:v", `${video.maxBitrateKbps}k`,
-    "-maxrate", `${video.maxBitrateKbps}k`,
-    "-bufsize", `${2 * video.maxBitrateKbps}k`,
+    ...videoCodecArgs,
     "-payload_type", String(video.payloadType),
     "-ssrc", String(video.ssrc),
     "-f", "rtp",
@@ -157,6 +181,29 @@ export function buildLiveFfmpegArgs(input: LiveFfmpegInput, includeAudio = true)
   ];
 }
 
+/**
+ * Where to actually send SRTP for a controller-requested target address.
+ * When the controller is THIS host (someone watching in the Mac's own Home app),
+ * it asks for media at the host's LAN IP — but macOS VPN/relay setups add
+ * self-addressed ipsec interfaces that hijack the route to one's own LAN IP and
+ * silently swallow the packets (verified 2026-06-11: UDP to own 10.0.0.x never
+ * arrives, loopback does). Deliver locally via loopback instead; non-local
+ * controllers are untouched.
+ */
+export function resolveSrtpTargetAddress(
+  requested: string,
+  interfaces: () => ReturnType<typeof networkInterfaces> = networkInterfaces,
+): string {
+  for (const addresses of Object.values(interfaces())) {
+    for (const address of addresses ?? []) {
+      if (address.address === requested) {
+        return requested.includes(":") ? "::1" : "127.0.0.1";
+      }
+    }
+  }
+  return requested;
+}
+
 /** Reserve a free UDP port by briefly binding an ephemeral socket. */
 async function reserveUdpPort(): Promise<number> {
   return new Promise((resolve, reject) => {
@@ -182,6 +229,8 @@ function srtpParamsFromRequest(key: Buffer, salt: Buffer): string {
 
 interface ActiveSession {
   ffmpeg?: ChildProcess;
+  /** The input used for the running FFmpeg — kept so RECONFIGURE can respawn with new video params. */
+  liveInput?: LiveFfmpegInput;
   prepared: {
     targetAddress: string;
     video: { port: number; localRtcpPort: number; ssrc: number; srtpParams: string };
@@ -198,6 +247,15 @@ export interface StreamingDelegateOptions {
   verbose?: boolean;
   /** Send audio (Opus) alongside video. Default true; set false for a video-only stream. */
   includeAudio?: boolean;
+  /** Live video handling. Default "transcode" (see LiveFfmpegInput.videoMode on why copy is experimental). */
+  videoMode?: "copy" | "transcode";
+  /**
+   * The live source's native resolution (probed from a snapshot at startup).
+   * Advertised to HomeKit ahead of the standard low-res set so iOS requests it —
+   * in copy mode what arrives IS this stream, so advertising it keeps the
+   * negotiation honest. Omitted → only the standard ≤640x480 set is advertised.
+   */
+  liveResolution?: { width: number; height: number };
   /** Injectable spawn for tests. */
   spawnFn?: typeof spawn;
 }
@@ -214,6 +272,7 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
   private readonly ffmpegPath: string;
   private readonly verbose: boolean;
   private readonly includeAudio: boolean;
+  private readonly videoMode: "copy" | "transcode";
   private readonly spawnFn: typeof spawn;
 
   public constructor(
@@ -227,6 +286,7 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
     this.ffmpegPath = options.ffmpegPath ?? "ffmpeg";
     this.verbose = options.verbose ?? true;
     this.includeAudio = options.includeAudio ?? true;
+    this.videoMode = options.videoMode ?? "transcode";
     this.spawnFn = options.spawnFn ?? spawn;
   }
 
@@ -258,7 +318,7 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
 
       this.sessions.set(request.sessionID, {
         prepared: {
-          targetAddress: request.targetAddress,
+          targetAddress: resolveSrtpTargetAddress(request.targetAddress),
           video: { port: request.video.port, localRtcpPort: videoRtcp, ssrc: videoSsrc, srtpParams: videoSrtpParams },
           audio: { port: request.audio.port, localRtcpPort: audioRtcp, ssrc: audioSsrc, srtpParams: audioSrtpParams },
         },
@@ -294,8 +354,45 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
       callback();
       return;
     }
-    // RECONFIGURE: accept without re-spawning for v1.
-    callback();
+    this.reconfigureStream(request, callback);
+  }
+
+  /**
+   * Apple clients START small (the tile player: 640x360@132k) and upgrade the
+   * SAME session via RECONFIGURE when the viewer goes full screen. Ignoring it
+   * (the old v1 behavior) is why full-screen live view stayed soft. Transcode
+   * respawns FFmpeg at the new resolution/bitrate; copy mode just acks — the
+   * passthrough stream is whatever the camera sends.
+   */
+  private reconfigureStream(
+    request: Extract<StreamingRequest, { type: StreamRequestTypes.RECONFIGURE }>,
+    callback: StreamRequestCallback,
+  ): void {
+    const session = this.sessions.get(request.sessionID);
+    callback(); // ack immediately; the respawn proceeds on its own
+
+    if (!session?.liveInput || this.videoMode !== "transcode") {
+      return;
+    }
+    const next: LiveFfmpegInput = {
+      ...session.liveInput,
+      video: {
+        ...session.liveInput.video,
+        width: request.video.width,
+        height: request.video.height,
+        fps: request.video.fps,
+        maxBitrateKbps: request.video.max_bit_rate,
+      },
+    };
+    if (this.verbose) {
+      process.stderr.write(
+        `[argus ${this.cameraName}] HomeKit reconfigure: ${request.video.width}x${request.video.height}@${request.video.fps} ` +
+          `bitrate=${request.video.max_bit_rate}k — respawning encoder\n`,
+      );
+    }
+    // SIGKILL is the teardown signal the exit handler ignores (no forceStop).
+    session.ffmpeg?.kill("SIGKILL");
+    this.spawnLive(request.sessionID, session, next);
   }
 
   private startStream(request: Extract<StreamingRequest, { type: StreamRequestTypes.START }>, callback: StreamRequestCallback): void {
@@ -310,14 +407,15 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
     if (this.verbose) {
       process.stderr.write(
         `[argus ${this.cameraName}] HomeKit negotiated video: ${request.video.width}x${request.video.height}@${request.video.fps} ` +
-          `profile=${profile} level=${level} ptype=${request.video.pt} bitrate=${request.video.max_bit_rate}k mtu=${request.video.mtu}; ` +
-          `audio: codec=${request.audio.codec} ${request.audio.sample_rate}kHz ptype=${request.audio.pt}\n`,
+          `profile=${profile} level=${level} ptype=${request.video.pt} bitrate=${request.video.max_bit_rate}k mtu=${request.video.mtu} ` +
+          `mode=${this.videoMode}; audio: codec=${request.audio.codec} ${request.audio.sample_rate}kHz ptype=${request.audio.pt}\n`,
       );
     }
 
-    const args = buildLiveFfmpegArgs({
+    const liveInput: LiveFfmpegInput = {
       inputUrl: this.liveUrl,
       targetAddress: session.prepared.targetAddress,
+      videoMode: this.videoMode,
       video: {
         port: session.prepared.video.port,
         localRtcpPort: session.prepared.video.localRtcpPort,
@@ -341,7 +439,20 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
         maxBitrateKbps: request.audio.max_bit_rate,
         srtpParams: session.prepared.audio.srtpParams,
       },
-    }, this.includeAudio);
+    };
+
+    this.spawnLive(request.sessionID, session, liveInput, callback);
+  }
+
+  /** Spawn (or respawn, for RECONFIGURE) the live FFmpeg for a prepared session. */
+  private spawnLive(
+    sessionID: string,
+    session: ActiveSession,
+    liveInput: LiveFfmpegInput,
+    callback?: StreamRequestCallback,
+  ): void {
+    const args = buildLiveFfmpegArgs(liveInput, this.includeAudio);
+    session.liveInput = liveInput;
 
     const log = (msg: string): void => {
       if (this.verbose) process.stderr.write(`[argus ${this.cameraName}] ${msg}\n`);
@@ -359,7 +470,7 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
     const answer = (error?: Error): void => {
       if (answered) return;
       answered = true;
-      callback(error);
+      callback?.(error);
     };
 
     ffmpeg.on("error", (error: Error) => {
@@ -374,8 +485,9 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
         return;
       }
       // A non-zero exit that isn't from our SIGKILL teardown means the stream broke.
+      // (SIGKILL is how stopStream and reconfigure respawns retire an encoder.)
       if (code !== 0 && signal !== "SIGKILL") {
-        this.controller?.forceStopStreamingSession(request.sessionID);
+        this.controller?.forceStopStreamingSession(sessionID);
       }
     });
 
@@ -399,7 +511,33 @@ export function buildCameraControllerOptions(
   delegate: ArgusStreamingDelegate,
   includeAudio = true,
   recordingDelegate?: ArgusRecordingDelegate,
+  liveResolution?: { width: number; height: number },
+  videoMode: "copy" | "transcode" = "transcode",
 ): CameraControllerOptions {
+  // Copy mode advertises ONLY the probed native resolution (a negotiation/stream
+  // mismatch is fatal: macOS rendered one frame and stopped the session).
+  // Transcode mode advertises the native size on top of the conservative set —
+  // Apple clients START at 640x360 for the tile and RECONFIGURE up to the best
+  // advertised size when the viewer goes full screen, which the delegate now
+  // honors by respawning the encoder. The old blanket ≤640x480 cap (WiFi keyframe
+  // bursts) is mitigated at these sizes: 896-wide keyframes at the negotiated
+  // ~600-800k bitrate stay deliverable, unlike the 1280x720@2M bursts that
+  // originally forced the cap.
+  const standardSet: [number, number, number][] = [
+    [640, 480, 30],
+    [640, 360, 30],
+    [480, 270, 30],
+    [320, 240, 15],
+  ];
+  let resolutions: [number, number, number][];
+  if (videoMode === "copy" && liveResolution) {
+    resolutions = [[liveResolution.width, liveResolution.height, 30]];
+  } else if (liveResolution && !standardSet.some(([w, h]) => w === liveResolution.width && h === liveResolution.height)) {
+    resolutions = [[liveResolution.width, liveResolution.height, 30], ...standardSet];
+  } else {
+    resolutions = standardSet;
+  }
+
   return {
     cameraStreamCount: 2, // allow two concurrent viewers
     delegate,
@@ -418,16 +556,7 @@ export function buildCameraControllerOptions(
           profiles: [H264Profile.BASELINE, H264Profile.MAIN, H264Profile.HIGH],
           levels: [H264Level.LEVEL3_1, H264Level.LEVEL3_2, H264Level.LEVEL4_0],
         },
-        // Capped to <=640x480 for live view: large (720p+) keyframes burst into
-        // many UDP packets that WiFi clients drop, leaving an undecodable frame
-        // (spinner). Low-res keyframes are small enough to arrive intact. HKSV
-        // recording can use the full-res main stream later.
-        resolutions: [
-          [640, 480, 30],
-          [640, 360, 30],
-          [480, 270, 30],
-          [320, 240, 15],
-        ],
+        resolutions,
       },
       // Omitting audio entirely makes HomeKit treat this as a video-only camera —
       // useful for isolating whether audio negotiation is what stalls a session.
@@ -474,7 +603,13 @@ export function createCameraAccessory(
     ...(options.verbose !== undefined ? { verbose: options.verbose } : {}),
   });
   const controller = new CameraController(
-    buildCameraControllerOptions(delegate, options.includeAudio ?? true, recordingDelegate),
+    buildCameraControllerOptions(
+      delegate,
+      options.includeAudio ?? true,
+      recordingDelegate,
+      options.liveResolution,
+      options.videoMode ?? "transcode",
+    ),
   );
   delegate.controller = controller;
   accessory.configureController(controller);

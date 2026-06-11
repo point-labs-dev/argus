@@ -43,11 +43,20 @@ export class ReolinkClient {
     const query = token ? `?cmd=${cmd}&token=${token}` : `?cmd=${cmd}`;
     const url = `http://${this.options.host}/cgi-bin/api.cgi${query}`;
     const body = JSON.stringify([{ cmd, action: 0, param }]);
-    const response = await this.fetchFn(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body,
-    });
+    let response: Response;
+    try {
+      response = await this.fetchFn(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body,
+      });
+    } catch (error) {
+      // undici reports transport failures as a generic "fetch failed" — surface
+      // the cause (ECONNREFUSED, EHOSTUNREACH, ETIMEDOUT…) or debugging is blind.
+      const cause = (error as { cause?: { code?: string; message?: string } }).cause;
+      const detail = cause?.code ?? cause?.message ?? (error instanceof Error ? error.message : String(error));
+      throw new ReolinkError(`${cmd} on ${this.options.host} fetch failed: ${detail}`);
+    }
     if (!response.ok) {
       throw new ReolinkError(`${cmd} on ${this.options.host} failed: HTTP ${response.status}`);
     }

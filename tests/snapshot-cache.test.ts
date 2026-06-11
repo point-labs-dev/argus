@@ -3,7 +3,7 @@ import { Buffer } from "node:buffer";
 import { describe, expect, it, vi } from "vitest";
 
 import { parseArgusConfig } from "../src/config.js";
-import { SnapshotCache } from "../src/snapshot-cache.js";
+import { parseJpegDimensions, SnapshotCache } from "../src/snapshot-cache.js";
 
 const jpeg = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10]);
 const invalidJpeg = Buffer.from([0x6e, 0x6f, 0x70, 0x65]);
@@ -60,6 +60,31 @@ function createConfig() {
 function okResponse(buffer = jpeg): Response {
   return new Response(buffer);
 }
+
+describe("parseJpegDimensions", () => {
+  it("reads width/height from the SOF0 frame header", () => {
+    // Minimal JPEG: SOI, APP0 (JFIF stub), SOF0 declaring 896x512, EOI.
+    const sof0 = Buffer.from([
+      0xff, 0xc0, 0x00, 0x11, 0x08,
+      0x02, 0x00, // height 512
+      0x03, 0x80, // width 896
+      0x03, 0x01, 0x22, 0x00, 0x02, 0x11, 0x01, 0x03, 0x11, 0x01,
+    ]);
+    const jpegBuffer = Buffer.concat([
+      Buffer.from([0xff, 0xd8]),
+      Buffer.from([0xff, 0xe0, 0x00, 0x04, 0x4a, 0x46]), // APP0, length 4
+      sof0,
+      Buffer.from([0xff, 0xd9]),
+    ]);
+
+    expect(parseJpegDimensions(jpegBuffer)).toEqual({ width: 896, height: 512 });
+  });
+
+  it("returns undefined for non-JPEG data and truncated buffers", () => {
+    expect(parseJpegDimensions(Buffer.from("not a jpeg"))).toBeUndefined();
+    expect(parseJpegDimensions(Buffer.from([0xff, 0xd8, 0xff]))).toBeUndefined();
+  });
+});
 
 describe("SnapshotCache", () => {
   it("fetches and stores a valid JPEG snapshot with metadata", async () => {

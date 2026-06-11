@@ -29,6 +29,43 @@ export class SnapshotCacheError extends Error {
   }
 }
 
+/**
+ * Width/height from a JPEG buffer (the SOFn frame header). Used at startup to
+ * probe a camera's live-stream resolution from its snapshot, so the HomeKit
+ * accessory can advertise the native size that copy-mode live view delivers.
+ */
+export function parseJpegDimensions(buffer: Buffer): { width: number; height: number } | undefined {
+  if (buffer.length < 4 || buffer[0] !== 0xff || buffer[1] !== 0xd8) {
+    return undefined;
+  }
+  let offset = 2;
+  while (offset + 9 < buffer.length) {
+    if (buffer[offset] !== 0xff) {
+      offset += 1;
+      continue;
+    }
+    const marker = buffer[offset + 1]!;
+    if (marker === 0xff) {
+      offset += 1; // fill byte
+      continue;
+    }
+    // Standalone markers with no length payload (SOI, RSTn, TEM).
+    if (marker === 0xd8 || (marker >= 0xd0 && marker <= 0xd7) || marker === 0x01) {
+      offset += 2;
+      continue;
+    }
+    if (marker === 0xda) {
+      return undefined; // start-of-scan before any SOF — give up rather than misparse
+    }
+    // SOFn carry the frame size: [length(2)][precision(1)][height(2)][width(2)].
+    if (marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc) {
+      return { height: buffer.readUInt16BE(offset + 5), width: buffer.readUInt16BE(offset + 7) };
+    }
+    offset += 2 + buffer.readUInt16BE(offset + 2);
+  }
+  return undefined;
+}
+
 interface CameraStreams {
   cameraName: string;
   streams: Record<SnapshotProfile, string>;
