@@ -96,3 +96,47 @@ All four verified on a real RLC-812A (4K H.265 main / H.264 sub) on 2026-06-10.
 **Net:** keep the architecture; rework `go2rtc.ts` URL generation into a
 per-device/per-codec strategy (FLV-sub always; main = `ffmpeg:`-FLV then RTSP
 fallback; RTSP path style by device class) instead of today's one-size bare-URL output.
+
+## 2026-06-11 — live-feed deep-dive (start time, resolution, the Mac-viewer trap)
+
+- **Reolink GOP ("Interframe Space") is THE live-view start lever.** `GetEnc
+  action:1` exposes `gop` 1–4 per stream on standalone cams; everything shipped
+  at gop=4 (4s keyframes). gop=1 → 1s keyframes on the fluent subs. The NVR
+  (RLN8-410) strips `gop` and pins its channels at 4.0s regardless of fps —
+  per-channel SetEnc ranges it advertises are a union template and lie (the D500
+  rejects what the table offers). Measure with ffprobe, don't trust ranges.
+- **Stream map:** ext/balanced = 896x512 (16:9) / 896x672 (4:3), ~2.0s keyframes,
+  NOT API-configurable, FLV-only on standalone cams; fluent = ≤640x480,
+  configurable. On NVR channels ext==sub. go2rtc `-sub` (FLV-ext first) is
+  therefore 896-wide everywhere — above the old 640x480 cap for free.
+- **go2rtc `preload:` (v1.9.14+) is the warm-stream answer.** Producers otherwise
+  die with their last consumer and every live tap pays a 1–3s cold camera
+  connect. With preload + gop tuning + 0.2s FFmpeg input analysis (copy mode),
+  time-to-first-video-packet: standalone avg ~1.2–1.7s, NVR ~2.4s (GOP-bound).
+  Snapshot polling every 5s is NOT a reliable keep-warm.
+- **FFmpeg stream-copy waits for the NEXT keyframe after input analysis ends**
+  (it discards leading non-key packets), so every analysis millisecond directly
+  delays start. 200000µs analyze / 100000 probesize is the floor that still
+  reliably catches the AAC audio stream (32-byte probesize aborts ~40% of runs
+  with "Output file does not contain any stream").
+- **Apple clients START live sessions at 640x360@132k and upgrade via
+  RECONFIGURE** when the viewer goes full screen — regardless of what resolutions
+  the accessory advertises (verified against fresh /accessories fetches). So:
+  (a) handle RECONFIGURE (respawn the encoder at the new params) or full-screen
+  stays soft forever; (b) `-c:v copy` can never satisfy a strict controller,
+  because delivered ≠ negotiated kills the session after the first IDR (macOS at
+  least; iPhone unverified). Copy stays behind ARGUS_LIVE_COPY=1.
+- **Changing advertised streaming config does NOT bump the HAP c#** — controllers
+  keep their cached copy until `configVersion` is hand-bumped in
+  `.homekit/AccessoryInfo.*.json` (daemon stopped) or the accessory is re-paired.
+- **THIS MacBook cannot receive its own SRTP**: VPN/relay ipsec interfaces
+  self-address the LAN IP and `route get 10.0.0.46` → ipsec1; UDP from the host
+  to its own LAN IP vanishes (nc-verified), so the local Home app's live view
+  freezes on one frame for ANY mode. Mitigated best-effort by rewriting
+  own-address SRTP targets to loopback (`resolveSrtpTargetAddress`), but the Mac
+  Home app seems to bind the specific address → **verify live view on an iPhone,
+  never on this Mac**. Snapshots/motion/HKSV (TCP) verify fine from the Mac.
+- **launchd findings:** launchd-spawned node reaches the LAN fine (no TCC wall —
+  proven with a `launchctl submit` A/B). The first ~30s after daemon boot, camera
+  HTTP servers refuse some connections (preload+login+probe burst) — transient,
+  self-healing; retry loops required for anything one-shot at startup.
