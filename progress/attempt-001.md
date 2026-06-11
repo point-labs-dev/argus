@@ -161,3 +161,21 @@ source (sharper downscale), or x264 intra-refresh to survive higher res over WiF
    HomeKit Data Stream on motion; verify Apple's person/vehicle/animal labels in the Home
    timeline. Confirm a Home Hub (Apple TV/HomePod) is present first.
 4. **Doorbell** service for .9. Ops: re-add 4 standalone to NVR; DHCP-reserve; rotate password.
+
+### Motion + HKSV slices built (2026-06-10, commits e2880f9/68382cc/c6b04a3)
+- **Motion** (src/reolink.ts + src/motion.ts): ReolinkClient (login + GetMdState OR
+  GetAiState person/vehicle — Peter's cams run AI mode, GetMdState stays 0) → MotionMonitor
+  (~1s poll, 30s cooldown) → controller-managed MotionSensor (sensors.motion, so it actually
+  triggers HKSV; a manually-added sensor would not). Client verified vs real cams; live motion
+  event not yet caught (coordination — hard to trigger outdoor cams on cue).
+- **HKSV** (src/mp4.ts + src/recording.ts): parse FFmpeg fragmented-MP4 into init segment +
+  keyframe fragments; ArgusRecordingDelegate records the full-res MAIN stream on a Home-Hub
+  recording request. **Verified end-to-end vs the real Garage Door main**: init + 2 fragments
+  reassemble into valid H.264 1280x720 + AAC.
+- Bug found in testing: recording must NOT use -an/-vn (single fMP4 output needs both streams,
+  else "Invalid argument"). Live view uses -an/-vn only because it has TWO separate SRTP outputs.
+
+### On-device co-test still pending (needs Peter)
+1. Enable "Stream & Allow Recording" per camera in the Home app (HKSV is off until the user turns it on).
+2. Trigger motion at a camera → confirm: HomeKit motion notification, then an HKSV clip in the
+   Home timeline WITH Apple's person/vehicle/animal label. That label IS the detection upgrade.
