@@ -22,3 +22,6 @@ recordings/
 
 # HomeKit persistence
 .homekit/
+
+# launchd daemon logs
+logs/
