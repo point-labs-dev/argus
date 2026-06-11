@@ -4,14 +4,27 @@
 // video SRTP packet plus sustained flow. The on-device number ≈ this + HomeKit
 // negotiation (~0.3s) + decode/render.
 //
-// Usage: node scripts/bench-live-start.mjs [stream-name] [runs]
+// Usage: node scripts/bench-live-start.mjs [stream-name] [runs] [--mode copy|transcode]
+//                                          [--size WxH] [--bitrate K]
+//   copy (default):  the experimental passthrough args against a sub stream
+//   transcode:       the production encoder args — pair with a main stream +
+//                    --size 1280x720 --bitrate 2000 to bench the ≥720p live path
 import { createSocket } from "node:dgram";
 import { spawn } from "node:child_process";
 
 import { buildLiveFfmpegArgs } from "../dist/homekit.js";
 
-const streamName = process.argv[2] ?? "garage-door-sub";
-const runs = Number(process.argv[3] ?? 5);
+const positional = process.argv.slice(2).filter((a) => !a.startsWith("--"));
+const flag = (name, fallback) => {
+  const i = process.argv.indexOf(`--${name}`);
+  return i === -1 ? fallback : process.argv[i + 1];
+};
+const streamName = positional[0] ?? "garage-door-sub";
+const runs = Number(positional[1] ?? 5);
+const mode = flag("mode", "copy");
+const [width, height] = flag("size", "896x512").split("x").map(Number);
+const bitrate = Number(flag("bitrate", 299));
+const windowMs = Number(flag("window", 6000));
 
 async function udpSocket() {
   const socket = createSocket("udp4");
@@ -38,10 +51,10 @@ async function benchOnce() {
   const args = buildLiveFfmpegArgs({
     inputUrl: `rtsp://127.0.0.1:8554/${streamName}`,
     targetAddress: "127.0.0.1",
-    videoMode: "copy",
+    videoMode: mode,
     video: {
       port: videoPort, localRtcpPort: videoRtcp, ssrc: 111, payloadType: 99,
-      maxBitrateKbps: 299, fps: 30, width: 896, height: 512, mtu: 1378,
+      maxBitrateKbps: bitrate, fps: 30, width, height, mtu: 1378,
       profile: "high", level: "4.0",
       srtpParams: Buffer.alloc(30, 7).toString("base64"),
     },
@@ -77,8 +90,9 @@ async function benchOnce() {
   let stderr = "";
   ffmpeg.stderr.on("data", (chunk) => { stderr += chunk; });
 
-  // Sample for 6s: long enough to capture start + sustained flow.
-  await new Promise((resolve) => setTimeout(resolve, 6_000));
+  // Sample window: long enough to capture start + sustained flow (--window to widen,
+  // e.g. for the NVR mains whose 4s GOP + 11MP decode start slowly).
+  await new Promise((resolve) => setTimeout(resolve, windowMs));
   ffmpeg.kill("SIGKILL");
   video.close();
   audio.close();
@@ -89,7 +103,7 @@ async function benchOnce() {
   return { ok: true, firstVideoMs, videoPackets, audioPackets };
 }
 
-console.log(`stream=${streamName} runs=${runs} (copy mode, local UDP sink)`);
+console.log(`stream=${streamName} runs=${runs} mode=${mode} ${width}x${height}@${bitrate}k (local UDP sink)`);
 const times = [];
 for (let i = 0; i < runs; i++) {
   const result = await benchOnce();

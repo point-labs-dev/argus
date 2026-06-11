@@ -71,10 +71,27 @@ describe("go2rtc generation", () => {
     expect(buildRtspUrl(camera, "sub")).toContain("/h264Preview_01_sub");
     // H.265 main can't use HTTP-FLV — auto mode must yield RTSP only.
     expect(buildTransportSources(camera, "main")).toEqual([buildRtspUrl(camera, "main")]);
-    // The sub stream still leads with HTTP-FLV.
+  });
+
+  it("keeps the h264 RTSP path name for NVR channels whatever the true main codec", () => {
+    // The NVR's RTSP namespace has h264Preview_* names ONLY (h265Preview_* 404s);
+    // its 12MP D1200 channels serve HEVC inside the h264-named path. mainCodec
+    // records the true codec so auto transport skips the dead FLV-main route.
+    const camera = createCameraConfig("auto", 2, "h265").cameras[0]!;
+
+    expect(buildRtspUrl(camera, "main")).toContain("/h264Preview_03_main");
+    expect(buildTransportSources(camera, "main")).toEqual([buildRtspUrl(camera, "main")]);
+  });
+
+  it("leads subs with RTSP (the gop-tuned fluent stream), FLV-ext as fallback", () => {
+    // The FLV "sub" name is really the EXT profile: 896-wide but a FIXED ~2s
+    // keyframe interval. RTSP serves the true fluent sub whose gop the tuner
+    // sets to 1s — about 1s faster to first frame for tile-sized live sessions.
+    const camera = createCameraConfig("auto").cameras[0]!;
+
     expect(buildTransportSources(camera, "sub")).toEqual([
-      buildHttpFlvUrl(camera, "sub"),
       buildRtspUrl(camera, "sub"),
+      buildHttpFlvUrl(camera, "sub"),
     ]);
   });
 
@@ -116,11 +133,14 @@ describe("go2rtc generation", () => {
     expect(go2rtcConfig.streams["front-door-sub"]).toBeDefined();
   });
 
-  it("preloads every sub stream (warm producers for fast live starts) but not mains", () => {
+  it("preloads every sub AND main stream (warm producers for fast live starts)", () => {
     const config = createCameraConfig();
     const go2rtcConfig = generateGo2RtcConfig(config);
 
-    expect(Object.keys(go2rtcConfig.preload)).toEqual(["front-door-sub"]);
+    // Subs feed tiles/<720p live; mains feed ≥720p live + HKSV. Cold producers
+    // cost 1-3s on the first tap, so both stay connected.
+    expect(Object.keys(go2rtcConfig.preload).sort()).toEqual(["front-door", "front-door-sub"]);
     expect(go2rtcConfig.preload["front-door-sub"]).toBe("");
+    expect(go2rtcConfig.preload["front-door"]).toBe("");
   });
 });

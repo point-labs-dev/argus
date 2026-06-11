@@ -26,7 +26,10 @@ cameras:
   - name: "Front L"
     host: 192.168.1.113     # the NVR's IP
     channel: 2              # NVR channel (RTSP path becomes h264Preview_03_*)
-    mainCodec: h264         # most NVR-attached D-series cams are H.264
+    mainCodec: h264         # the TRUE codec of the channel's main stream — probe it!
+                            # 12MP D-series channels encode HEVC: set h265 (the NVR
+                            # path name stays h264Preview_*, but FLV main must be
+                            # skipped or the stream delivers nothing)
     username: admin
     password: change-me
     transport: auto

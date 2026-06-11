@@ -77,15 +77,24 @@ export async function startArgusServer(config: ArgusConfig, configDir = process.
     // ARGUS_AUDIO=0 publishes video-only accessories (diagnostic isolation).
     const includeAudio = process.env.ARGUS_AUDIO !== "0";
     const liveResolution = liveResolutions.get(camera.name);
-    // Transcode is the validated live path (now with RECONFIGURE upgrades to the
-    // probed native size). ARGUS_LIVE_COPY=1 opts into the experimental passthrough
+    // Transcode is the validated live path: tiles/<720p transcode the sub stream,
+    // ≥720p sessions (Apple's standard ladder, advertised up to 1080p) transcode
+    // the full-res main. ARGUS_LIVE_COPY=1 opts into the experimental passthrough
     // (needs the probed resolution; macOS Home kills mismatched copy sessions).
     const videoMode =
       process.env.ARGUS_LIVE_COPY === "1" && liveResolution ? "copy" : "transcode";
-    process.stdout.write(`[argus ${camera.name}] live mode: ${videoMode}\n`);
+    // Standalone cameras (their own host) source ≥720p live from the main stream.
+    // NVR-fronted channels don't: their mains keyframe every 4s (hard limit) and
+    // the D1200s encode 12MP HEVC — both blow the live start-time budget. Their
+    // ≥720p sessions upscale the 896-wide sub source instead.
+    const standalone = config.cameras.filter((c) => c.host === camera.host).length === 1;
+    process.stdout.write(
+      `[argus ${camera.name}] live mode: ${videoMode}${videoMode === "transcode" ? ` (≥720p source: ${standalone ? "main" : "sub"})` : ""}\n`,
+    );
     const { accessory, setMotion } = createCameraAccessory(camera, liveUrl, mainUrl, cache, {
       includeAudio,
       videoMode,
+      ...(standalone ? { mainStreamUrl: mainUrl } : {}),
       ...(liveResolution ? { liveResolution } : {}),
     });
     setMotionByCamera.set(camera.name, setMotion);

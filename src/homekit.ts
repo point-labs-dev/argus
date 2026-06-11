@@ -57,7 +57,11 @@ export interface SrtpParameters {
 }
 
 export interface LiveFfmpegInput {
-  /** go2rtc local restream, e.g. rtsp://127.0.0.1:8554/backyard-left-sub */
+  /**
+   * go2rtc local restream, e.g. rtsp://127.0.0.1:8554/backyard-left-sub.
+   * ≥720p transcode sessions get the camera's MAIN restream instead — the
+   * 896-wide ext stream has no pixels to fill 1280x720 (see pickInputUrl).
+   */
   inputUrl: string;
   targetAddress: string;
   /**
@@ -116,7 +120,11 @@ export function buildLiveFfmpegArgs(input: LiveFfmpegInput, includeAudio = true)
           "-pix_fmt", "yuv420p",
           "-color_range", "tv",
           "-r", String(video.fps),
-          "-vf", `scale=${video.width}:${video.height}`,
+          // Fit within the negotiated box, preserving aspect (homebridge-camera-ffmpeg
+          // pattern). A plain WxH scale would stretch the 4:3 sources (RLC-520A main is
+          // 2560x1920) into the 16:9 sizes Apple negotiates. Never exceeds the
+          // negotiated dimensions — oversize is what controllers kill sessions over.
+          "-vf", `scale=${video.width}:${video.height}:force_original_aspect_ratio=decrease:force_divisible_by=2`,
           // HomeKit needs frequent keyframes and no B-frames, or the iOS client waits
           // forever for a decodable IDR (the "spinner that never resolves" symptom).
           "-bf", "0",
@@ -129,14 +137,12 @@ export function buildLiveFfmpegArgs(input: LiveFfmpegInput, includeAudio = true)
         ];
 
   // Cap RTSP stream analysis: FFmpeg's default ~5s runs past HomeKit's stream-start
-  // window (spinner → "No Response"). Copy mode goes much lower (0.2s): codec params
-  // come from go2rtc's SDP, and every analysis millisecond delays the keyframe that
-  // stream-copy waits for (bench: 1s analysis ≈ +1s start). 0.2s still reliably
-  // catches the AAC audio stream; probesize 32 did not (flaky "no stream" aborts).
-  const analyzeArgs =
-    videoMode === "copy"
-      ? ["-probesize", "100000", "-analyzeduration", "200000"]
-      : ["-probesize", "500000", "-analyzeduration", "1000000"];
+  // window (spinner → "No Response"). 0.2s is enough for transcode too — codec
+  // params come from go2rtc's SDP, and every analysis millisecond delays the first
+  // frame out (bench 2026-06-11: trimming 1s → 0.2s took the 720p-from-main start
+  // from 2.8s to 1.8s; AAC detection stayed reliable on subs AND mains, 13/13
+  // runs). probesize 32 was the value that flaked ("no stream" aborts) — keep 100k.
+  const analyzeArgs = ["-probesize", "100000", "-analyzeduration", "200000"];
 
   const videoArgs = [
     "-hide_banner",
@@ -250,10 +256,19 @@ export interface StreamingDelegateOptions {
   /** Live video handling. Default "transcode" (see LiveFfmpegInput.videoMode on why copy is experimental). */
   videoMode?: "copy" | "transcode";
   /**
+   * go2rtc restream of the camera's full-res MAIN stream. When set, transcode
+   * sessions negotiated at ≥720p source from it instead of the light sub/ext
+   * stream (896-wide — upscaling it is why full-screen looked the same as the
+   * tile). Sub remains the source below 720p: cheaper to decode, and its
+   * 1s keyframes start faster than the NVR mains' 4s.
+   */
+  mainStreamUrl?: string;
+  /**
    * The live source's native resolution (probed from a snapshot at startup).
-   * Advertised to HomeKit ahead of the standard low-res set so iOS requests it —
-   * in copy mode what arrives IS this stream, so advertising it keeps the
-   * negotiation honest. Omitted → only the standard ≤640x480 set is advertised.
+   * Used by COPY mode only, where it is the single advertised size — what
+   * arrives IS this stream, so the advertisement must match. Transcode mode
+   * ignores it: Apple clients only ever negotiate their own standard ladder
+   * (measured 2026-06-11 — non-standard sizes are dead weight).
    */
   liveResolution?: { width: number; height: number };
   /** Injectable spawn for tests. */
@@ -273,6 +288,7 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
   private readonly verbose: boolean;
   private readonly includeAudio: boolean;
   private readonly videoMode: "copy" | "transcode";
+  private readonly mainStreamUrl?: string;
   private readonly spawnFn: typeof spawn;
 
   public constructor(
@@ -287,7 +303,21 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
     this.verbose = options.verbose ?? true;
     this.includeAudio = options.includeAudio ?? true;
     this.videoMode = options.videoMode ?? "transcode";
+    if (options.mainStreamUrl !== undefined) this.mainStreamUrl = options.mainStreamUrl;
     this.spawnFn = options.spawnFn ?? spawn;
+  }
+
+  /**
+   * Live input per negotiated size: ≥720p transcode sessions pull the full-res
+   * MAIN restream (the sub/ext source tops out 896-wide — no pixels for 720p+);
+   * everything else stays on the light sub. Copy mode always passes the sub
+   * through (mains can be H.265, which copy can't deliver to HomeKit).
+   */
+  private pickInputUrl(width: number, height: number): string {
+    if (this.videoMode === "transcode" && this.mainStreamUrl && (width >= 1280 || height >= 720)) {
+      return this.mainStreamUrl;
+    }
+    return this.liveUrl;
   }
 
   public handleSnapshotRequest(_request: SnapshotRequest, callback: SnapshotRequestCallback): void {
@@ -376,6 +406,8 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
     }
     const next: LiveFfmpegInput = {
       ...session.liveInput,
+      // Re-pick the source: a full-screen upgrade to ≥720p moves to the main stream.
+      inputUrl: this.pickInputUrl(request.video.width, request.video.height),
       video: {
         ...session.liveInput.video,
         width: request.video.width,
@@ -387,7 +419,7 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
     if (this.verbose) {
       process.stderr.write(
         `[argus ${this.cameraName}] HomeKit reconfigure: ${request.video.width}x${request.video.height}@${request.video.fps} ` +
-          `bitrate=${request.video.max_bit_rate}k — respawning encoder\n`,
+          `bitrate=${request.video.max_bit_rate}k source=${next.inputUrl} — respawning encoder\n`,
       );
     }
     // SIGKILL is the teardown signal the exit handler ignores (no forceStop).
@@ -408,12 +440,13 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
       process.stderr.write(
         `[argus ${this.cameraName}] HomeKit negotiated video: ${request.video.width}x${request.video.height}@${request.video.fps} ` +
           `profile=${profile} level=${level} ptype=${request.video.pt} bitrate=${request.video.max_bit_rate}k mtu=${request.video.mtu} ` +
-          `mode=${this.videoMode}; audio: codec=${request.audio.codec} ${request.audio.sample_rate}kHz ptype=${request.audio.pt}\n`,
+          `mode=${this.videoMode} source=${this.pickInputUrl(request.video.width, request.video.height)}; ` +
+          `audio: codec=${request.audio.codec} ${request.audio.sample_rate}kHz ptype=${request.audio.pt}\n`,
       );
     }
 
     const liveInput: LiveFfmpegInput = {
-      inputUrl: this.liveUrl,
+      inputUrl: this.pickInputUrl(request.video.width, request.video.height),
       targetAddress: session.prepared.targetAddress,
       videoMode: this.videoMode,
       video: {
@@ -516,27 +549,28 @@ export function buildCameraControllerOptions(
 ): CameraControllerOptions {
   // Copy mode advertises ONLY the probed native resolution (a negotiation/stream
   // mismatch is fatal: macOS rendered one frame and stopped the session).
-  // Transcode mode advertises the native size on top of the conservative set —
-  // Apple clients START at 640x360 for the tile and RECONFIGURE up to the best
-  // advertised size when the viewer goes full screen, which the delegate now
-  // honors by respawning the encoder. The old blanket ≤640x480 cap (WiFi keyframe
-  // bursts) is mitigated at these sizes: 896-wide keyframes at the negotiated
-  // ~600-800k bitrate stay deliverable, unlike the 1280x720@2M bursts that
-  // originally forced the cap.
+  // Transcode mode advertises the Apple-standard ladder. Measured 2026-06-11:
+  // Apple clients pick exclusively from their OWN ladder (1920x1080 / 1280x720 /
+  // 640x360 / 480x270 / 320x240) — the probed non-standard sizes (896x512/896x672)
+  // were advertised for a full day and never once negotiated, while every session
+  // settled at 640x360 because nothing bigger from the ladder was on offer. So
+  // quality = advertise the standard sizes and back them with real pixels: the
+  // delegate sources ≥720p sessions from the camera's full-res main stream.
+  // WiFi keyframe-burst risk at 720p+ (the reason for the original ≤640x480 cap)
+  // is mitigated by the encoder's 1s forced IDRs; if full-screen still spins,
+  // walk the ladder in the goal prompt (relax IDRs → intra-refresh → pkt_size).
   const standardSet: [number, number, number][] = [
+    [1920, 1080, 30],
+    [1280, 720, 30],
     [640, 480, 30],
     [640, 360, 30],
     [480, 270, 30],
     [320, 240, 15],
   ];
-  let resolutions: [number, number, number][];
-  if (videoMode === "copy" && liveResolution) {
-    resolutions = [[liveResolution.width, liveResolution.height, 30]];
-  } else if (liveResolution && !standardSet.some(([w, h]) => w === liveResolution.width && h === liveResolution.height)) {
-    resolutions = [[liveResolution.width, liveResolution.height, 30], ...standardSet];
-  } else {
-    resolutions = standardSet;
-  }
+  const resolutions: [number, number, number][] =
+    videoMode === "copy" && liveResolution
+      ? [[liveResolution.width, liveResolution.height, 30]]
+      : standardSet;
 
   return {
     cameraStreamCount: 2, // allow two concurrent viewers
@@ -596,6 +630,9 @@ export function createCameraAccessory(
     .setCharacteristic(Characteristic.Model, "Argus")
     .setCharacteristic(Characteristic.SerialNumber, `argus-${camera.host}-${camera.channel}`);
 
+  // Whether live ≥720p sessions may source the main restream is the caller's call
+  // (serve grants it to standalone cameras only — the NVR mains' 4s GOP + 12MP
+  // HEVC decode cannot meet the live start-time bar; recording still uses them).
   const delegate = new ArgusStreamingDelegate(camera.name, liveUrl, snapshots, options);
   // HKSV recording delegate records the full-res MAIN stream on motion.
   const recordingDelegate = new ArgusRecordingDelegate(camera.name, mainUrl, {

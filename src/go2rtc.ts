@@ -15,7 +15,9 @@ export interface Go2RtcConfig {
    * (stream name → probe query; "" = default video&audio). Without this a
    * producer only exists while a consumer is attached, so every HomeKit live
    * tap pays the cold camera connect (~1-3s) before the keyframe wait even
-   * starts. Sub streams are preloaded; mains stay on-demand (HKSV only).
+   * starts. Subs AND mains are preloaded: subs feed tiles/<720p live, mains
+   * feed ≥720p live + HKSV. Standing LAN load ~40Mbps for 7 cameras —
+   * acceptable, and the NVR pulls the mains continuously anyway.
    */
   preload: Record<string, string>;
 }
@@ -86,7 +88,14 @@ export function buildRtspUrl(camera: CameraConfig, profile: CameraProfile): stri
   // Codec-prefixed paths (h264/h265Preview_0N) work on every Reolink device class
   // tested — standalone cams, NVR channels, doorbell. The bare Preview_0N form
   // 404s on newer 4K/H.265 models (RLC-812A), so always prefix. Sub is H.264.
-  const codec = profile === "main" ? camera.mainCodec : "h264";
+  // On the NVR the prefix is only a path LABEL: its namespace has h264Preview_*
+  // names exclusively (h265Preview_* 404s) while the payload follows the channel
+  // encoder — the 12MP D1200 channels serve HEVC inside h264Preview_0N_main
+  // (probed 2026-06-11). mainCodec stays the TRUE codec (it drives transport
+  // selection); NVR-fronted cameras (channel > 0 — standalone Reolink cams are
+  // always channel 0) keep the h264 path name regardless.
+  const codec =
+    profile === "main" && camera.channel === 0 ? camera.mainCodec : "h264";
 
   return `rtsp://${username}:${password}@${camera.host}:554/${codec}Preview_${previewChannel}_${profile}`;
 }
@@ -98,12 +107,18 @@ export function buildTransportSources(camera: CameraConfig, profile: CameraProfi
   switch (camera.transport) {
     case "auto":
       // H.265 main streams don't work over Reolink HTTP-FLV (verified: bare and
-      // ffmpeg-wrapped FLV both fail on the RLC-812A) — use RTSP only. Everything
-      // else (all subs, H.264 mains) keeps HTTP-FLV first with RTSP fallback.
-      if (profile === "main" && camera.mainCodec === "h265") {
-        return [rtspUrl];
+      // ffmpeg-wrapped FLV both fail on the RLC-812A; the HEVC NVR channels hang
+      // the same way) — use RTSP only. H.264 mains keep HTTP-FLV first with RTSP
+      // fallback.
+      if (profile === "main") {
+        return camera.mainCodec === "h265" ? [rtspUrl] : [httpFlvUrl, rtspUrl];
       }
-      return [httpFlvUrl, rtspUrl];
+      // Subs: RTSP first. The FLV name for "sub" is actually the EXT profile
+      // (896-wide, FIXED ~2s keyframes, not API-configurable) while RTSP serves
+      // the true fluent sub whose gop the tuner sets to 1s — measured 2026-06-11,
+      // sourcing ext cost tiles ~1s of extra keyframe wait. Now that ≥720p live
+      // sessions transcode the main stream, ext's extra width buys nothing.
+      return [rtspUrl, httpFlvUrl];
     case "http-flv":
       return [httpFlvUrl];
     case "rtsp":
@@ -126,6 +141,7 @@ export function generateGo2RtcConfig(config: ArgusConfig): Go2RtcConfig {
     streams[streamName.main] = buildTransportSources(camera, "main");
     streams[streamName.sub] = buildTransportSources(camera, "sub");
     preload[streamName.sub] = "";
+    preload[streamName.main] = "";
   });
 
   return {

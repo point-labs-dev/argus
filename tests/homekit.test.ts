@@ -92,12 +92,14 @@ describe("buildLiveFfmpegArgs", () => {
 
   it("caps RTSP input analysis so the stream starts fast (else HomeKit times out)", () => {
     const args = buildLiveFfmpegArgs(liveInput());
-    // Low-latency flags must come BEFORE -i to apply to the input.
+    // Low-latency flags must come BEFORE -i to apply to the input. 0.2s analysis
+    // is bench-validated for transcode too (2026-06-11: 1s of analysis was 1s of
+    // start latency; AAC detection stayed reliable at 0.2s/100k).
     const inputIndex = args.indexOf("-i");
     const head = args.slice(0, inputIndex).join(" ");
     expect(head).toContain("-fflags nobuffer");
-    expect(head).toContain("-probesize 500000");
-    expect(head).toContain("-analyzeduration 1000000");
+    expect(head).toContain("-probesize 100000");
+    expect(head).toContain("-analyzeduration 200000");
   });
 
   it("targets the device address with matching SRTP params and SSRCs", () => {
@@ -140,9 +142,7 @@ describe("buildCameraControllerOptions", () => {
     expect(opts.cameraStreamCount).toBe(2);
     expect(opts.streamingOptions.supportedCryptoSuites).toContain(0); // AES_CM_128_HMAC_SHA1_80
     const resolutions = opts.streamingOptions.video.resolutions.map((r) => `${r[0]}x${r[1]}`);
-    // Without a probed native size, the conservative <=640x480 set is advertised.
     expect(resolutions).toContain("640x480");
-    expect(resolutions.some((r) => r.startsWith("1280"))).toBe(false);
     expect(opts.streamingOptions.audio?.codecs?.[0]?.type).toBe("OPUS");
   });
 
@@ -153,15 +153,19 @@ describe("buildCameraControllerOptions", () => {
     expect(opts.streamingOptions.video.resolutions).toEqual([[896, 512, 30]]);
   });
 
-  it("advertises the native size on top of the standard set in transcode mode", () => {
+  it("advertises the Apple-standard ladder up to 1080p in transcode mode", () => {
     const delegate = new ArgusStreamingDelegate("Backyard Right", "rtsp://x", cacheWith(Buffer.from([0xff, 0xd8])));
     const opts = buildCameraControllerOptions(delegate, true, undefined, { width: 896, height: 672 }, "transcode");
 
-    const resolutions = opts.streamingOptions.video.resolutions;
-    // Apple clients START small and RECONFIGURE up to the best advertised size,
-    // so the native entry is what makes full-screen exceed 640x480.
-    expect(resolutions[0]).toEqual([896, 672, 30]);
-    expect(resolutions.map((r) => `${r[0]}x${r[1]}`)).toContain("640x480");
+    const resolutions = opts.streamingOptions.video.resolutions.map((r) => `${r[0]}x${r[1]}`);
+    // Apple clients negotiate only from their OWN ladder (measured 2026-06-11:
+    // the probed 896-wide entries were never once picked; every session sat at
+    // 640x360). 1080p/720p on the list is what lets full-screen go sharp.
+    expect(resolutions).toContain("1920x1080");
+    expect(resolutions).toContain("1280x720");
+    expect(resolutions).toContain("640x360");
+    // Non-standard probed sizes are dead weight — no longer advertised.
+    expect(resolutions).not.toContain("896x672");
   });
 });
 
@@ -268,5 +272,46 @@ describe("ArgusStreamingDelegate", () => {
     const secondArgs = (spawnFn as unknown as { mock: { calls: [string, string[]][] } }).mock.calls[1]![1].join(" ");
     expect(secondArgs).toContain("scale=896:672");
     expect(secondArgs).toContain("-b:v 600k");
+  });
+
+  it("sources ≥720p sessions from the main restream and returns to sub below 720p", async () => {
+    const spawnFn = vi.fn(() => Object.assign(new EventEmitter(), { kill: vi.fn() })) as unknown as typeof import("node:child_process").spawn;
+    const delegate = new ArgusStreamingDelegate(
+      "Backyard Left",
+      "rtsp://127.0.0.1:8554/backyard-left-sub",
+      cacheWith(Buffer.from([0xff, 0xd8])),
+      { spawnFn, mainStreamUrl: "rtsp://127.0.0.1:8554/backyard-left" },
+    );
+
+    await new Promise<void>((resolve, reject) => {
+      delegate.prepareStream(
+        { sessionID: "s3", targetAddress: "192.168.1.50",
+          video: { port: 50000, srtp_key: Buffer.alloc(16, 1), srtp_salt: Buffer.alloc(14, 2) },
+          audio: { port: 50002, srtp_key: Buffer.alloc(16, 3), srtp_salt: Buffer.alloc(14, 4) } } as never,
+        (error) => (error ? reject(error) : resolve()),
+      );
+    });
+    // Full-screen-sized START: the 896-wide sub has no pixels for 720p — the
+    // session must transcode the full-res main instead.
+    await new Promise<void>((resolve, reject) => {
+      delegate.handleStreamRequest(
+        { type: "start", sessionID: "s3",
+          video: { pt: 99, max_bit_rate: 2000, fps: 30, width: 1280, height: 720, mtu: 1378, profile: 2, level: 2 },
+          audio: { pt: 110, sample_rate: 24, max_bit_rate: 24, codec: 3 } } as never,
+        (error) => (error ? reject(error) : resolve()),
+      );
+    });
+    // Downgrade RECONFIGURE (e.g. backgrounding to the tile) returns to the sub.
+    await new Promise<void>((resolve, reject) => {
+      delegate.handleStreamRequest(
+        { type: "reconfigure", sessionID: "s3",
+          video: { width: 640, height: 360, fps: 30, max_bit_rate: 132, rtcp_interval: 0.5 } } as never,
+        (error) => (error ? reject(error) : resolve()),
+      );
+    });
+
+    const calls = (spawnFn as unknown as { mock: { calls: [string, string[]][] } }).mock.calls;
+    expect(calls[0]![1].join(" ")).toContain("-i rtsp://127.0.0.1:8554/backyard-left ");
+    expect(calls[1]![1].join(" ")).toContain("-i rtsp://127.0.0.1:8554/backyard-left-sub");
   });
 });

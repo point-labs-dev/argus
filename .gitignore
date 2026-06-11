@@ -22,6 +22,8 @@ recordings/
 
 # HomeKit persistence
 .homekit/
+# configVersion-bump backups of .homekit (pairing keys — never commit)
+.homekit.bak*/
 
 # launchd daemon logs
 logs/
