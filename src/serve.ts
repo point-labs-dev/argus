@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 
 import { createHash } from "node:crypto";
+import { realpathSync } from "node:fs";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { Categories, HAPStorage } from "hap-nodejs";
 
@@ -160,7 +162,19 @@ async function main(): Promise<void> {
   process.on("SIGTERM", shutdown);
 }
 
-// Run only when invoked directly (not when imported by tests).
-if (import.meta.url === `file://${process.argv[1]}`) {
+// Run only when invoked directly (not when imported by tests). Compare REAL
+// paths: launchd invokes dist/serve.js through whatever path is baked into the
+// plist, and if any segment is a symlink (2026-06-12: ~/code became a symlink
+// to ~/Projects mid-day) a naive string compare silently no-ops and the
+// daemon exit-0 loops with the cameras down.
+const invokedDirectly = ((): boolean => {
+  if (!process.argv[1]) return false;
+  try {
+    return realpathSync(process.argv[1]) === fileURLToPath(import.meta.url);
+  } catch {
+    return false;
+  }
+})();
+if (invokedDirectly) {
   void main();
 }

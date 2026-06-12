@@ -710,6 +710,18 @@ export function buildCameraControllerOptions(
   };
 }
 
+/**
+ * Advertised accessory firmware version — the controller cache-buster. iOS
+ * pins camera streaming profiles hard: a manual configVersion bump alone did
+ * NOT make a paired iPhone re-read the resolution list (measured 2026-06-12:
+ * c#=8 visible in mDNS for 12h, phone still requested the long-removed
+ * 640x360). Controllers DO refresh accessory metadata on a firmware update,
+ * and HAP-NodeJS auto-bumps c# when this increases (it tracks
+ * lastFirmwareVersion in AccessoryInfo for exactly that). BUMP THIS whenever
+ * the advertised streaming configuration changes.
+ */
+export const ARGUS_FIRMWARE_REVISION = "1.1.0";
+
 export interface CameraAccessoryHandle {
   accessory: Accessory;
   delegate: ArgusStreamingDelegate;
@@ -735,7 +747,8 @@ export function createCameraAccessory(
     .getService(Service.AccessoryInformation)!
     .setCharacteristic(Characteristic.Manufacturer, "Point Labs")
     .setCharacteristic(Characteristic.Model, "Argus")
-    .setCharacteristic(Characteristic.SerialNumber, `argus-${camera.host}-${camera.channel}`);
+    .setCharacteristic(Characteristic.SerialNumber, `argus-${camera.host}-${camera.channel}`)
+    .setCharacteristic(Characteristic.FirmwareRevision, ARGUS_FIRMWARE_REVISION);
 
   // Whether live ≥720p sessions may source the main restream is the caller's call
   // (serve grants it to standalone cameras only — the NVR mains' 4s GOP + 12MP
