@@ -86,7 +86,7 @@ describe("buildLiveFfmpegArgs", () => {
     expect(args).toContain("-force_key_frames expr:gte(t,n_forced*2)");
     expect(args).not.toContain("intra-refresh");
     // Source timestamp gaps must not become audible freezes (Reolink RTSP).
-    expect(args).toContain("-af aresample=async=1:first_pts=0");
+    expect(args).toContain("-af aresample=async=1");
   });
 
   it("downscales starved sessions (relay-obeyed bitrates) inside the negotiated box", () => {
