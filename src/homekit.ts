@@ -206,12 +206,14 @@ export function buildLiveFfmpegArgs(input: LiveFfmpegInput, includeAudio = true)
     "-fflags", "nobuffer",
     "-flags", "low_delay",
     ...analyzeArgs,
-    // Decode the ≥720p sources (2560x1920–4K, H.265 on some cameras) on the
-    // VideoToolbox hardware. Tiles stay software: their 640-wide subs decode
-    // for free, and the VT decoder noisily rejects the pre-IDR packets at
-    // every session join ("failed to decode picture" bursts in the log).
-    // Plain -hwaccel falls back to software automatically when unsupported.
-    ...(videoMode === "transcode" && hiResSession ? ["-hwaccel", "videotoolbox"] : []),
+    // SOFTWARE decode only. -hwaccel videotoolbox was tried 2026-06-12 and
+    // killed the first real ≥720p phone session: VideoToolbox decode sessions
+    // are a finite pool, and with the Apple TV grid (6 concurrent sessions) +
+    // HKSV recordings competing, per-picture decode fails continuously — and
+    // ffmpeg only falls back to software when INIT fails, not mid-stream — so
+    // the viewer gets zero frames (spinner → "not responding", controller
+    // STOP at 30s). Software decode of a 2560x1920 main is ~0.3 core and
+    // never exhausts.
     "-rtsp_transport", "tcp",
     "-i", inputUrl,
 

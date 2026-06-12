@@ -87,8 +87,6 @@ describe("buildLiveFfmpegArgs", () => {
     expect(args).not.toContain("-force_key_frames");
     // Source timestamp gaps must not become audible freezes (Reolink RTSP).
     expect(args).toContain("-af aresample=async=1:first_pts=0");
-    // The big sources (2560x1920/4K, some H.265) decode in hardware.
-    expect(args).toContain("-hwaccel videotoolbox");
   });
 
   it("downscales starved sessions (relay-obeyed bitrates) inside the negotiated box", () => {
@@ -124,9 +122,7 @@ describe("buildLiveFfmpegArgs", () => {
     expect(args).toContain("-maxrate 600k");
     expect(args).toContain("-x264opts intra-refresh=1");
     expect(args).toContain("scale=640:360");
-    // VT decode is ≥720p-only: pointless for 640-wide subs, and the VT decoder
-    // noisily rejects pre-IDR packets at every session join.
-    expect(args).not.toContain("-hwaccel");
+            expect(args).not.toContain("-hwaccel");
   });
 
   it("passes video through untouched in copy mode (no encode, no scaling, no keyframe forcing)", () => {
