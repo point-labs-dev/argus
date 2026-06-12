@@ -56,3 +56,26 @@ should be sharp IMMEDIATELY with no focus-hunt moment.
 - 7 concurrent hi-res tiles ≈ 25–40Mbps to the viewing device on LAN — fine
   on AC/AX WiFi; remote grid over a thin uplink will be the first place to
   look if reports of stalling grids appear (then: hub-obey list or compat).
+
+## Addendum — research workstream findings (same day)
+1. **go2rtc keyframe replay: confirmed impossible in v1.9.14.** RTSP consumers
+   always wait for the camera's next IDR (`pkg/rtsp/consumer.go` has no
+   keyframe sync; preload only warms the producer). The GOP-cache PR
+   [AlexxIT/go2rtc#1887] (`#gop=1` per stream) would eliminate the wait but is
+   open/unmerged ("doubt" label). **We are at the achievable start-time floor**
+   (camera gop=1 + preload + 0.2s analysis): ~0.6-1.3s. WATCH #1887 — when it
+   merges, one config line shaves the remaining ~0.5s avg.
+2. **Bitrate-overshoot upgrade-suppression: plausible, unconfirmed upstream.**
+   No direct issue report, but consistent with RTCP-driven congestion logic;
+   132k is documented as iOS's low-bandwidth profile ask. The hi-res-only
+   ladder sidesteps the upgrade path entirely, BUT the research flagged the
+   relay risk hard: remote sessions + Apple Watch negotiate low bitrates, and
+   flooring them through the hub would hurt. **Mitigation shipped: installer
+   now passes ARGUS_* envs into the plist and the daemon runs with
+   `ARGUS_HUB_ADDRESSES=10.0.0.15`** — hub-relayed sessions obey Apple's ask,
+   LAN sessions keep the floors.
+3. **Apple Watch on hi-res-only ladder is the open compat question** (HAP
+   examples advertise 320x240 "for Watch"; no reliable community data either
+   way). Watch sessions ride the relay → they'll obey the negotiated bitrate;
+   if the Watch refuses 720p-only entirely, `ARGUS_LIVE_LADDER=compat` + c#
+   bump is the rollback.

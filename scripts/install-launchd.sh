@@ -50,7 +50,15 @@ cat > "$PLIST" <<PLIST
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key>
-    <string>${DAEMON_PATH}</string>
+    <string>${DAEMON_PATH}</string>$(
+    # Pass through optional Argus tuning envs when set at install time, e.g.
+    #   ARGUS_HUB_ADDRESSES=<hub-ip> bash scripts/install-launchd.sh
+    # Hub-relayed sessions (remote viewers, Apple Watch) then obey Apple's
+    # negotiated bitrate instead of the LAN quality floors.
+    for var in ARGUS_HUB_ADDRESSES ARGUS_LIVE_LADDER ARGUS_LIVE_OBEY_BITRATE ARGUS_LIVE_COPY ARGUS_AUDIO; do
+      [[ -n "${!var:-}" ]] && printf '\n    <key>%s</key>\n    <string>%s</string>' "$var" "${!var}"
+    done
+  )
   </dict>
   <key>RunAtLoad</key>
   <true/>
