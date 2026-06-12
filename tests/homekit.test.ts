@@ -70,7 +70,9 @@ describe("buildLiveFfmpegArgs", () => {
     expect(args).toContain("-c:a libopus");
     expect(args).toContain("scale=1280:720");
     // Capped-CRF: easy scenes undershoot the cap, motion gets the full budget.
-    expect(args).toContain("-crf 20");
+    // Hi-res sessions get the extra encoder effort and quality target.
+    expect(args).toContain("-preset faster");
+    expect(args).toContain("-crf 18");
     expect(args).toContain("-maxrate 299k");
     expect(args).not.toContain("-b:v");
     expect(args).toContain("-bf 0");
@@ -146,15 +148,16 @@ describe("buildLiveFfmpegArgs", () => {
 describe("effectiveBitrateKbps", () => {
   it("floors Apple's conservative asks per resolution tier", () => {
     // Measured asks from a real iPhone session (2026-06-11): 299k @720p, 802k
-    // @1080p — visibly starved. Floors are conventional IP-camera rates.
-    expect(effectiveBitrateKbps(1920, 1080, 802)).toBe(4000);
-    expect(effectiveBitrateKbps(1280, 720, 299)).toBe(2500);
+    // @1080p — visibly starved. Floors are generous LAN rates: every session
+    // is now hi-res (hi-res-only ladder) and quality is the stated goal.
+    expect(effectiveBitrateKbps(1920, 1080, 802)).toBe(5500);
+    expect(effectiveBitrateKbps(1280, 720, 299)).toBe(3500);
     expect(effectiveBitrateKbps(640, 360, 132)).toBe(600);
     expect(effectiveBitrateKbps(320, 240, 100)).toBe(300);
   });
 
   it("honors the negotiated bitrate when it exceeds the floor", () => {
-    expect(effectiveBitrateKbps(1280, 720, 3500)).toBe(3500);
+    expect(effectiveBitrateKbps(1280, 720, 4500)).toBe(4500);
   });
 });
 
@@ -183,7 +186,7 @@ describe("buildCameraControllerOptions", () => {
     expect(opts.cameraStreamCount).toBe(2);
     expect(opts.streamingOptions.supportedCryptoSuites).toContain(0); // AES_CM_128_HMAC_SHA1_80
     const resolutions = opts.streamingOptions.video.resolutions.map((r) => `${r[0]}x${r[1]}`);
-    expect(resolutions).toContain("640x480");
+    expect(resolutions).toContain("1280x720");
     expect(opts.streamingOptions.audio?.codecs?.[0]?.type).toBe("OPUS");
   });
 
@@ -194,19 +197,32 @@ describe("buildCameraControllerOptions", () => {
     expect(opts.streamingOptions.video.resolutions).toEqual([[896, 512, 30]]);
   });
 
-  it("advertises the Apple-standard ladder up to 1080p in transcode mode", () => {
+  it("advertises ONLY high resolutions in transcode mode (small sizes invite 640x360 sessions)", () => {
     const delegate = new ArgusStreamingDelegate("Backyard Right", "rtsp://x", cacheWith(Buffer.from([0xff, 0xd8])));
     const opts = buildCameraControllerOptions(delegate, true, undefined, { width: 896, height: 672 }, "transcode");
 
     const resolutions = opts.streamingOptions.video.resolutions.map((r) => `${r[0]}x${r[1]}`);
-    // Apple clients negotiate only from their OWN ladder (measured 2026-06-11:
-    // the probed 896-wide entries were never once picked; every session sat at
-    // 640x360). 1080p/720p on the list is what lets full-screen go sharp.
-    expect(resolutions).toContain("1920x1080");
-    expect(resolutions).toContain("1280x720");
-    expect(resolutions).toContain("640x360");
-    // Non-standard probed sizes are dead weight — no longer advertised.
+    // Measured 2026-06-12: whenever 640x360 is on offer, the iOS tile player
+    // takes it AND full-screen reuses that session without upgrading — every
+    // "full screen" was an upscaled 640x360. Offering only 1080p/720p makes
+    // every session high-res from its first frame.
+    expect(resolutions).toEqual(["1920x1080", "1280x720"]);
+    // Non-standard probed sizes are dead weight — never advertised.
     expect(resolutions).not.toContain("896x672");
+  });
+
+  it("restores the small tiers with ARGUS_LIVE_LADDER=compat (client-compat rollback)", () => {
+    const delegate = new ArgusStreamingDelegate("Backyard Right", "rtsp://x", cacheWith(Buffer.from([0xff, 0xd8])));
+    process.env.ARGUS_LIVE_LADDER = "compat";
+    try {
+      const opts = buildCameraControllerOptions(delegate, true, undefined, undefined, "transcode");
+      const resolutions = opts.streamingOptions.video.resolutions.map((r) => `${r[0]}x${r[1]}`);
+      expect(resolutions).toContain("1920x1080");
+      expect(resolutions).toContain("640x360");
+      expect(resolutions).toContain("320x240");
+    } finally {
+      delete process.env.ARGUS_LIVE_LADDER;
+    }
   });
 });
 
@@ -262,8 +278,8 @@ describe("ArgusStreamingDelegate", () => {
     // Transcode is the default live mode (validated on real devices).
     expect(args.join(" ")).toContain("-c:v libx264");
     expect(args.join(" ")).toContain("scale=1280:720");
-    // Apple asked 299k for 720p (its asks are mush); the floor policy serves 2500k.
-    expect(args.join(" ")).toContain("-maxrate 2500k");
+    // Apple asked 299k for 720p (its asks are mush); the floor policy serves 3500k.
+    expect(args.join(" ")).toContain("-maxrate 3500k");
     // FFmpeg must encrypt with the CONTROLLER's key from the request (not a
     // generated one), or the device can't decrypt — the forever-spinner bug.
     const expectedVideoSrtp = Buffer.concat([Buffer.alloc(16, 1), Buffer.alloc(14, 2)]).toString("base64");

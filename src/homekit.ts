@@ -111,8 +111,8 @@ export interface LiveFfmpegInput {
 export function effectiveBitrateKbps(width: number, height: number, negotiatedKbps: number): number {
   const pixels = width * height;
   const floor =
-    pixels >= 1920 * 1080 ? 4000 :
-    pixels >= 1280 * 720 ? 2500 :
+    pixels >= 1920 * 1080 ? 5500 :
+    pixels >= 1280 * 720 ? 3500 :
     pixels >= 640 * 360 ? 600 : 300;
   return Math.max(negotiatedKbps, floor);
 }
@@ -152,7 +152,10 @@ export function buildLiveFfmpegArgs(input: LiveFfmpegInput, includeAudio = true)
       ? ["-c:v", "copy"]
       : [
           "-c:v", "libx264",
-          "-preset", "veryfast",
+          // ≥720p is now EVERY session (hi-res-only ladder): spend more encoder
+          // effort and quality there — "faster" buys ~10% bitrate efficiency
+          // over veryfast and an M-series core does 1080p30 several times over.
+          "-preset", hiResSession ? "faster" : "veryfast",
           "-tune", "zerolatency",
           "-profile:v", video.profile,
           "-level", video.level,
@@ -164,7 +167,7 @@ export function buildLiveFfmpegArgs(input: LiveFfmpegInput, includeAudio = true)
           "-g", String(video.fps * 2 * idrSeconds),
           "-keyint_min", String(video.fps * idrSeconds),
           "-force_key_frames", `expr:gte(t,n_forced*${idrSeconds})`,
-          "-crf", "20",
+          "-crf", hiResSession ? "18" : "20",
           "-maxrate", `${video.maxBitrateKbps}k`,
           "-bufsize", `${2 * video.maxBitrateKbps}k`,
         ];
@@ -348,6 +351,13 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
     this.spawnFn = options.spawnFn ?? spawn;
   }
 
+  /** Timestamped stderr line — session forensics without timestamps kept hurting. */
+  private logLine(msg: string): void {
+    if (this.verbose) {
+      process.stderr.write(`${new Date().toISOString()} [argus ${this.cameraName}] ${msg}\n`);
+    }
+  }
+
   /**
    * Live input per negotiated size: ≥720p transcode sessions pull the full-res
    * MAIN restream (the sub/ext source tops out 896-wide — no pixels for 720p+);
@@ -481,12 +491,10 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
         maxBitrateKbps: bitrate,
       },
     };
-    if (this.verbose) {
-      process.stderr.write(
-        `[argus ${this.cameraName}] HomeKit reconfigure: ${request.video.width}x${request.video.height}@${request.video.fps} ` +
-          `asked=${request.video.max_bit_rate}k serving=${bitrate}k source=${next.inputUrl} — respawning encoder\n`,
-      );
-    }
+    this.logLine(
+      `HomeKit reconfigure: ${request.video.width}x${request.video.height}@${request.video.fps} ` +
+        `asked=${request.video.max_bit_rate}k serving=${bitrate}k source=${next.inputUrl} — respawning encoder`,
+    );
     // SIGKILL is the teardown signal the exit handler ignores (no forceStop).
     session.ffmpeg?.kill("SIGKILL");
     this.spawnLive(request.sessionID, session, next);
@@ -507,14 +515,12 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
       request.video.max_bit_rate,
       session.prepared.controllerAddress,
     );
-    if (this.verbose) {
-      process.stderr.write(
-        `[argus ${this.cameraName}] HomeKit negotiated video: ${request.video.width}x${request.video.height}@${request.video.fps} ` +
-          `profile=${profile} level=${level} ptype=${request.video.pt} asked=${request.video.max_bit_rate}k serving=${bitrate}k mtu=${request.video.mtu} ` +
-          `mode=${this.videoMode} source=${this.pickInputUrl(request.video.width, request.video.height)}; ` +
-          `audio: codec=${request.audio.codec} ${request.audio.sample_rate}kHz ptype=${request.audio.pt}\n`,
-      );
-    }
+    this.logLine(
+      `HomeKit negotiated video: ${request.video.width}x${request.video.height}@${request.video.fps} ` +
+        `profile=${profile} level=${level} ptype=${request.video.pt} asked=${request.video.max_bit_rate}k serving=${bitrate}k mtu=${request.video.mtu} ` +
+        `mode=${this.videoMode} source=${this.pickInputUrl(request.video.width, request.video.height)}; ` +
+        `audio: codec=${request.audio.codec} ${request.audio.sample_rate}kHz ptype=${request.audio.pt}`,
+    );
 
     const liveInput: LiveFfmpegInput = {
       inputUrl: this.pickInputUrl(request.video.width, request.video.height),
@@ -558,9 +564,7 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
     const args = buildLiveFfmpegArgs(liveInput, this.includeAudio);
     session.liveInput = liveInput;
 
-    const log = (msg: string): void => {
-      if (this.verbose) process.stderr.write(`[argus ${this.cameraName}] ${msg}\n`);
-    };
+    const log = (msg: string): void => this.logLine(msg);
     log(`ffmpeg ${this.ffmpegPath} ${args.join(" ")}`);
 
     const ffmpeg = this.spawnFn(this.ffmpegPath, args, { stdio: ["ignore", "ignore", "pipe"] });
@@ -620,19 +624,25 @@ export function buildCameraControllerOptions(
 ): CameraControllerOptions {
   // Copy mode advertises ONLY the probed native resolution (a negotiation/stream
   // mismatch is fatal: macOS rendered one frame and stopped the session).
-  // Transcode mode advertises the Apple-standard ladder. Measured 2026-06-11:
-  // Apple clients pick exclusively from their OWN ladder (1920x1080 / 1280x720 /
-  // 640x360 / 480x270 / 320x240) — the probed non-standard sizes (896x512/896x672)
-  // were advertised for a full day and never once negotiated, while every session
-  // settled at 640x360 because nothing bigger from the ladder was on offer. So
-  // quality = advertise the standard sizes and back them with real pixels: the
-  // delegate sources ≥720p sessions from the camera's full-res main stream.
-  // WiFi keyframe-burst risk at 720p+ (the reason for the original ≤640x480 cap)
-  // is mitigated by the encoder's 1s forced IDRs; if full-screen still spins,
-  // walk the ladder in the goal prompt (relax IDRs → intra-refresh → pkt_size).
-  const standardSet: [number, number, number][] = [
+  // Transcode mode advertises HIGH RESOLUTIONS ONLY (1080p/720p). Two measured
+  // findings drive this (2026-06-11/12):
+  // - Apple clients pick exclusively from their OWN ladder and the TILE player
+  //   takes 640x360 whenever it is offered. With grid live tiles always running,
+  //   iOS then REUSES that small session for full-screen and (since the bitrate
+  //   floors) never reconfigures up — every "full screen" was an upscaled
+  //   640x360. No small sizes on offer = every session starts ≥720p, sourced
+  //   from the camera main, with no upgrade moment at all.
+  // - The probed non-standard sizes (896-wide) were advertised for a day and
+  //   never once negotiated — only Apple-ladder entries matter.
+  // ARGUS_LIVE_LADDER=compat restores the small tiers (rollback if some client
+  // — Apple Watch, CarPlay, remote relay — refuses hi-res-only; needs a
+  // configVersion bump to be seen, see the controller-cache trap).
+  const hiResSet: [number, number, number][] = [
     [1920, 1080, 30],
     [1280, 720, 30],
+  ];
+  const compatSet: [number, number, number][] = [
+    ...hiResSet,
     [640, 480, 30],
     [640, 360, 30],
     [480, 270, 30],
@@ -641,7 +651,9 @@ export function buildCameraControllerOptions(
   const resolutions: [number, number, number][] =
     videoMode === "copy" && liveResolution
       ? [[liveResolution.width, liveResolution.height, 30]]
-      : standardSet;
+      : process.env.ARGUS_LIVE_LADDER === "compat"
+        ? compatSet
+        : hiResSet;
 
   return {
     cameraStreamCount: 2, // allow two concurrent viewers
