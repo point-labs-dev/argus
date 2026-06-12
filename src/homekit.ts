@@ -230,7 +230,12 @@ export function buildLiveFfmpegArgs(input: LiveFfmpegInput, includeAudio = true)
     "-f", "rtp",
     "-srtp_out_suite", "AES_CM_128_HMAC_SHA1_80",
     "-srtp_out_params", video.srtpParams,
-    `srtp://${targetAddress}:${video.port}?rtcpport=${video.port}&localrtcpport=${video.localRtcpPort}&pkt_size=${video.mtu}`,
+    // Hi-res sessions ship SMALL packets (564 ≤ negotiated MTU): on-device
+    // 2026-06-12, 720p at full 1378-byte packets hung direct-WiFi sessions
+    // (relay + tile sessions rendered; payload decode-validated locally) —
+    // smaller datagrams lose less per WiFi drop and aggregate better. The
+    // documented mitigation rung from the goal prompt's WiFi ladder.
+    `srtp://${targetAddress}:${video.port}?rtcpport=${video.port}&localrtcpport=${video.localRtcpPort}&pkt_size=${hiResSession ? Math.min(564, video.mtu) : video.mtu}`,
   ];
 
   if (!includeAudio) {

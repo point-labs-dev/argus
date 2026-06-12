@@ -140,7 +140,8 @@ describe("buildLiveFfmpegArgs", () => {
     // Audio is still transcoded to Opus, and SRTP targeting is unchanged.
     expect(args).toContain("-c:a libopus");
     expect(args).toContain("-srtp_out_params VIDEOKEY==");
-    expect(args).toContain("srtp://192.168.1.50:50000?rtcpport=50000&localrtcpport=60000&pkt_size=1378");
+    // hi-res sessions (copy included) ship small packets for WiFi resilience
+    expect(args).toContain("srtp://192.168.1.50:50000?rtcpport=50000&localrtcpport=60000&pkt_size=564");
     expect(args).toContain("-payload_type 99");
   });
 
@@ -162,7 +163,7 @@ describe("buildLiveFfmpegArgs", () => {
 
     // video SRTP out
     expect(joined).toContain("-srtp_out_params VIDEOKEY==");
-    expect(joined).toContain("srtp://192.168.1.50:50000?rtcpport=50000&localrtcpport=60000&pkt_size=1378");
+    expect(joined).toContain("srtp://192.168.1.50:50000?rtcpport=50000&localrtcpport=60000&pkt_size=564");
     // audio SRTP out
     expect(joined).toContain("-srtp_out_params AUDIOKEY==");
     expect(joined).toContain("srtp://192.168.1.50:50002?rtcpport=50002&localrtcpport=60002");
