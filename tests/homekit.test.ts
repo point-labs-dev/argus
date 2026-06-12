@@ -62,34 +62,39 @@ function cacheWith(jpeg: Buffer): SnapshotCache {
 }
 
 describe("buildLiveFfmpegArgs", () => {
-  it("encodes ≥720p sessions on the VideoToolbox hardware encoder", () => {
+  it("encodes ≥720p sessions with capped-CRF libx264 and relaxed 2s IDRs", () => {
     const args = buildLiveFfmpegArgs(liveInput()).join(" ");
 
     expect(args).toContain("-i rtsp://127.0.0.1:8554/backyard-left-sub");
-    // Verified 2026-06-12: h264_videotoolbox under -realtime emits I/P frames
-    // only (B-frames would break HomeKit) at ~zero CPU.
-    expect(args).toContain("-c:v h264_videotoolbox");
-    expect(args).toContain("-realtime 1");
+    expect(args).toContain("-c:v libx264");
     expect(args).toContain("-c:a libopus");
     expect(args).toContain("scale=1280:720");
-    expect(args).toContain("-b:v 299k");
+    // Capped-CRF: easy scenes undershoot the cap, motion gets the full budget.
+    expect(args).toContain("-crf 20");
+    expect(args).toContain("-maxrate 299k");
+    expect(args).not.toContain("-b:v");
     expect(args).toContain("-bf 0");
-    // The big sources (2560x1920/4K, some H.265) decode in hardware too.
+    // A 720p+ IDR every 1s starved the in-between P-frames into a visible
+    // sharp→soft pulse; 2s cadence steadies it (first frame is an IDR anyway).
+    expect(args).toContain("-force_key_frames expr:gte(t,n_forced*2)");
+    // The big sources (2560x1920/4K, some H.265) decode in hardware.
     expect(args).toContain("-hwaccel videotoolbox");
   });
 
-  it("encodes tile-sized sessions with capped-CRF libx264 (better per-bit at low rates)", () => {
+  it("keeps 1s IDRs at the tile tier (cheap there, fast loss recovery)", () => {
     const args = buildLiveFfmpegArgs(
       liveInput({ video: { ...liveInput().video, width: 640, height: 360, maxBitrateKbps: 600 } }),
     ).join(" ");
 
     expect(args).toContain("-c:v libx264");
     expect(args).toContain("-tune zerolatency");
-    // Capped-CRF: easy scenes undershoot the cap, motion gets the full budget.
     expect(args).toContain("-crf 20");
     expect(args).toContain("-maxrate 600k");
-    expect(args).not.toContain("-b:v");
+    expect(args).toContain("-force_key_frames expr:gte(t,n_forced*1)");
     expect(args).toContain("scale=640:360");
+    // VT decode is ≥720p-only: pointless for 640-wide subs, and the VT decoder
+    // noisily rejects pre-IDR packets at every session join.
+    expect(args).not.toContain("-hwaccel");
   });
 
   it("passes video through untouched in copy mode (no encode, no scaling, no keyframe forcing)", () => {
@@ -254,12 +259,11 @@ describe("ArgusStreamingDelegate", () => {
     expect(bin).toBe("ffmpeg");
     expect(args.join(" ")).toContain("-i rtsp://127.0.0.1:8554/backyard-left-sub");
     expect(args.join(" ")).toContain("srtp://192.168.1.50:50000");
-    // Transcode is the default live mode (validated on real devices); 720p+
-    // rides the hardware encoder.
-    expect(args.join(" ")).toContain("-c:v h264_videotoolbox");
+    // Transcode is the default live mode (validated on real devices).
+    expect(args.join(" ")).toContain("-c:v libx264");
     expect(args.join(" ")).toContain("scale=1280:720");
     // Apple asked 299k for 720p (its asks are mush); the floor policy serves 2500k.
-    expect(args.join(" ")).toContain("-b:v 2500k");
+    expect(args.join(" ")).toContain("-maxrate 2500k");
     // FFmpeg must encrypt with the CONTROLLER's key from the request (not a
     // generated one), or the device can't decrypt — the forever-spinner bug.
     const expectedVideoSrtp = Buffer.concat([Buffer.alloc(16, 1), Buffer.alloc(14, 2)]).toString("base64");

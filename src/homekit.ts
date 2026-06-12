@@ -124,54 +124,50 @@ export function effectiveBitrateKbps(width: number, height: number, negotiatedKb
 export function buildLiveFfmpegArgs(input: LiveFfmpegInput, includeAudio = true): string[] {
   const { inputUrl, targetAddress, videoMode, video, audio } = input;
 
-  // Shared output shaping for both encoders:
+  // Keyframe cadence: an IDR every 1s at the tile tier (cheap there, and quick
+  // recovery from packet loss), every 2s at ≥720p — a 720p/1080p IDR eats a
+  // large slice of each second's bit budget, and at 1s cadence the starved
+  // P-frames in between read as a sharp→soft→sharp "focus hunting" pulse
+  // (Peter's 2026-06-12 report). The session's FIRST frame is an IDR either
+  // way, so start time is unaffected.
+  const hiResSession = video.width >= 1280 || video.height >= 720;
+  const idrSeconds = hiResSession ? 2 : 1;
+
+  // Everything transcoded goes through libx264 capped-CRF: constant visual
+  // quality up to the bitrate cap, easy scenes undershoot, motion gets the
+  // full budget — steadier-looking than chasing a CBR target. (The
+  // h264_videotoolbox hardware encoder was tried 2026-06-12 and reverted same
+  // day: its -realtime rate control visibly pulses at 2.5-4Mbps. Revisit a
+  // zero-copy VT pipeline on the Mac mini only if CPU becomes the constraint.)
+  //
+  // Output shaping:
   // - Fit within the negotiated box, preserving aspect (homebridge-camera-ffmpeg
   //   pattern). A plain WxH scale would stretch the 4:3 sources (RLC-520A main is
   //   2560x1920) into the 16:9 sizes Apple negotiates. Never exceeds the
   //   negotiated dimensions — oversize is what controllers kill sessions over.
-  // - HomeKit needs frequent keyframes and no B-frames, or the iOS client waits
-  //   forever for a decodable IDR (the "spinner that never resolves" symptom).
-  const envelopeArgs = [
-    "-profile:v", video.profile,
-    "-level", video.level,
-    "-pix_fmt", "yuv420p",
-    "-color_range", "tv",
-    "-r", String(video.fps),
-    "-vf", `scale=${video.width}:${video.height}:force_original_aspect_ratio=decrease:force_divisible_by=2`,
-    "-bf", "0",
-    "-g", String(video.fps * 2),
-    "-keyint_min", String(video.fps),
-    "-force_key_frames", "expr:gte(t,n_forced*1)",
-  ];
-
-  // ≥720p sessions encode on the Apple Silicon hardware encoder: ~zero CPU at
-  // 1080p (headroom for the Mac mini + concurrent viewers) and verified to emit
-  // I/P frames only under -realtime (B-frames would break HomeKit). The tile
-  // tier stays on libx264: at a few hundred kbps the software encoder is
-  // visibly better per bit, and capped-CRF lets easy scenes undershoot the cap
-  // while motion gets the full budget.
-  const hiRes = video.width >= 1280 || video.height >= 720;
+  // - HomeKit needs periodic IDRs and no B-frames, or the iOS client waits
+  //   forever for a decodable keyframe (the "spinner that never resolves" symptom).
   const videoCodecArgs =
     videoMode === "copy"
       ? ["-c:v", "copy"]
-      : hiRes
-        ? [
-            "-c:v", "h264_videotoolbox",
-            "-realtime", "1",
-            ...envelopeArgs,
-            "-b:v", `${video.maxBitrateKbps}k`,
-            "-maxrate", `${video.maxBitrateKbps}k`,
-            "-bufsize", `${2 * video.maxBitrateKbps}k`,
-          ]
-        : [
-            "-c:v", "libx264",
-            "-preset", "veryfast",
-            "-tune", "zerolatency",
-            ...envelopeArgs,
-            "-crf", "20",
-            "-maxrate", `${video.maxBitrateKbps}k`,
-            "-bufsize", `${2 * video.maxBitrateKbps}k`,
-          ];
+      : [
+          "-c:v", "libx264",
+          "-preset", "veryfast",
+          "-tune", "zerolatency",
+          "-profile:v", video.profile,
+          "-level", video.level,
+          "-pix_fmt", "yuv420p",
+          "-color_range", "tv",
+          "-r", String(video.fps),
+          "-vf", `scale=${video.width}:${video.height}:force_original_aspect_ratio=decrease:force_divisible_by=2`,
+          "-bf", "0",
+          "-g", String(video.fps * 2 * idrSeconds),
+          "-keyint_min", String(video.fps * idrSeconds),
+          "-force_key_frames", `expr:gte(t,n_forced*${idrSeconds})`,
+          "-crf", "20",
+          "-maxrate", `${video.maxBitrateKbps}k`,
+          "-bufsize", `${2 * video.maxBitrateKbps}k`,
+        ];
 
   // Cap RTSP stream analysis: FFmpeg's default ~5s runs past HomeKit's stream-start
   // window (spinner → "No Response"). 0.2s is enough for transcode too — codec
@@ -187,10 +183,12 @@ export function buildLiveFfmpegArgs(input: LiveFfmpegInput, includeAudio = true)
     "-fflags", "nobuffer",
     "-flags", "low_delay",
     ...analyzeArgs,
-    // Decode on the VideoToolbox hardware (the ≥720p sources are 2560x1920–4K,
-    // H.265 on some cameras). Plain -hwaccel falls back to software decode
-    // automatically if the codec/machine can't, so this is strictly headroom.
-    ...(videoMode === "transcode" ? ["-hwaccel", "videotoolbox"] : []),
+    // Decode the ≥720p sources (2560x1920–4K, H.265 on some cameras) on the
+    // VideoToolbox hardware. Tiles stay software: their 640-wide subs decode
+    // for free, and the VT decoder noisily rejects the pre-IDR packets at
+    // every session join ("failed to decode picture" bursts in the log).
+    // Plain -hwaccel falls back to software automatically when unsupported.
+    ...(videoMode === "transcode" && hiResSession ? ["-hwaccel", "videotoolbox"] : []),
     "-rtsp_transport", "tcp",
     "-i", inputUrl,
 
@@ -288,8 +286,8 @@ interface ActiveSession {
 }
 
 export interface StreamingDelegateOptions {
-  /** Which profile to pull for live view. Default "sub" (H.264, light). */
-  liveProfile?: SnapshotProfile;
+  /** Which stream's stills to serve for HomeKit snapshot requests. Default "sub". */
+  snapshotProfile?: SnapshotProfile;
   /** Override FFmpeg binary path (default "ffmpeg"). */
   ffmpegPath?: string;
   /** Log the FFmpeg command + stderr to the console. Default true. */
@@ -326,7 +324,7 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
   public controller?: CameraController;
 
   private readonly sessions = new Map<string, ActiveSession>();
-  private readonly liveProfile: SnapshotProfile;
+  private readonly snapshotProfile: SnapshotProfile;
   private readonly ffmpegPath: string;
   private readonly verbose: boolean;
   private readonly includeAudio: boolean;
@@ -341,7 +339,7 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
     private readonly snapshots: SnapshotCache,
     options: StreamingDelegateOptions = {},
   ) {
-    this.liveProfile = options.liveProfile ?? "sub";
+    this.snapshotProfile = options.snapshotProfile ?? "sub";
     this.ffmpegPath = options.ffmpegPath ?? "ffmpeg";
     this.verbose = options.verbose ?? true;
     this.includeAudio = options.includeAudio ?? true;
@@ -382,7 +380,7 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
 
   public handleSnapshotRequest(_request: SnapshotRequest, callback: SnapshotRequestCallback): void {
     this.snapshots
-      .getOrRefresh(this.cameraName, this.liveProfile)
+      .getOrRefresh(this.cameraName, this.snapshotProfile)
       .then((snapshot) => callback(undefined, snapshot.buffer))
       .catch((error: unknown) => callback(error instanceof Error ? error : new Error(String(error))));
   }

@@ -37,7 +37,13 @@ export async function startArgusServer(config: ArgusConfig, configDir = process.
   });
 
   const cache = new SnapshotCache(config, { defaultProfile: "sub" });
-  cache.startPolling(5_000, ["sub"]);
+  // Home-app grid stills come from the MAIN streams (2560x1920–4512x2512 —
+  // go2rtc decodes a JPEG per request, HEVC included, verified fleet-wide
+  // 2026-06-12). The poll loop is sequential, so one decode at a time: a full
+  // 7-camera sweep takes ~5-8s, giving each tile a fresh still every ~15s —
+  // about Apple's own grid refresh cadence — at a bounded go2rtc cost. The sub
+  // profile stays available for on-demand consumers (boot resolution probe).
+  cache.startPolling(10_000, ["main"]);
 
   // Probe each camera's live (sub) resolution from a snapshot so the accessory
   // advertises the native size copy-mode live view will deliver. Retries through
@@ -94,6 +100,9 @@ export async function startArgusServer(config: ArgusConfig, configDir = process.
     const { accessory, setMotion } = createCameraAccessory(camera, liveUrl, mainUrl, cache, {
       includeAudio,
       videoMode,
+      // HomeKit snapshot requests serve the full-res main-stream stills the
+      // cache polls — the 640-wide sub stills read as "pixelated" on the grid.
+      snapshotProfile: "main",
       ...(standalone ? { mainStreamUrl: mainUrl } : {}),
       ...(liveResolution ? { liveResolution } : {}),
     });
