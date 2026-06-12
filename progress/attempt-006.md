@@ -79,3 +79,24 @@ should be sharp IMMEDIATELY with no focus-hunt moment.
    way). Watch sessions ride the relay → they'll obey the negotiated bitrate;
    if the Watch refuses 720p-only entirely, `ARGUS_LIVE_LADDER=compat` + c#
    bump is the rollback.
+
+## Round 5 (same day) — intra-refresh + audio healing + starved-session downscale
+Peter's post-force-quit report decoded: his sessions were STILL 640x360 — the
+phone/hub serve streaming params from their CACHED accessory DB; a force-quit
+doesn't flush it (c#=8 is in mDNS but homed lags). **The flush is rebooting
+the Apple TV hub.** Meanwhile his symptoms (WiFi: periodic "sharpen" pulse +
+audio freezing every few seconds; cellular at obeyed 132k: pulsating mush, no
+audio) are all keyframe-burst pathologies — so fixed at the encoder:
+- **x264 intra-refresh replaces periodic IDRs** (all transcode tiers): one IDR
+  at session start, then refresh columns inside P-frames — flat bitrate, no
+  burst to pulse the quality or trample the 20ms Opus packets. Verified
+  stream shape: 1 I + 119 P over 4s. Loss recovery = the 1s refresh cycle.
+  Rollback: ARGUS_LIVE_INTRA=0 (periodic IDRs return).
+- **Audio timestamp healing**: `-af aresample=async=1:first_pts=0` — Reolink
+  RTSP audio timing is jittery; gaps were becoming audible freezes.
+- **Starved-session downscale**: relay-obeyed sessions (<800k at ≥720p) encode
+  854x480 inside the negotiated box — fewer pixels per bit beats pulsating
+  720p at 132k. Controllers accept smaller-than-negotiated (fit-within
+  precedent).
+- Bench post-change: 720p 0.87s avg start, sustained flow + steady audio. 53
+  tests green. c# stays 8 (no advertised-config change).

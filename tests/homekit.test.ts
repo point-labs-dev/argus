@@ -62,8 +62,13 @@ function cacheWith(jpeg: Buffer): SnapshotCache {
 }
 
 describe("buildLiveFfmpegArgs", () => {
-  it("encodes ≥720p sessions with capped-CRF libx264 and relaxed 2s IDRs", () => {
-    const args = buildLiveFfmpegArgs(liveInput()).join(" ");
+  it("encodes ≥720p sessions with capped-CRF libx264 and intra-refresh", () => {
+    // 3500k = the post-floor bitrate a LAN 720p session actually arrives with
+    // (the delegate floors before building args; sub-800k here means a
+    // relay-obeyed session and triggers the starved downscale instead).
+    const args = buildLiveFfmpegArgs(
+      liveInput({ video: { ...liveInput().video, maxBitrateKbps: 3500 } }),
+    ).join(" ");
 
     expect(args).toContain("-i rtsp://127.0.0.1:8554/backyard-left-sub");
     expect(args).toContain("-c:v libx264");
@@ -73,17 +78,42 @@ describe("buildLiveFfmpegArgs", () => {
     // Hi-res sessions get the extra encoder effort and quality target.
     expect(args).toContain("-preset faster");
     expect(args).toContain("-crf 18");
-    expect(args).toContain("-maxrate 299k");
+    expect(args).toContain("-maxrate 3500k");
     expect(args).not.toContain("-b:v");
     expect(args).toContain("-bf 0");
-    // A 720p+ IDR every 1s starved the in-between P-frames into a visible
-    // sharp→soft pulse; 2s cadence steadies it (first frame is an IDR anyway).
-    expect(args).toContain("-force_key_frames expr:gte(t,n_forced*2)");
+    // Intra-refresh instead of periodic IDRs: flat bitrate (no keyframe burst
+    // = no sharp→soft pulse, no audio packets trampled on WiFi).
+    expect(args).toContain("-x264opts intra-refresh=1");
+    expect(args).not.toContain("-force_key_frames");
+    // Source timestamp gaps must not become audible freezes (Reolink RTSP).
+    expect(args).toContain("-af aresample=async=1:first_pts=0");
     // The big sources (2560x1920/4K, some H.265) decode in hardware.
     expect(args).toContain("-hwaccel videotoolbox");
   });
 
-  it("keeps 1s IDRs at the tile tier (cheap there, fast loss recovery)", () => {
+  it("downscales starved sessions (relay-obeyed bitrates) inside the negotiated box", () => {
+    // A hub-relayed remote viewer negotiates 720p but obeys Apple's 132k ask —
+    // full 720p at 132k pulsates; 854x480 in the same box is merely soft.
+    const args = buildLiveFfmpegArgs(
+      liveInput({ video: { ...liveInput().video, maxBitrateKbps: 132 } }),
+    ).join(" ");
+
+    expect(args).toContain("scale=854:480:force_original_aspect_ratio=decrease");
+    expect(args).toContain("-maxrate 132k");
+  });
+
+  it("restores periodic IDRs with ARGUS_LIVE_INTRA=0 (decoder-compat rollback)", () => {
+    process.env.ARGUS_LIVE_INTRA = "0";
+    try {
+      const args = buildLiveFfmpegArgs(liveInput()).join(" ");
+      expect(args).toContain("-force_key_frames expr:gte(t,n_forced*2)");
+      expect(args).not.toContain("intra-refresh");
+    } finally {
+      delete process.env.ARGUS_LIVE_INTRA;
+    }
+  });
+
+  it("uses intra-refresh at the tile tier too (flat bitrate at any size)", () => {
     const args = buildLiveFfmpegArgs(
       liveInput({ video: { ...liveInput().video, width: 640, height: 360, maxBitrateKbps: 600 } }),
     ).join(" ");
@@ -92,7 +122,7 @@ describe("buildLiveFfmpegArgs", () => {
     expect(args).toContain("-tune zerolatency");
     expect(args).toContain("-crf 20");
     expect(args).toContain("-maxrate 600k");
-    expect(args).toContain("-force_key_frames expr:gte(t,n_forced*1)");
+    expect(args).toContain("-x264opts intra-refresh=1");
     expect(args).toContain("scale=640:360");
     // VT decode is ≥720p-only: pointless for 640-wide subs, and the VT decoder
     // noisily rejects pre-IDR packets at every session join.

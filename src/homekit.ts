@@ -124,14 +124,36 @@ export function effectiveBitrateKbps(width: number, height: number, negotiatedKb
 export function buildLiveFfmpegArgs(input: LiveFfmpegInput, includeAudio = true): string[] {
   const { inputUrl, targetAddress, videoMode, video, audio } = input;
 
-  // Keyframe cadence: an IDR every 1s at the tile tier (cheap there, and quick
-  // recovery from packet loss), every 2s at ≥720p — a 720p/1080p IDR eats a
-  // large slice of each second's bit budget, and at 1s cadence the starved
-  // P-frames in between read as a sharp→soft→sharp "focus hunting" pulse
-  // (Peter's 2026-06-12 report). The session's FIRST frame is an IDR either
-  // way, so start time is unaffected.
   const hiResSession = video.width >= 1280 || video.height >= 720;
+
+  // Keyframe strategy: x264 INTRA-REFRESH by default — the per-frame refresh
+  // column replaces periodic IDRs, so the bitrate is flat instead of bursting
+  // every GOP. Measured consequences of periodic IDRs (2026-06-12, on-device):
+  // the burst starves the P-frames after it (sharp→soft "focus hunting"
+  // pulse), shoves the 20ms Opus packets aside on WiFi (audio freezes every
+  // few seconds), and at relay bitrates (132k) starves the whole stream into
+  // pulsating mush. The session's first frame is still an IDR, loss recovery
+  // is the ≤1s refresh cycle (-g), and each viewer has a dedicated encoder so
+  // there is no late-joiner needing an IDR. ARGUS_LIVE_INTRA=0 restores
+  // periodic IDRs (1s tiles / 2s hi-res) if any Apple decoder balks.
+  const intraRefresh = process.env.ARGUS_LIVE_INTRA !== "0";
   const idrSeconds = hiResSession ? 2 : 1;
+  const keyframeArgs = intraRefresh
+    ? ["-g", String(video.fps), "-x264opts", "intra-refresh=1"]
+    : [
+        "-g", String(video.fps * 2 * idrSeconds),
+        "-keyint_min", String(video.fps * idrSeconds),
+        "-force_key_frames", `expr:gte(t,n_forced*${idrSeconds})`,
+      ];
+
+  // Starved sessions (hub-relayed remote viewers obeying Apple's 132-300k
+  // asks) get fewer pixels per bit: encoding a full 1280x720 at 132k is
+  // pulsating mush, 854x480 in the same negotiated box is merely soft.
+  // Controllers accept smaller-than-negotiated dimensions (the fit-within
+  // scale below already relies on that).
+  const starved = hiResSession && video.maxBitrateKbps < 800;
+  const boxWidth = starved ? Math.min(854, video.width) : video.width;
+  const boxHeight = starved ? Math.min(480, video.height) : video.height;
 
   // Everything transcoded goes through libx264 capped-CRF: constant visual
   // quality up to the bitrate cap, easy scenes undershoot, motion gets the
@@ -162,11 +184,9 @@ export function buildLiveFfmpegArgs(input: LiveFfmpegInput, includeAudio = true)
           "-pix_fmt", "yuv420p",
           "-color_range", "tv",
           "-r", String(video.fps),
-          "-vf", `scale=${video.width}:${video.height}:force_original_aspect_ratio=decrease:force_divisible_by=2`,
+          "-vf", `scale=${boxWidth}:${boxHeight}:force_original_aspect_ratio=decrease:force_divisible_by=2`,
           "-bf", "0",
-          "-g", String(video.fps * 2 * idrSeconds),
-          "-keyint_min", String(video.fps * idrSeconds),
-          "-force_key_frames", `expr:gte(t,n_forced*${idrSeconds})`,
+          ...keyframeArgs,
           "-crf", hiResSession ? "18" : "20",
           "-maxrate", `${video.maxBitrateKbps}k`,
           "-bufsize", `${2 * video.maxBitrateKbps}k`,
@@ -217,6 +237,10 @@ export function buildLiveFfmpegArgs(input: LiveFfmpegInput, includeAudio = true)
     "-c:a", "libopus",
     "-application", "lowdelay",
     "-frame_duration", "20",
+    // Heal source timestamp gaps by stretching/padding samples — Reolink RTSP
+    // audio timing is jittery, and every input gap otherwise becomes an
+    // audible freeze on the controller (reported on-device 2026-06-12).
+    "-af", "aresample=async=1:first_pts=0",
     "-ac", "1",
     "-ar", `${audio.sampleRateKhz}k`,
     "-b:a", `${audio.maxBitrateKbps}k`,
