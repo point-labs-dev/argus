@@ -126,17 +126,16 @@ export function buildLiveFfmpegArgs(input: LiveFfmpegInput, includeAudio = true)
 
   const hiResSession = video.width >= 1280 || video.height >= 720;
 
-  // Keyframe strategy: x264 INTRA-REFRESH by default — the per-frame refresh
-  // column replaces periodic IDRs, so the bitrate is flat instead of bursting
-  // every GOP. Measured consequences of periodic IDRs (2026-06-12, on-device):
-  // the burst starves the P-frames after it (sharp→soft "focus hunting"
-  // pulse), shoves the 20ms Opus packets aside on WiFi (audio freezes every
-  // few seconds), and at relay bitrates (132k) starves the whole stream into
-  // pulsating mush. The session's first frame is still an IDR, loss recovery
-  // is the ≤1s refresh cycle (-g), and each viewer has a dedicated encoder so
-  // there is no late-joiner needing an IDR. ARGUS_LIVE_INTRA=0 restores
-  // periodic IDRs (1s tiles / 2s hi-res) if any Apple decoder balks.
-  const intraRefresh = process.env.ARGUS_LIVE_INTRA !== "0";
+  // Keyframe strategy: periodic IDRs (1s tiles / 2s hi-res). Intra-refresh
+  // was tried 2026-06-12 (flat bitrate — no keyframe burst pulse, no trampled
+  // audio) and reverted the same evening: a session's ONLY IDR is its first
+  // frame, and when those packets drop during the controller's socket ramp
+  // there is never another keyframe to lock onto — on-device pattern was
+  // "first view perfect, re-entry hangs". At the floored bitrates the burst
+  // pathology that motivated it is minor anyway (a 720p IDR ≈ 11% of a 2s
+  // budget at 3500k, vs >50% at the old 600k). ARGUS_LIVE_INTRA=1 re-enables
+  // the experiment.
+  const intraRefresh = process.env.ARGUS_LIVE_INTRA === "1";
   const idrSeconds = hiResSession ? 2 : 1;
   const keyframeArgs = intraRefresh
     ? ["-g", String(video.fps), "-x264opts", "intra-refresh=1"]

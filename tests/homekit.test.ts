@@ -81,10 +81,10 @@ describe("buildLiveFfmpegArgs", () => {
     expect(args).toContain("-maxrate 3500k");
     expect(args).not.toContain("-b:v");
     expect(args).toContain("-bf 0");
-    // Intra-refresh instead of periodic IDRs: flat bitrate (no keyframe burst
-    // = no sharp→soft pulse, no audio packets trampled on WiFi).
-    expect(args).toContain("-x264opts intra-refresh=1");
-    expect(args).not.toContain("-force_key_frames");
+    // Periodic IDRs (2s at hi-res): intra-refresh was reverted — its single
+    // start-of-session IDR made re-entry hang whenever those packets dropped.
+    expect(args).toContain("-force_key_frames expr:gte(t,n_forced*2)");
+    expect(args).not.toContain("intra-refresh");
     // Source timestamp gaps must not become audible freezes (Reolink RTSP).
     expect(args).toContain("-af aresample=async=1:first_pts=0");
   });
@@ -100,18 +100,18 @@ describe("buildLiveFfmpegArgs", () => {
     expect(args).toContain("-maxrate 132k");
   });
 
-  it("restores periodic IDRs with ARGUS_LIVE_INTRA=0 (decoder-compat rollback)", () => {
-    process.env.ARGUS_LIVE_INTRA = "0";
+  it("enables the intra-refresh experiment with ARGUS_LIVE_INTRA=1", () => {
+    process.env.ARGUS_LIVE_INTRA = "1";
     try {
       const args = buildLiveFfmpegArgs(liveInput()).join(" ");
-      expect(args).toContain("-force_key_frames expr:gte(t,n_forced*2)");
-      expect(args).not.toContain("intra-refresh");
+      expect(args).toContain("-x264opts intra-refresh=1");
+      expect(args).not.toContain("-force_key_frames");
     } finally {
       delete process.env.ARGUS_LIVE_INTRA;
     }
   });
 
-  it("uses intra-refresh at the tile tier too (flat bitrate at any size)", () => {
+  it("keeps 1s periodic IDRs at the tile tier", () => {
     const args = buildLiveFfmpegArgs(
       liveInput({ video: { ...liveInput().video, width: 640, height: 360, maxBitrateKbps: 600 } }),
     ).join(" ");
@@ -120,7 +120,7 @@ describe("buildLiveFfmpegArgs", () => {
     expect(args).toContain("-tune zerolatency");
     expect(args).toContain("-crf 20");
     expect(args).toContain("-maxrate 600k");
-    expect(args).toContain("-x264opts intra-refresh=1");
+    expect(args).toContain("-force_key_frames expr:gte(t,n_forced*1)");
     expect(args).toContain("scale=640:360");
             expect(args).not.toContain("-hwaccel");
   });
