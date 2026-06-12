@@ -249,15 +249,13 @@ export function buildLiveFfmpegArgs(input: LiveFfmpegInput, includeAudio = true)
     "-c:a", "libopus",
     "-application", "lowdelay",
     "-frame_duration", "20",
-    // Heal source timestamp gaps by stretching/padding samples — Reolink RTSP
-    // audio timing is jittery, and every input gap otherwise becomes an
-    // audible freeze on the controller. CRITICAL: no first_pts rebasing! The
-    // first_pts=0 variant rebased audio to zero while video kept source
-    // timestamps — a permanent A/V offset that made iOS's lip-sync gate hold
-    // video forever (2026-06-12: every direct session "hung" until a
-    // video-only A/B proved the video leg fine; relay sessions rendered but
-    // SILENT because the hub just drops unsyncable audio).
-    "-af", "aresample=async=1",
+    // NO audio timestamp filter. Both aresample variants broke real sessions
+    // (2026-06-12): first_pts=0 rebased audio and iOS's lip-sync gate held
+    // video forever; plain async=1 tracked Reolink's jittery audio clock
+    // until sync drifted past tolerance mid-stream (picture died ~1min in).
+    // Raw Opus encode = the all-morning-stable config; the residual is an
+    // occasional audible blip on source gaps. The real fix is sourcing audio
+    // with sane timestamps (e.g. the camera's FLV leg) — a future slice.
     "-ac", "1",
     "-ar", `${audio.sampleRateKhz}k`,
     "-b:a", `${audio.maxBitrateKbps}k`,
