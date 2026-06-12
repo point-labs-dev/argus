@@ -7,6 +7,7 @@ import {
   ArgusStreamingDelegate,
   buildCameraControllerOptions,
   buildLiveFfmpegArgs,
+  effectiveBitrateKbps,
   resolveSrtpTargetAddress,
   type LiveFfmpegInput,
 } from "../src/homekit.js";
@@ -61,14 +62,34 @@ function cacheWith(jpeg: Buffer): SnapshotCache {
 }
 
 describe("buildLiveFfmpegArgs", () => {
-  it("transcodes video to libx264 and audio to libopus over SRTP", () => {
+  it("encodes ≥720p sessions on the VideoToolbox hardware encoder", () => {
     const args = buildLiveFfmpegArgs(liveInput()).join(" ");
 
     expect(args).toContain("-i rtsp://127.0.0.1:8554/backyard-left-sub");
-    expect(args).toContain("-c:v libx264");
+    // Verified 2026-06-12: h264_videotoolbox under -realtime emits I/P frames
+    // only (B-frames would break HomeKit) at ~zero CPU.
+    expect(args).toContain("-c:v h264_videotoolbox");
+    expect(args).toContain("-realtime 1");
     expect(args).toContain("-c:a libopus");
     expect(args).toContain("scale=1280:720");
     expect(args).toContain("-b:v 299k");
+    expect(args).toContain("-bf 0");
+    // The big sources (2560x1920/4K, some H.265) decode in hardware too.
+    expect(args).toContain("-hwaccel videotoolbox");
+  });
+
+  it("encodes tile-sized sessions with capped-CRF libx264 (better per-bit at low rates)", () => {
+    const args = buildLiveFfmpegArgs(
+      liveInput({ video: { ...liveInput().video, width: 640, height: 360, maxBitrateKbps: 600 } }),
+    ).join(" ");
+
+    expect(args).toContain("-c:v libx264");
+    expect(args).toContain("-tune zerolatency");
+    // Capped-CRF: easy scenes undershoot the cap, motion gets the full budget.
+    expect(args).toContain("-crf 20");
+    expect(args).toContain("-maxrate 600k");
+    expect(args).not.toContain("-b:v");
+    expect(args).toContain("scale=640:360");
   });
 
   it("passes video through untouched in copy mode (no encode, no scaling, no keyframe forcing)", () => {
@@ -114,6 +135,21 @@ describe("buildLiveFfmpegArgs", () => {
     expect(joined).toContain("srtp://192.168.1.50:50002?rtcpport=50002&localrtcpport=60002");
     expect(joined).toContain("-ssrc 1");
     expect(joined).toContain("-ssrc 2");
+  });
+});
+
+describe("effectiveBitrateKbps", () => {
+  it("floors Apple's conservative asks per resolution tier", () => {
+    // Measured asks from a real iPhone session (2026-06-11): 299k @720p, 802k
+    // @1080p — visibly starved. Floors are conventional IP-camera rates.
+    expect(effectiveBitrateKbps(1920, 1080, 802)).toBe(4000);
+    expect(effectiveBitrateKbps(1280, 720, 299)).toBe(2500);
+    expect(effectiveBitrateKbps(640, 360, 132)).toBe(600);
+    expect(effectiveBitrateKbps(320, 240, 100)).toBe(300);
+  });
+
+  it("honors the negotiated bitrate when it exceeds the floor", () => {
+    expect(effectiveBitrateKbps(1280, 720, 3500)).toBe(3500);
   });
 });
 
@@ -218,9 +254,12 @@ describe("ArgusStreamingDelegate", () => {
     expect(bin).toBe("ffmpeg");
     expect(args.join(" ")).toContain("-i rtsp://127.0.0.1:8554/backyard-left-sub");
     expect(args.join(" ")).toContain("srtp://192.168.1.50:50000");
-    // Transcode is the default live mode (validated on real devices).
-    expect(args.join(" ")).toContain("-c:v libx264");
+    // Transcode is the default live mode (validated on real devices); 720p+
+    // rides the hardware encoder.
+    expect(args.join(" ")).toContain("-c:v h264_videotoolbox");
     expect(args.join(" ")).toContain("scale=1280:720");
+    // Apple asked 299k for 720p (its asks are mush); the floor policy serves 2500k.
+    expect(args.join(" ")).toContain("-b:v 2500k");
     // FFmpeg must encrypt with the CONTROLLER's key from the request (not a
     // generated one), or the device can't decrypt — the forever-spinner bug.
     const expectedVideoSrtp = Buffer.concat([Buffer.alloc(16, 1), Buffer.alloc(14, 2)]).toString("base64");
@@ -271,7 +310,7 @@ describe("ArgusStreamingDelegate", () => {
     expect(procs[0]!.kill).toHaveBeenCalledWith("SIGKILL");
     const secondArgs = (spawnFn as unknown as { mock: { calls: [string, string[]][] } }).mock.calls[1]![1].join(" ");
     expect(secondArgs).toContain("scale=896:672");
-    expect(secondArgs).toContain("-b:v 600k");
+    expect(secondArgs).toContain("-maxrate 600k");
   });
 
   it("sources ≥720p sessions from the main restream and returns to sub below 720p", async () => {

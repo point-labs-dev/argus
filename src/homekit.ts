@@ -101,40 +101,77 @@ export interface LiveFfmpegInput {
 }
 
 /**
+ * What we actually encode at, given HomeKit's ask. Apple clients negotiate
+ * absurdly conservative bitrates (measured 2026-06-11 on Peter's iPhone, LAN:
+ * 299k for 1280x720, 802k for 1920x1080 — mush at those sizes) and mature
+ * bridges (homebridge-camera-ffmpeg videoBitrate, Scrypted) override them as a
+ * matter of course. Floors are conventional IP-camera rates per tier; the ask
+ * is still honored when it EXCEEDS the floor.
+ */
+export function effectiveBitrateKbps(width: number, height: number, negotiatedKbps: number): number {
+  const pixels = width * height;
+  const floor =
+    pixels >= 1920 * 1080 ? 4000 :
+    pixels >= 1280 * 720 ? 2500 :
+    pixels >= 640 * 360 ? 600 : 300;
+  return Math.max(negotiatedKbps, floor);
+}
+
+/**
  * Pure builder for the FFmpeg live-streaming command (video + Opus audio over SRTP).
  * Kept side-effect free so it can be unit-tested without spawning anything.
  */
 export function buildLiveFfmpegArgs(input: LiveFfmpegInput, includeAudio = true): string[] {
   const { inputUrl, targetAddress, videoMode, video, audio } = input;
 
-  // Transcode re-encodes to the negotiated H.264 params. Copy needs none of it.
+  // Shared output shaping for both encoders:
+  // - Fit within the negotiated box, preserving aspect (homebridge-camera-ffmpeg
+  //   pattern). A plain WxH scale would stretch the 4:3 sources (RLC-520A main is
+  //   2560x1920) into the 16:9 sizes Apple negotiates. Never exceeds the
+  //   negotiated dimensions — oversize is what controllers kill sessions over.
+  // - HomeKit needs frequent keyframes and no B-frames, or the iOS client waits
+  //   forever for a decodable IDR (the "spinner that never resolves" symptom).
+  const envelopeArgs = [
+    "-profile:v", video.profile,
+    "-level", video.level,
+    "-pix_fmt", "yuv420p",
+    "-color_range", "tv",
+    "-r", String(video.fps),
+    "-vf", `scale=${video.width}:${video.height}:force_original_aspect_ratio=decrease:force_divisible_by=2`,
+    "-bf", "0",
+    "-g", String(video.fps * 2),
+    "-keyint_min", String(video.fps),
+    "-force_key_frames", "expr:gte(t,n_forced*1)",
+  ];
+
+  // ≥720p sessions encode on the Apple Silicon hardware encoder: ~zero CPU at
+  // 1080p (headroom for the Mac mini + concurrent viewers) and verified to emit
+  // I/P frames only under -realtime (B-frames would break HomeKit). The tile
+  // tier stays on libx264: at a few hundred kbps the software encoder is
+  // visibly better per bit, and capped-CRF lets easy scenes undershoot the cap
+  // while motion gets the full budget.
+  const hiRes = video.width >= 1280 || video.height >= 720;
   const videoCodecArgs =
     videoMode === "copy"
       ? ["-c:v", "copy"]
-      : [
-          "-c:v", "libx264",
-          "-preset", "veryfast",
-          "-tune", "zerolatency",
-          "-profile:v", video.profile,
-          "-level", video.level,
-          "-pix_fmt", "yuv420p",
-          "-color_range", "tv",
-          "-r", String(video.fps),
-          // Fit within the negotiated box, preserving aspect (homebridge-camera-ffmpeg
-          // pattern). A plain WxH scale would stretch the 4:3 sources (RLC-520A main is
-          // 2560x1920) into the 16:9 sizes Apple negotiates. Never exceeds the
-          // negotiated dimensions — oversize is what controllers kill sessions over.
-          "-vf", `scale=${video.width}:${video.height}:force_original_aspect_ratio=decrease:force_divisible_by=2`,
-          // HomeKit needs frequent keyframes and no B-frames, or the iOS client waits
-          // forever for a decodable IDR (the "spinner that never resolves" symptom).
-          "-bf", "0",
-          "-g", String(video.fps * 2),
-          "-keyint_min", String(video.fps),
-          "-force_key_frames", "expr:gte(t,n_forced*1)",
-          "-b:v", `${video.maxBitrateKbps}k`,
-          "-maxrate", `${video.maxBitrateKbps}k`,
-          "-bufsize", `${2 * video.maxBitrateKbps}k`,
-        ];
+      : hiRes
+        ? [
+            "-c:v", "h264_videotoolbox",
+            "-realtime", "1",
+            ...envelopeArgs,
+            "-b:v", `${video.maxBitrateKbps}k`,
+            "-maxrate", `${video.maxBitrateKbps}k`,
+            "-bufsize", `${2 * video.maxBitrateKbps}k`,
+          ]
+        : [
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-tune", "zerolatency",
+            ...envelopeArgs,
+            "-crf", "20",
+            "-maxrate", `${video.maxBitrateKbps}k`,
+            "-bufsize", `${2 * video.maxBitrateKbps}k`,
+          ];
 
   // Cap RTSP stream analysis: FFmpeg's default ~5s runs past HomeKit's stream-start
   // window (spinner → "No Response"). 0.2s is enough for transcode too — codec
@@ -150,6 +187,10 @@ export function buildLiveFfmpegArgs(input: LiveFfmpegInput, includeAudio = true)
     "-fflags", "nobuffer",
     "-flags", "low_delay",
     ...analyzeArgs,
+    // Decode on the VideoToolbox hardware (the ≥720p sources are 2560x1920–4K,
+    // H.265 on some cameras). Plain -hwaccel falls back to software decode
+    // automatically if the codec/machine can't, so this is strictly headroom.
+    ...(videoMode === "transcode" ? ["-hwaccel", "videotoolbox"] : []),
     "-rtsp_transport", "tcp",
     "-i", inputUrl,
 
@@ -239,6 +280,8 @@ interface ActiveSession {
   liveInput?: LiveFfmpegInput;
   prepared: {
     targetAddress: string;
+    /** The controller's requested address BEFORE any loopback rewrite — identity, not routing. */
+    controllerAddress: string;
     video: { port: number; localRtcpPort: number; ssrc: number; srtpParams: string };
     audio: { port: number; localRtcpPort: number; ssrc: number; srtpParams: string };
   };
@@ -320,6 +363,23 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
     return this.liveUrl;
   }
 
+  /**
+   * Encode bitrate for a session: the per-resolution floor policy
+   * (effectiveBitrateKbps), except spec-obedient for controllers listed in
+   * ARGUS_HUB_ADDRESSES — those are home-hub RELAYS fronting remote viewers
+   * whose uplink we can't see, so Apple's conservative ask wins there — or
+   * globally with ARGUS_LIVE_OBEY_BITRATE=1 (rollback switch).
+   */
+  private liveBitrateKbps(width: number, height: number, negotiated: number, controllerAddress: string): number {
+    if (process.env.ARGUS_LIVE_OBEY_BITRATE === "1") return negotiated;
+    const hubs = (process.env.ARGUS_HUB_ADDRESSES ?? "")
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    if (hubs.includes(controllerAddress)) return negotiated;
+    return effectiveBitrateKbps(width, height, negotiated);
+  }
+
   public handleSnapshotRequest(_request: SnapshotRequest, callback: SnapshotRequestCallback): void {
     this.snapshots
       .getOrRefresh(this.cameraName, this.liveProfile)
@@ -349,6 +409,7 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
       this.sessions.set(request.sessionID, {
         prepared: {
           targetAddress: resolveSrtpTargetAddress(request.targetAddress),
+          controllerAddress: request.targetAddress,
           video: { port: request.video.port, localRtcpPort: videoRtcp, ssrc: videoSsrc, srtpParams: videoSrtpParams },
           audio: { port: request.audio.port, localRtcpPort: audioRtcp, ssrc: audioSsrc, srtpParams: audioSrtpParams },
         },
@@ -404,6 +465,12 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
     if (!session?.liveInput || this.videoMode !== "transcode") {
       return;
     }
+    const bitrate = this.liveBitrateKbps(
+      request.video.width,
+      request.video.height,
+      request.video.max_bit_rate,
+      session.prepared.controllerAddress,
+    );
     const next: LiveFfmpegInput = {
       ...session.liveInput,
       // Re-pick the source: a full-screen upgrade to ≥720p moves to the main stream.
@@ -413,13 +480,13 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
         width: request.video.width,
         height: request.video.height,
         fps: request.video.fps,
-        maxBitrateKbps: request.video.max_bit_rate,
+        maxBitrateKbps: bitrate,
       },
     };
     if (this.verbose) {
       process.stderr.write(
         `[argus ${this.cameraName}] HomeKit reconfigure: ${request.video.width}x${request.video.height}@${request.video.fps} ` +
-          `bitrate=${request.video.max_bit_rate}k source=${next.inputUrl} — respawning encoder\n`,
+          `asked=${request.video.max_bit_rate}k serving=${bitrate}k source=${next.inputUrl} — respawning encoder\n`,
       );
     }
     // SIGKILL is the teardown signal the exit handler ignores (no forceStop).
@@ -436,10 +503,16 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
 
     const profile = H264_PROFILE_TO_X264[request.video.profile] ?? "high";
     const level = H264_LEVEL_TO_X264[request.video.level] ?? "4.0";
+    const bitrate = this.liveBitrateKbps(
+      request.video.width,
+      request.video.height,
+      request.video.max_bit_rate,
+      session.prepared.controllerAddress,
+    );
     if (this.verbose) {
       process.stderr.write(
         `[argus ${this.cameraName}] HomeKit negotiated video: ${request.video.width}x${request.video.height}@${request.video.fps} ` +
-          `profile=${profile} level=${level} ptype=${request.video.pt} bitrate=${request.video.max_bit_rate}k mtu=${request.video.mtu} ` +
+          `profile=${profile} level=${level} ptype=${request.video.pt} asked=${request.video.max_bit_rate}k serving=${bitrate}k mtu=${request.video.mtu} ` +
           `mode=${this.videoMode} source=${this.pickInputUrl(request.video.width, request.video.height)}; ` +
           `audio: codec=${request.audio.codec} ${request.audio.sample_rate}kHz ptype=${request.audio.pt}\n`,
       );
@@ -454,7 +527,7 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
         localRtcpPort: session.prepared.video.localRtcpPort,
         ssrc: session.prepared.video.ssrc,
         payloadType: request.video.pt,
-        maxBitrateKbps: request.video.max_bit_rate,
+        maxBitrateKbps: bitrate,
         fps: request.video.fps,
         width: request.video.width,
         height: request.video.height,

@@ -15,6 +15,9 @@ import { parse } from "yaml";
 const apply = process.argv.includes("--apply");
 const cfg = parse(await readFile("argus.yaml", "utf8"));
 
+// 1024k is the D1200 sub-encoder ceiling (2048 → param error, probed
+// 2026-06-12); it matters because the 896-wide sub IS those channels'
+// full-screen live source. The D500 (ch6) rejects anything above 640*480@15/512.
 const NVR_SUB_TARGET = { size: "896*512", frameRate: 20, bitRate: 1024 };
 const STANDALONE_SUB_TARGET = { frameRate: 15, bitRate: 512, gop: 1 };
 
