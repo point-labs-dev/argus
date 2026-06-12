@@ -67,7 +67,7 @@ describe("buildLiveFfmpegArgs", () => {
     // (the delegate floors before building args; sub-800k here means a
     // relay-obeyed session and triggers the starved downscale instead).
     const args = buildLiveFfmpegArgs(
-      liveInput({ video: { ...liveInput().video, maxBitrateKbps: 3500 } }),
+      liveInput({ video: { ...liveInput().video, maxBitrateKbps: 2000 } }),
     ).join(" ");
 
     expect(args).toContain("-i rtsp://127.0.0.1:8554/backyard-left-sub");
@@ -78,7 +78,7 @@ describe("buildLiveFfmpegArgs", () => {
     // Hi-res sessions get the extra encoder effort and quality target.
     expect(args).toContain("-preset faster");
     expect(args).toContain("-crf 18");
-    expect(args).toContain("-maxrate 3500k");
+    expect(args).toContain("-maxrate 2000k");
     expect(args).not.toContain("-b:v");
     expect(args).toContain("-bf 0");
     // Periodic IDRs (2s at hi-res): intra-refresh was reverted — its single
@@ -176,8 +176,8 @@ describe("effectiveBitrateKbps", () => {
     // Measured asks from a real iPhone session (2026-06-11): 299k @720p, 802k
     // @1080p — visibly starved. Floors are generous LAN rates: every session
     // is now hi-res (hi-res-only ladder) and quality is the stated goal.
-    expect(effectiveBitrateKbps(1920, 1080, 802)).toBe(5500);
-    expect(effectiveBitrateKbps(1280, 720, 299)).toBe(3500);
+    expect(effectiveBitrateKbps(1920, 1080, 802)).toBe(3000);
+    expect(effectiveBitrateKbps(1280, 720, 299)).toBe(2000);
     expect(effectiveBitrateKbps(640, 360, 132)).toBe(600);
     expect(effectiveBitrateKbps(320, 240, 100)).toBe(300);
   });
@@ -305,7 +305,7 @@ describe("ArgusStreamingDelegate", () => {
     expect(args.join(" ")).toContain("-c:v libx264");
     expect(args.join(" ")).toContain("scale=1280:720");
     // Apple asked 299k for 720p (its asks are mush); the floor policy serves 3500k.
-    expect(args.join(" ")).toContain("-maxrate 3500k");
+    expect(args.join(" ")).toContain("-maxrate 2000k");
     // FFmpeg must encrypt with the CONTROLLER's key from the request (not a
     // generated one), or the device can't decrypt — the forever-spinner bug.
     const expectedVideoSrtp = Buffer.concat([Buffer.alloc(16, 1), Buffer.alloc(14, 2)]).toString("base64");

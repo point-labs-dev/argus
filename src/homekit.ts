@@ -110,9 +110,13 @@ export interface LiveFfmpegInput {
  */
 export function effectiveBitrateKbps(width: number, height: number, negotiatedKbps: number): number {
   const pixels = width * height;
+  // 2000k@720p / 3000k@1080p are the community-proven LAN rates (Scrypted
+  // defaults): 3500k+ with 2x VBV burst headroom hung real iPhone sessions on
+  // WiFi (2026-06-12: tiles at 600k always rendered, 720p at 3500k hung on
+  // most attempts — delivery, not negotiation; the sender was healthy).
   const floor =
-    pixels >= 1920 * 1080 ? 5500 :
-    pixels >= 1280 * 720 ? 3500 :
+    pixels >= 1920 * 1080 ? 3000 :
+    pixels >= 1280 * 720 ? 2000 :
     pixels >= 640 * 360 ? 600 : 300;
   return Math.max(negotiatedKbps, floor);
 }
@@ -188,7 +192,9 @@ export function buildLiveFfmpegArgs(input: LiveFfmpegInput, includeAudio = true)
           ...keyframeArgs,
           "-crf", hiResSession ? "18" : "20",
           "-maxrate", `${video.maxBitrateKbps}k`,
-          "-bufsize", `${2 * video.maxBitrateKbps}k`,
+          // 1x VBV: momentary bursts toward 2x maxrate were part of what WiFi
+          // delivery choked on; a tight buffer keeps the wire rate honest.
+          "-bufsize", `${video.maxBitrateKbps}k`,
         ];
 
   // Cap RTSP stream analysis: FFmpeg's default ~5s runs past HomeKit's stream-start
