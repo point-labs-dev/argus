@@ -105,7 +105,13 @@ export async function startArgusServer(config: ArgusConfig, configDir = process.
       // HomeKit snapshot requests serve the full-res main-stream stills the
       // cache polls — the 640-wide sub stills read as "pixelated" on the grid.
       snapshotProfile: "main",
-      ...(standalone ? { mainStreamUrl: mainUrl } : {}),
+      // Main-source live is PARKED (2026-06-12 night): every on-device
+      // session class that rendered with audio used SUB video; main-sourced
+      // sessions hung at iOS's A/V gate regardless of bitrate/packets/
+      // keyframes/audio filters (see progress/attempt-007). Re-grant per
+      // camera once the main restream's A/V timing is proven by the
+      // offline validator. ARGUS_LIVE_MAIN_SOURCE=1 re-enables for tests.
+      ...(standalone && process.env.ARGUS_LIVE_MAIN_SOURCE === "1" ? { mainStreamUrl: mainUrl } : {}),
       ...(liveResolution ? { liveResolution } : {}),
     });
     setMotionByCamera.set(camera.name, setMotion);
