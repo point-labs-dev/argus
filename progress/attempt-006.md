@@ -100,3 +100,23 @@ audio) are all keyframe-burst pathologies — so fixed at the encoder:
   precedent).
 - Bench post-change: 720p 0.87s avg start, sustained flow + steady audio. 53
   tests green. c# stays 8 (no advertised-config change).
+
+## RESOLUTION (2026-06-12 evening) — re-pair is the only controller flush
+Empirical ladder, all measured on Peter's devices:
+- c# bump alone (7→8): phone ignored for 12h.
+- Apple TV (hub) restart: flushed the APPLE TV (it grid-streamed six cameras
+  at 1280x720 at 21:06Z — first wild proof of the hi-res ladder) but NOT the
+  phone.
+- App force-quit: nothing. iPhone reboot: nothing. FirmwareRevision 1.1.0 +
+  c#9: nothing — the phone kept requesting the long-removed 640x360@132k.
+- **Remove + re-pair (Garage Door, ~1 min): immediate.** First session
+  21:53Z: 1280x720 asked=299k serving=3500k source=main. The iPhone's
+  per-accessory camera stream profile lives in the home's iCloud config
+  record and is rebuilt ONLY at pairing.
+Remaining: Peter re-pairs the other 6 at his leisure (codes 123-45-678,
+re-enable Stream & Allow Recording each). The doorbell will need ONE more
+re-pair when the Doorbell service (execution order #4) lands — sequence that
+slice before any future fleet-wide re-pair event.
+
+Also fixed this session: ~/code → ~/Projects symlink move broke the daemon's
+main-module guard (silent exit-0 loop, ~10 min outage) — realpath compare now.
