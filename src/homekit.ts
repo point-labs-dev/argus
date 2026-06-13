@@ -249,13 +249,16 @@ export function buildLiveFfmpegArgs(input: LiveFfmpegInput, includeAudio = true)
     "-c:a", "libopus",
     "-application", "lowdelay",
     "-frame_duration", "20",
-    // NO audio timestamp filter. Both aresample variants broke real sessions
-    // (2026-06-12): first_pts=0 rebased audio and iOS's lip-sync gate held
-    // video forever; plain async=1 tracked Reolink's jittery audio clock
-    // until sync drifted past tolerance mid-stream (picture died ~1min in).
-    // Raw Opus encode = the all-morning-stable config; the residual is an
-    // occasional audible blip on source gaps. The real fix is sourcing audio
-    // with sane timestamps (e.g. the camera's FLV leg) — a future slice.
+    // SYNTHETIC audio clock: regenerate pts from the cumulative sample count,
+    // discarding the camera's wobbly timestamps entirely. The video leg
+    // already gets a steady clock from the -r CFR grid; audio passing the
+    // Reolink wobble (±600ms bursts, measured by validate-av-sync) through
+    // was what tripped iOS's STRICT ≥720p A/V sync pipeline — 640x360 uses a
+    // lenient path and tolerated it all day, video-only sessions rendered,
+    // and every "fluke" 720p render matched a clean stretch between wobble
+    // bursts. Trade-off: lip-sync accuracy to reality can drift if the
+    // camera truly gaps samples — irrelevant for ambient security audio.
+    "-af", "asetpts=N/SR/TB",
     "-ac", "1",
     "-ar", `${audio.sampleRateKhz}k`,
     "-b:a", `${audio.maxBitrateKbps}k`,
