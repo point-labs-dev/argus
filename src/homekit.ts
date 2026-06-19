@@ -97,6 +97,15 @@ export interface LiveFfmpegInput {
     sampleRateKhz: number;
     maxBitrateKbps: number;
     srtpParams: string;
+    /**
+     * HomeKit audio codec to encode. "opus" (default) is what Argus has always
+     * shipped; "aac_eld" is Apple's canonical camera codec (HomeKit negotiates
+     * AAC-ELD at 16kHz mono). Set from the NEGOTIATED codec at the call site, so
+     * the builder always produces exactly what the controller asked for. AAC-ELD
+     * requires a libfdk_aac-enabled ffmpeg (Homebrew's default build lacks it) —
+     * see ARGUS_FFMPEG and progress/attempt-008.md.
+     */
+    audioCodec?: "opus" | "aac_eld";
   };
 }
 
@@ -242,13 +251,25 @@ export function buildLiveFfmpegArgs(input: LiveFfmpegInput, includeAudio = true)
     return videoArgs;
   }
 
+  // Audio codec: Opus (Argus's long-time default) or AAC-ELD. AAC-ELD is
+  // Apple's canonical HomeKit camera codec; the research sweep (2026-06-19,
+  // progress/attempt-008.md) found the "audio gates ≥720p video" hang is an
+  // iOS-wide behavior tied to non-standard audio, and that go2rtc/Scrypted/
+  // homebridge all feed HomeKit AAC-ELD rather than Opus. AAC-ELD needs a
+  // libfdk_aac-enabled ffmpeg (Homebrew's default build has neither libfdk_aac
+  // nor an ELD-capable aac_at) — point ARGUS_FFMPEG at one (e.g.
+  // ffmpeg-for-homebridge). homebridge-camera-ffmpeg's proven ELD args are
+  // `libfdk_aac -profile:a aac_eld -flags +global_header`.
+  const audioCodecArgs =
+    audio.audioCodec === "aac_eld"
+      ? ["-c:a", "libfdk_aac", "-profile:a", "aac_eld", "-flags", "+global_header"]
+      : ["-c:a", "libopus", "-application", "lowdelay", "-frame_duration", "20"];
+
   return [
     ...videoArgs,
-    // --- audio: transcode to Opus, SRTP out ---
+    // --- audio: transcode (Opus or AAC-ELD), SRTP out ---
     "-vn",
-    "-c:a", "libopus",
-    "-application", "lowdelay",
-    "-frame_duration", "20",
+    ...audioCodecArgs,
     // SYNTHETIC audio clock: regenerate pts from the cumulative sample count,
     // discarding the camera's wobbly timestamps entirely. The video leg
     // already gets a steady clock from the -r CFR grid; audio passing the
@@ -333,7 +354,7 @@ interface ActiveSession {
 export interface StreamingDelegateOptions {
   /** Which stream's stills to serve for HomeKit snapshot requests. Default "sub". */
   snapshotProfile?: SnapshotProfile;
-  /** Override FFmpeg binary path (default "ffmpeg"). */
+  /** Override FFmpeg binary path (default: ARGUS_FFMPEG env, else "ffmpeg"). */
   ffmpegPath?: string;
   /** Log the FFmpeg command + stderr to the console. Default true. */
   verbose?: boolean;
@@ -385,7 +406,10 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
     options: StreamingDelegateOptions = {},
   ) {
     this.snapshotProfile = options.snapshotProfile ?? "sub";
-    this.ffmpegPath = options.ffmpegPath ?? "ffmpeg";
+    // ARGUS_FFMPEG lets the daemon point at a libfdk_aac-enabled ffmpeg (needed
+    // for AAC-ELD live audio) without replacing the system binary — explicit
+    // option still wins. See progress/attempt-008.md.
+    this.ffmpegPath = options.ffmpegPath ?? process.env.ARGUS_FFMPEG ?? "ffmpeg";
     this.verbose = options.verbose ?? true;
     this.includeAudio = options.includeAudio ?? true;
     this.videoMode = options.videoMode ?? "transcode";
@@ -590,6 +614,12 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
         sampleRateKhz: request.audio.sample_rate,
         maxBitrateKbps: request.audio.max_bit_rate,
         srtpParams: session.prepared.audio.srtpParams,
+        // Encode whatever HomeKit negotiated. The advertised codec (Opus vs
+        // AAC-ELD) is gated by ARGUS_LIVE_AAC_ELD in buildCameraControllerOptions;
+        // deriving from the actual ask keeps the encoder correct even if a
+        // controller picks the other codec.
+        audioCodec:
+          request.audio.codec === AudioStreamingCodecType.AAC_ELD ? "aac_eld" : "opus",
       },
     };
 
@@ -719,9 +749,17 @@ export function buildCameraControllerOptions(
       },
       // Omitting audio entirely makes HomeKit treat this as a video-only camera —
       // useful for isolating whether audio negotiation is what stalls a session.
+      // ARGUS_LIVE_AAC_ELD=1 advertises Apple's canonical AAC-ELD codec (16kHz)
+      // instead of Opus (24kHz) — the experimental fix for the ≥720p audio-gates-
+      // video hang (progress/attempt-008.md). Requires ARGUS_FFMPEG pointed at a
+      // libfdk_aac build, or the live audio leg fails to start.
       audio: {
         codecs: includeAudio
-          ? [{ type: AudioStreamingCodecType.OPUS, samplerate: AudioStreamingSamplerate.KHZ_24 }]
+          ? [
+              process.env.ARGUS_LIVE_AAC_ELD === "1"
+                ? { type: AudioStreamingCodecType.AAC_ELD, samplerate: AudioStreamingSamplerate.KHZ_16 }
+                : { type: AudioStreamingCodecType.OPUS, samplerate: AudioStreamingSamplerate.KHZ_24 },
+            ]
           : [],
       },
     },

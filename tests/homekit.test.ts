@@ -87,6 +87,36 @@ describe("buildLiveFfmpegArgs", () => {
     expect(args).not.toContain("intra-refresh");
   });
 
+  it("encodes AAC-ELD audio when the negotiated codec is aac_eld (libfdk_aac, no opus flags)", () => {
+    // HomeKit's canonical camera codec; the builder must produce exactly what
+    // was negotiated (16kHz mono from the controller's ask). homebridge-camera-
+    // ffmpeg's proven ELD args: libfdk_aac -profile:a aac_eld -flags +global_header.
+    const args = buildLiveFfmpegArgs(
+      liveInput({
+        audio: { ...liveInput().audio, audioCodec: "aac_eld", sampleRateKhz: 16 },
+      }),
+    ).join(" ");
+
+    expect(args).toContain("-c:a libfdk_aac");
+    expect(args).toContain("-profile:a aac_eld");
+    expect(args).toContain("-flags +global_header");
+    expect(args).toContain("-ar 16k");
+    expect(args).toContain("-ac 1");
+    // Opus-only options must NOT leak into the ELD command.
+    expect(args).not.toContain("libopus");
+    expect(args).not.toContain("-application lowdelay");
+    expect(args).not.toContain("-frame_duration 20");
+    // The synthetic audio clock still applies (it heals Reolink RTSP wobble
+    // regardless of codec).
+    expect(args).toContain("-af asetpts=N/SR/TB");
+  });
+
+  it("defaults to Opus audio when no codec is specified (back-compat)", () => {
+    const args = buildLiveFfmpegArgs(liveInput()).join(" ");
+    expect(args).toContain("-c:a libopus");
+    expect(args).not.toContain("libfdk_aac");
+  });
+
   it("downscales starved sessions (relay-obeyed bitrates) inside the negotiated box", () => {
     // A hub-relayed remote viewer negotiates 720p but obeys Apple's 132k ask —
     // full 720p at 132k pulsates; 854x480 in the same box is merely soft.
@@ -213,6 +243,18 @@ describe("buildCameraControllerOptions", () => {
     const resolutions = opts.streamingOptions.video.resolutions.map((r) => `${r[0]}x${r[1]}`);
     expect(resolutions).toContain("1280x720");
     expect(opts.streamingOptions.audio?.codecs?.[0]?.type).toBe("OPUS");
+  });
+
+  it("advertises AAC-ELD at 16kHz with ARGUS_LIVE_AAC_ELD=1 (Apple's canonical codec)", () => {
+    const delegate = new ArgusStreamingDelegate("Backyard Left", "rtsp://x", cacheWith(Buffer.from([0xff, 0xd8])));
+    process.env.ARGUS_LIVE_AAC_ELD = "1";
+    try {
+      const opts = buildCameraControllerOptions(delegate);
+      expect(opts.streamingOptions.audio?.codecs?.[0]?.type).toBe("AAC-eld");
+      expect(opts.streamingOptions.audio?.codecs?.[0]?.samplerate).toBe(16); // KHZ_16
+    } finally {
+      delete process.env.ARGUS_LIVE_AAC_ELD;
+    }
   });
 
   it("advertises ONLY the native resolution in copy mode (mismatch kills the session)", () => {
