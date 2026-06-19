@@ -55,7 +55,7 @@ cat > "$PLIST" <<PLIST
     #   ARGUS_HUB_ADDRESSES=<hub-ip> bash scripts/install-launchd.sh
     # Hub-relayed sessions (remote viewers, Apple Watch) then obey Apple's
     # negotiated bitrate instead of the LAN quality floors.
-    for var in ARGUS_HUB_ADDRESSES ARGUS_LIVE_LADDER ARGUS_LIVE_OBEY_BITRATE ARGUS_LIVE_COPY ARGUS_AUDIO; do
+    for var in ARGUS_HUB_ADDRESSES ARGUS_LIVE_LADDER ARGUS_LIVE_OBEY_BITRATE ARGUS_LIVE_COPY ARGUS_AUDIO ARGUS_FFMPEG ARGUS_LIVE_AAC_ELD ARGUS_LIVE_MAIN_SOURCE ARGUS_LIVE_INTRA; do
       [[ -n "${!var:-}" ]] && printf '\n    <key>%s</key>\n    <string>%s</string>' "$var" "${!var}"
     done
   )

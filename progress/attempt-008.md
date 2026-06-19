@@ -96,6 +96,28 @@ libfdk build — the running daemon is byte-identical today.
    encoder, and `<that-ffmpeg> -f lavfi -i sine=r=16000 -c:a libfdk_aac
    -profile:a aac_eld -ar 16000 -ac 1 -t1 -f null -` exits 0.
 
+## Install log (2026-06-19) — prerequisite DONE, blocker cleared
+
+- Installed `ffmpeg-for-homebridge` standalone at `~/.local/lib/ffmpeg-for-homebridge`;
+  binary symlinked to **`~/.local/bin/ffmpeg-homebridge`** (ffmpeg 8.0-homebridge-darwin-arm64,
+  ships `libfdk_aac`).
+- **AAC-ELD encode VERIFIED** on that binary: `libfdk_aac -profile:a aac_eld -ar 16000
+  -ac 1 -b:a 24k` → exit 0, real `aac (ELD) 16000 Hz mono 24 kb/s` packets (RTP muxer too).
+- **GOTCHA (do not remove `-b:a`):** ELD with libfdk REQUIRES an explicit bitrate.
+  VBR / no `-b:a` fails with `Terminating thread with return code -22 (Invalid argument)`.
+  The builder already emits `-b:a ${maxBitrateKbps}k` from the negotiated ask, so this
+  is fine — just never "simplify" it away.
+- `scripts/install-launchd.sh` env forward-list was stale; added `ARGUS_FFMPEG`,
+  `ARGUS_LIVE_AAC_ELD`, `ARGUS_LIVE_MAIN_SOURCE`, `ARGUS_LIVE_INTRA`.
+- Daemon reinstalled with `ARGUS_FFMPEG=~/.local/bin/ffmpeg-homebridge` (existing
+  `ARGUS_HUB_ADDRESSES=10.0.0.15` + `ARGUS_LIVE_LADDER=compat` preserved).
+  **`ARGUS_LIVE_AAC_ELD` left OFF** — daemon still serves Opus, now via the libfdk
+  binary (identical output). Note: `launchctl bootstrap` threw a transient
+  `5: Input/output error` immediately after bootout; a second bootout+bootstrap
+  succeeded (pid healthy, all 7 cameras published). If it recurs, just re-run.
+- So the ONLY remaining steps for the on-device test are: flip `ARGUS_LIVE_AAC_ELD=1`,
+  bump `ARGUS_FIRMWARE_REVISION`, reboot the hub, test Garage Door.
+
 ## Next-session protocol (resume here)
 
 1. Set `ARGUS_FFMPEG=<libfdk-ffmpeg>` and `ARGUS_LIVE_AAC_ELD=1` in the launchd
