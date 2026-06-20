@@ -118,6 +118,17 @@ libfdk build — the running daemon is byte-identical today.
 - So the ONLY remaining steps for the on-device test are: flip `ARGUS_LIVE_AAC_ELD=1`,
   bump `ARGUS_FIRMWARE_REVISION`, reboot the hub, test Garage Door.
 
+**FLIPPED (2026-06-19, same session):** `ARGUS_FIRMWARE_REVISION` 1.1.0 → **1.2.0**;
+daemon reinstalled with `ARGUS_LIVE_AAC_ELD=1` (pid healthy, env verified, all 7
+published). The daemon now ADVERTISES AAC-ELD@16kHz fleet-wide and will spawn the
+libfdk binary for the next live session. **Blast radius is fleet-wide** (the flag
+is a process env, not per-camera) — the 6 cameras still on cached 640x360 will also
+move to AAC-ELD once their controllers refresh. **Remaining: Peter reboots the
+Apple TV hub** (the only thing that flushes the controller streaming-config cache;
+a firmware bump alone did NOT force a re-read in attempt-007's measurements), then
+tests Garage Door (≥10-min cooldown). **Rollback if audio regresses:** reinstall
+without `ARGUS_LIVE_AAC_ELD` (bump firmware again) — back to Opus instantly.
+
 ## Next-session protocol (resume here)
 
 1. Set `ARGUS_FFMPEG=<libfdk-ffmpeg>` and `ARGUS_LIVE_AAC_ELD=1` in the launchd

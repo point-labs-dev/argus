@@ -776,7 +776,7 @@ export function buildCameraControllerOptions(
  * lastFirmwareVersion in AccessoryInfo for exactly that). BUMP THIS whenever
  * the advertised streaming configuration changes.
  */
-export const ARGUS_FIRMWARE_REVISION = "1.1.0";
+export const ARGUS_FIRMWARE_REVISION = "1.2.0";
 
 export interface CameraAccessoryHandle {
   accessory: Accessory;
