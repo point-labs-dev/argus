@@ -120,10 +120,13 @@ libfdk build — the running daemon is byte-identical today.
 
 **FLIPPED (2026-06-19, same session):** `ARGUS_FIRMWARE_REVISION` 1.1.0 → **1.2.0**;
 daemon reinstalled with `ARGUS_LIVE_AAC_ELD=1` (pid healthy, env verified, all 7
-published). The daemon now ADVERTISES AAC-ELD@16kHz fleet-wide and will spawn the
-libfdk binary for the next live session. **Blast radius is fleet-wide** (the flag
-is a process env, not per-camera) — the 6 cameras still on cached 640x360 will also
-move to AAC-ELD once their controllers refresh. **Remaining: Peter reboots the
+published). The daemon now ADVERTISES AAC-ELD@16kHz and will spawn the libfdk
+binary for the next live session. **Scope: effectively Garage-Door-only.** The
+flag is a process env (not per-camera), but ground truth (Peter, 2026-06-19) is
+that **only Garage Door is currently paired to HomeKit — the other 6 were
+unpaired during earlier debugging** — so there are no other controllers for the
+AAC-ELD advert to affect. This is exactly the single-camera test scope this
+attempt wanted. **Remaining: Peter reboots the
 Apple TV hub** (the only thing that flushes the controller streaming-config cache;
 a firmware bump alone did NOT force a re-read in attempt-007's measurements), then
 tests Garage Door (≥10-min cooldown). **Rollback if audio regresses:** reinstall
