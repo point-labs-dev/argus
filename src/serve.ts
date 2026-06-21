@@ -77,6 +77,19 @@ export async function startArgusServer(config: ArgusConfig, configDir = process.
   );
 
   const streamNames = buildGo2RtcStreamNames(config.cameras);
+  // ARGUS_HAP_BIND restricts HAP/mDNS advertisement to specific interface(s) or
+  // IP(s) (comma-separated; HAP-NodeJS accepts interface names like "en0"). When
+  // unset, HAP binds ALL interfaces — which on a multi-homed host advertises the
+  // accessory on dead/secondary interfaces too (e.g. a 169.254 link-local from a
+  // failed-DHCP adapter), so the hub flaps trying the unreachable address. Pin to
+  // the real LAN interface (e.g. en0) to stop that. See progress/attempt-009.md.
+  const hapBindRaw = process.env.ARGUS_HAP_BIND?.trim();
+  const hapBind = hapBindRaw
+    ? hapBindRaw.split(",").map((s) => s.trim()).filter(Boolean)
+    : undefined;
+  if (hapBind) {
+    process.stdout.write(`[argus] HAP/mDNS bind restricted to: ${hapBind.join(", ")}\n`);
+  }
   const setMotionByCamera = new Map<string, (detected: boolean) => void>();
   const published = config.cameras.map((camera, index) => {
     const names = streamNames[index]!;
@@ -118,7 +131,13 @@ export async function startArgusServer(config: ArgusConfig, configDir = process.
     const username = macFromName(camera.name);
     const port = HOMEKIT_PORT_BASE + index;
 
-    accessory.publish({ username, pincode: config.homekit.pin, port, category: Categories.IP_CAMERA });
+    accessory.publish({
+      username,
+      pincode: config.homekit.pin,
+      port,
+      category: Categories.IP_CAMERA,
+      ...(hapBind ? { bind: hapBind } : {}),
+    });
 
     process.stdout.write(
       `\n  📷 ${camera.name}\n     pair code: ${config.homekit.pin}\n     setup URI: ${accessory.setupURI()}\n     (port ${port}, id ${username})\n`,
