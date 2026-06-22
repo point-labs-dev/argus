@@ -18,7 +18,10 @@
     "build": "tsc -p tsconfig.json",
     "dev": "tsx src/cli.ts",
     "serve": "tsx src/serve.ts",
-    "test": "vitest run"
+    "test": "vitest run",
+    "verify:home": "node scripts/verify-home-live.mjs",
+    "watch:home": "node scripts/watch-home-live.mjs",
+    "watch:home:mini": "node scripts/watch-mini-home-live.mjs"
   },
   "dependencies": {
     "hap-nodejs": "^0.14.3",
