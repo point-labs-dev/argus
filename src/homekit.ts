@@ -73,6 +73,10 @@ export interface LiveFfmpegInput {
    * Enable via ARGUS_LIVE_COPY=1 to test against other clients (iPhone).
    */
   videoMode: "copy" | "transcode";
+  /** Optional per-camera content box for aspect-preserved transcodes. Env override still wins. */
+  liveContentResolution?: { width: number; height: number };
+  /** Whether to pad to Home's negotiated frame. Env override still wins. */
+  liveExactFrame?: boolean;
   video: {
     port: number;
     localRtcpPort?: number;
@@ -158,12 +162,20 @@ export function keepNegotiatedLiveSize(value = process.env.ARGUS_LIVE_KEEP_NEGOT
   return value === "1";
 }
 
-function parseMaxLiveResolution(value = process.env.ARGUS_LIVE_MAX_RESOLUTION): { width: number; height: number } | undefined {
+function parseResolution(value: string | undefined): { width: number; height: number } | undefined {
   const match = value?.trim().match(/^(\d+)x(\d+)$/i);
   if (!match) return undefined;
   const width = Number(match[1]);
   const height = Number(match[2]);
   return width > 0 && height > 0 ? { width, height } : undefined;
+}
+
+function parseMaxLiveResolution(value = process.env.ARGUS_LIVE_MAX_RESOLUTION): { width: number; height: number } | undefined {
+  return parseResolution(value);
+}
+
+function forcedLiveContentResolution(value = process.env.ARGUS_LIVE_CONTENT_RESOLUTION): { width: number; height: number } | undefined {
+  return parseResolution(value);
 }
 
 function capResolutions(resolutions: [number, number, number][]): [number, number, number][] {
@@ -192,6 +204,12 @@ export function liveVideoPacketSize(
 
 export function exactLiveFrameEnabled(value = process.env.ARGUS_LIVE_EXACT_FRAME): boolean {
   return value !== "0";
+}
+
+function exactLiveFrameFor(inputExactFrame: boolean | undefined): boolean {
+  return process.env.ARGUS_LIVE_EXACT_FRAME !== undefined
+    ? exactLiveFrameEnabled(process.env.ARGUS_LIVE_EXACT_FRAME)
+    : inputExactFrame ?? true;
 }
 
 export function liveVideoFilter(
@@ -250,9 +268,13 @@ export function buildLiveFfmpegArgs(input: LiveFfmpegInput, includeAudio = true)
   // asks) get fewer content pixels per bit: encoding a full 1280x720 at 132k is
   // pulsating mush, 854x480 content padded back into the negotiated frame is
   // merely soft while preserving the exact HomeKit stream dimensions.
+  const forcedContent = videoMode === "transcode"
+    ? (forcedLiveContentResolution() ?? input.liveContentResolution)
+    : undefined;
   const starved = hiResSession && video.maxBitrateKbps < 800 && !keepNegotiatedLiveSize();
-  const contentWidth = starved ? Math.min(854, video.width) : video.width;
-  const contentHeight = starved ? Math.min(480, video.height) : video.height;
+  const contentWidth = forcedContent?.width ?? (starved ? Math.min(854, video.width) : video.width);
+  const contentHeight = forcedContent?.height ?? (starved ? Math.min(480, video.height) : video.height);
+  const exactFrame = exactLiveFrameFor(input.liveExactFrame);
   const cbrVideo = process.env.ARGUS_LIVE_CBR === "1";
 
   // Everything transcoded goes through libx264 capped-CRF: constant visual
@@ -287,7 +309,7 @@ export function buildLiveFfmpegArgs(input: LiveFfmpegInput, includeAudio = true)
           "-pix_fmt", "yuv420p",
           "-color_range", "tv",
           "-r", String(video.fps),
-          "-vf", liveVideoFilter(contentWidth, contentHeight, video.width, video.height),
+          "-vf", liveVideoFilter(contentWidth, contentHeight, video.width, video.height, exactFrame),
           "-bf", "0",
           ...keyframeArgs,
           "-crf", hiResSession ? "18" : "20",
@@ -502,6 +524,14 @@ export interface StreamingDelegateOptions {
    * (measured 2026-06-11 — non-standard sizes are dead weight).
    */
   liveResolution?: { width: number; height: number };
+  /**
+   * Per-camera content box for aspect-preserved transcodes. Used to keep the
+   * encoded H.264 frame inside a known Home-accepted geometry while retaining a
+   * higher bitrate. ARGUS_LIVE_CONTENT_RESOLUTION overrides globally for tests.
+   */
+  liveContentResolution?: { width: number; height: number };
+  /** Per-camera override for exact-frame padding; ARGUS_LIVE_EXACT_FRAME overrides globally. */
+  liveExactFrame?: boolean;
   /** Injectable spawn for tests. */
   spawnFn?: typeof spawn;
 }
@@ -520,6 +550,8 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
   private readonly includeAudio: boolean;
   private readonly videoMode: "copy" | "transcode";
   private readonly mainStreamUrl?: string;
+  private readonly liveContentResolution?: { width: number; height: number };
+  private readonly liveExactFrame?: boolean;
   private readonly spawnFn: typeof spawn;
 
   public constructor(
@@ -538,6 +570,8 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
     this.includeAudio = options.includeAudio ?? true;
     this.videoMode = options.videoMode ?? "transcode";
     if (options.mainStreamUrl !== undefined) this.mainStreamUrl = options.mainStreamUrl;
+    if (options.liveContentResolution !== undefined) this.liveContentResolution = options.liveContentResolution;
+    if (options.liveExactFrame !== undefined) this.liveExactFrame = options.liveExactFrame;
     this.spawnFn = options.spawnFn ?? spawn;
   }
 
@@ -767,6 +801,8 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
       inputUrl: this.pickInputUrl(request.video.width, request.video.height),
       targetAddress: session.prepared.targetAddress,
       videoMode: this.videoMode,
+      ...(this.liveContentResolution ? { liveContentResolution: this.liveContentResolution } : {}),
+      ...(this.liveExactFrame !== undefined ? { liveExactFrame: this.liveExactFrame } : {}),
       video: {
         port: session.prepared.video.port,
         ...(session.prepared.video.localRtcpPort !== undefined

@@ -163,6 +163,79 @@ describe("buildLiveFfmpegArgs", () => {
     }
   });
 
+  it("can force the live content scale independently from the bitrate cap", () => {
+    process.env.ARGUS_LIVE_CONTENT_RESOLUTION = "854x480";
+    try {
+      const args = buildLiveFfmpegArgs(
+        liveInput({ video: { ...liveInput().video, maxBitrateKbps: 2000 } }),
+      ).join(" ");
+
+      expect(args).toContain("scale=854:480:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1");
+      expect(args).toContain("-maxrate 2000k");
+      expect(args).not.toContain("-b:v");
+    } finally {
+      delete process.env.ARGUS_LIVE_CONTENT_RESOLUTION;
+    }
+  });
+
+  it("accepts a per-camera live content scale when no env override is set", () => {
+    const args = buildLiveFfmpegArgs(
+      liveInput({
+        liveContentResolution: { width: 854, height: 480 },
+        video: { ...liveInput().video, maxBitrateKbps: 2000 },
+      }),
+    ).join(" ");
+
+    expect(args).toContain("scale=854:480:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1");
+    expect(args).toContain("-maxrate 2000k");
+  });
+
+  it("can disable exact-frame padding per camera", () => {
+    const args = buildLiveFfmpegArgs(
+      liveInput({
+        liveContentResolution: { width: 854, height: 480 },
+        liveExactFrame: false,
+        video: { ...liveInput().video, maxBitrateKbps: 2000 },
+      }),
+    ).join(" ");
+
+    expect(args).toContain("scale=854:480:force_original_aspect_ratio=decrease:force_divisible_by=2,setsar=1");
+    expect(args).not.toContain("pad=1280:720");
+  });
+
+  it("lets exact-frame env override per-camera config for diagnostics", () => {
+    process.env.ARGUS_LIVE_EXACT_FRAME = "1";
+    try {
+      const args = buildLiveFfmpegArgs(
+        liveInput({
+          liveContentResolution: { width: 854, height: 480 },
+          liveExactFrame: false,
+          video: { ...liveInput().video, maxBitrateKbps: 2000 },
+        }),
+      ).join(" ");
+
+      expect(args).toContain("scale=854:480:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1");
+    } finally {
+      delete process.env.ARGUS_LIVE_EXACT_FRAME;
+    }
+  });
+
+  it("lets the live content env override per-camera config for diagnostics", () => {
+    process.env.ARGUS_LIVE_CONTENT_RESOLUTION = "640x360";
+    try {
+      const args = buildLiveFfmpegArgs(
+        liveInput({
+          liveContentResolution: { width: 854, height: 480 },
+          video: { ...liveInput().video, maxBitrateKbps: 2000 },
+        }),
+      ).join(" ");
+
+      expect(args).toContain("scale=640:360:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1");
+    } finally {
+      delete process.env.ARGUS_LIVE_CONTENT_RESOLUTION;
+    }
+  });
+
   it("can add a CBR video target for HomeKit stream-shape diagnostics", () => {
     process.env.ARGUS_LIVE_CBR = "1";
     try {

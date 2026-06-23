@@ -796,6 +796,134 @@ Interpret this as "no iPhone/Home Garage Door live request reached Argus during
 the watcher window", not as a stream failure. It also confirms the passive
 watcher can wait without activating Mac Home or changing HomeKit cooldown state.
 
+A second normal-profile Mini watcher was run at `2026-06-22T20:17Z`:
+
+`npm run watch:home:mini -- --timeout-seconds 240 --json-out /tmp/argus-iphone-live-normal-20260622T2017Z.json --mirror-log /tmp/argus-iphone-live-normal-20260622T2017Z.log`
+
+Result:
+
+- timeout after 240s, from `2026-06-22T20:17:03.929Z` to
+  `2026-06-22T20:21:04.013Z`
+- ignored Mac controller: `10.0.0.46`
+- matching HomeKit live negotiations: none
+- `partialLines: []`
+- mirror log was empty
+
+Interpret this the same way: no non-Mac/iPhone live request reached Argus during
+the watcher window. If the Garage Door tile was tapped from iPhone during this
+window, the next investigation is Home/iPhone targeting or cached accessory
+state, not RTP payload tuning.
+
+The next Mini watcher was run at `2026-06-22T20:22Z`:
+
+`npm run watch:home:mini -- --timeout-seconds 300 --json-out /tmp/argus-iphone-live-normal-20260622T2022Z.json --mirror-log /tmp/argus-iphone-live-normal-20260622T2022Z.log`
+
+Result:
+
+- matched iPhone/Home controller `10.0.0.41`
+- negotiated at `2026-06-22T20:24:28.521Z`
+- exited at `2026-06-22T20:24:58.562Z`, session duration `30041ms`
+- negotiated `1280x720@30`, H.264 high level 4.0, payload type `99`
+- Home asked `299k`, Argus served the normal 720p floor of `2000k`
+- source `rtsp://127.0.0.1:8554/garage-door-sub`, mode `transcode`
+- target/controller both `10.0.0.41`, RTCP via `ffmpeg-localrtcpport`
+- controller selected audio, Argus audio enabled, FFmpeg audio leg present,
+  AAC-ELD true (`codec=AAC-eld 16kHz ptype=110 source=input`)
+- exact-frame padding was active in the FFmpeg command:
+  `pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1`
+- FFmpeg exit line:
+  `2026-06-22T20:24:58.562Z [argus Garage Door] ffmpeg exited code=null signal=SIGKILL`
+- visible iPhone result, reported by Peter: spinner for the full 30-second
+  session, no live render
+
+Additional Mini log context: before the 20:22 watcher began, the iPhone
+controller also opened Garage Door at `2026-06-22T20:13:45.110Z` and was killed
+after `30371ms`, then opened two short sessions at `20:14:29.404Z` (`2144ms`)
+and `20:14:34.853Z` (`4245ms`). All three selected the same
+`1280x720@30` / AAC-ELD / `serving=2000k` profile.
+
+An early iPhone tap occurred before the next cooldown/test profile was ready:
+`2026-06-22T20:26:11.760Z` negotiated the same normal
+`1280x720@30` / AAC-ELD / `serving=2000k` profile for controller `10.0.0.41`
+and was killed at `2026-06-22T20:26:42.180Z` after `30420ms`.
+
+After that, the Mini launchd plist was rewritten for a temporary constrained
+720p profile:
+
+`ARGUS_HUB_ADDRESSES=10.0.0.15 ARGUS_LIVE_LADDER=compat ARGUS_FFMPEG=/Users/pointlabs/.local/bin/ffmpeg-homebridge ARGUS_LIVE_AAC_ELD=1 ARGUS_HAP_BIND=en0 ARGUS_LIVE_720P_BITRATE_KBPS=1000 ARGUS_LIVE_KEEP_NEGOTIATED_SIZE=1 ARGUS_LIVE_CBR=1`
+
+Install detail: the first install attempt failed because the non-interactive SSH
+shell did not have Homebrew `node` on `PATH`; the retry with
+`PATH=/opt/homebrew/bin:$PATH` wrote the plist, then hit the known transient
+`Bootstrap failed: 5: Input/output error`. Direct `launchctl bootstrap` of the
+written plist succeeded. `launchctl print` then showed pid `99769`, Garage Door
+still `live mode: transcode (≥720p source: sub)`, and active envs
+`ARGUS_LIVE_720P_BITRATE_KBPS=1000`, `ARGUS_LIVE_KEEP_NEGOTIATED_SIZE=1`,
+`ARGUS_LIVE_CBR=1`, `ARGUS_HAP_BIND=en0`, and `ARGUS_LIVE_AAC_ELD=1`.
+
+After the cooldown, the constrained-profile Mini watcher was run at
+`2026-06-22T20:36Z`:
+
+`npm run watch:home:mini -- --timeout-seconds 180 --json-out /tmp/argus-iphone-live-1000cbr-20260622T2036Z.json --mirror-log /tmp/argus-iphone-live-1000cbr-20260622T2036Z.log`
+
+Result:
+
+- matched iPhone/Home controller `10.0.0.41`
+- negotiated at `2026-06-22T20:37:19.599Z`
+- exited at `2026-06-22T20:37:50.026Z`, session duration `30427ms`
+- negotiated `1280x720@30`, H.264 high level 4.0, payload type `99`
+- Home asked `299k`, Argus served constrained `1000k`
+- FFmpeg command confirmed CBR-style shaping:
+  `-b:v 1000k -maxrate 1000k -bufsize 1000k`
+- exact-frame padding remained active:
+  `pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1`
+- source `rtsp://127.0.0.1:8554/garage-door-sub`, mode `transcode`
+- target/controller both `10.0.0.41`, RTCP via `ffmpeg-localrtcpport`
+- controller selected audio, Argus audio enabled, FFmpeg audio leg present,
+  AAC-ELD true (`codec=AAC-eld 16kHz ptype=110 source=input`)
+- FFmpeg exit line:
+  `2026-06-22T20:37:50.026Z [argus Garage Door] ffmpeg exited code=null signal=SIGKILL`
+- visible iPhone result, reported by Peter: spinner for the full session, no
+  live feed
+
+After the `1000k` CBR spinner result, the Mini launchd plist was rewritten for a
+strict Home-ask bitrate test:
+
+`ARGUS_HUB_ADDRESSES=10.0.0.15 ARGUS_LIVE_LADDER=compat ARGUS_FFMPEG=/Users/pointlabs/.local/bin/ffmpeg-homebridge ARGUS_LIVE_AAC_ELD=1 ARGUS_HAP_BIND=en0 ARGUS_LIVE_OBEY_BITRATE=1 ARGUS_LIVE_CBR=1`
+
+The first reinstall again hit the known `Bootstrap failed: 5: Input/output
+error` after writing the plist. Direct `launchctl bootstrap` succeeded.
+`launchctl print` showed pid `2206`, active envs `ARGUS_LIVE_OBEY_BITRATE=1`,
+`ARGUS_LIVE_CBR=1`, `ARGUS_HAP_BIND=en0`, and `ARGUS_LIVE_AAC_ELD=1`, with no
+`ARGUS_LIVE_KEEP_NEGOTIATED_SIZE`. Garage Door startup remained
+`live mode: transcode (≥720p source: sub)`. This should serve Home's `299k`
+ask exactly and let the starved-content fallback send 854x480 content padded
+into the negotiated 1280x720 frame.
+
+After the cooldown, the strict-bitrate Mini watcher was run at
+`2026-06-22T20:48Z`:
+
+`npm run watch:home:mini -- --timeout-seconds 180 --json-out /tmp/argus-iphone-live-obey-20260622T2048Z.json --mirror-log /tmp/argus-iphone-live-obey-20260622T2048Z.log`
+
+Result:
+
+- matched iPhone/Home controller `10.0.0.41`
+- negotiated at `2026-06-22T20:48:37.121Z`
+- exited at `2026-06-22T20:49:03.327Z`, session duration `26206ms`
+- negotiated `1280x720@30`, H.264 high level 4.0, payload type `99`
+- Home asked `299k`, Argus served exactly `299k`
+- FFmpeg command confirmed strict CBR-style shaping:
+  `-b:v 299k -maxrate 299k -bufsize 299k`
+- starved-content fallback was active inside the negotiated frame:
+  `scale=854:480:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1`
+- source `rtsp://127.0.0.1:8554/garage-door-sub`, mode `transcode`
+- target/controller both `10.0.0.41`, RTCP via `ffmpeg-localrtcpport`
+- controller selected audio, Argus audio enabled, FFmpeg audio leg present,
+  AAC-ELD true (`codec=AAC-eld 16kHz ptype=110 source=input`)
+- FFmpeg exit line:
+  `2026-06-22T20:49:03.327Z [argus Garage Door] ffmpeg exited code=null signal=SIGKILL`
+- visible iPhone result, reported by Peter: spinner only, no live video
+
 ## Interpretation
 
 - The fastest path metrics are good up to negotiation: 226-284ms
@@ -831,29 +959,581 @@ watcher can wait without activating Mac Home or changing HomeKit cooldown state.
   accessory identity. Do not apply that to the other six cameras yet.
 - Because video-only, real AAC-ELD, and synthetic-silence AAC-ELD all fail in the
   Mac Home verifier, do not re-pair the other six cameras yet.
+- The iPhone/Home path is now confirmed to reach Argus (`10.0.0.41`) and selects
+  the same 720p/AAC-ELD shape as Mac Home. If the visible iPhone result was a
+  30-second spinner/no-render, the next useful test is a cooldown-respecting
+  iPhone run with 720p preserved but bitrate constrained by the existing
+  rollback envs, because Home asked for only `299k` while Argus served `2000k`.
+- The constrained `1000k` CBR iPhone run also spun for the full 30 seconds, so
+  the next useful bitrate test is strict Home-ask obedience (`~299k`) with
+  CBR and the starved-content fallback: 854x480 content padded into the
+  negotiated 1280x720 frame.
+- The strict-bitrate iPhone run successfully exercised that fallback and served
+  exactly Home's `299k` ask. If the visible result was still spinner/no-render,
+  the next variable to isolate is audio at the iPhone controller path:
+  `ARGUS_AUDIO=0`, not another bitrate rung.
+- The strict-bitrate iPhone run also spun with no live video, so bitrate and
+  720p frame size are not sufficient explanations. Next run should keep strict
+  bitrate and remove Argus's audio response/RTP leg with `ARGUS_AUDIO=0`, plus a
+  Garage Door `ARGUS_HAP_CONFIG_BUMP` so the iPhone has a chance to refresh the
+  changed audio shape.
+
+After that, the Mini launchd plist was rewritten for video-only strict bitrate:
+
+`ARGUS_HUB_ADDRESSES=10.0.0.15 ARGUS_LIVE_LADDER=compat ARGUS_FFMPEG=/Users/pointlabs/.local/bin/ffmpeg-homebridge ARGUS_HAP_BIND=en0 ARGUS_AUDIO=0 ARGUS_LIVE_OBEY_BITRATE=1 ARGUS_LIVE_CBR=1 ARGUS_HAP_CONFIG_BUMP="Garage Door"`
+
+As before, the first reinstall hit `Bootstrap failed: 5: Input/output error`
+after writing the plist. Direct `launchctl bootstrap` succeeded. `launchctl
+print` then showed pid `3686` with active envs `ARGUS_AUDIO=0`,
+`ARGUS_LIVE_OBEY_BITRATE=1`, `ARGUS_LIVE_CBR=1`, `ARGUS_HAP_BIND=en0`, and
+`ARGUS_HAP_CONFIG_BUMP=Garage Door`. Startup log confirmed Garage Door stayed
+`live mode: transcode (≥720p source: sub)` and forced
+`HomeKit configVersion=18`.
+
+After the cooldown, the video-only strict-bitrate Mini watcher was run at
+`2026-06-22T20:59Z`:
+
+`npm run watch:home:mini -- --timeout-seconds 180 --json-out /tmp/argus-iphone-live-videoonly-obey-20260622T2059Z.json --mirror-log /tmp/argus-iphone-live-videoonly-obey-20260622T2059Z.log`
+
+Result:
+
+- matched iPhone/Home controller `10.0.0.41`
+- negotiated at `2026-06-22T20:59:52.224Z`
+- exited at `2026-06-22T21:00:17.982Z`, session duration `25758ms`
+- negotiated `1280x720@30`, H.264 high level 4.0, payload type `99`
+- Home asked `299k`, Argus served exactly `299k`
+- Argus omitted `PrepareStreamResponse.audio`/audio RTP:
+  `argusAudioDisabled=true`, `ffmpegAudioLeg=false`, `aacEld=false`
+- Home/HAP still selected its fallback audio shape:
+  `audio: disabled (controller selected codec=OPUS 24kHz ptype=110)`
+- FFmpeg command had no audio leg and strict CBR-style shaping:
+  `-b:v 299k -maxrate 299k -bufsize 299k`
+- starved-content fallback was active:
+  `scale=854:480:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1`
+- source `rtsp://127.0.0.1:8554/garage-door-sub`, mode `transcode`
+- target/controller both `10.0.0.41`, RTCP via `ffmpeg-localrtcpport`
+- FFmpeg exit line:
+  `2026-06-22T21:00:17.982Z [argus Garage Door] ffmpeg exited code=null signal=SIGKILL`
+- visible iPhone result, reported by Peter: same spinner behavior, no live video
+
+This rules out the AAC-ELD RTP leg as the direct iPhone blocker for this
+failure mode. The next high-signal source/profile test is main-source
+video-only strict bitrate, because attempt 007's one known 720p iPhone render
+was `720p@299k`, main source, video-only, while all current iPhone runs above
+were sub-source.
+
+### Last30days research and main-source follow-up
+
+Peter asked whether to research before spending another Home cooldown. Ran the
+`last30days` engine with a targeted HomeKit/HAP-NodeJS/FFmpeg/go2rtc plan:
+
+`python3 /Users/peterpine/.agents/skills/last30days/scripts/last30days.py "HomeKit camera live view spinner HAP-NodeJS FFmpeg RTP go2rtc homebridge-camera-ffmpeg" --emit=compact --save-dir="$HOME/Documents/Last30Days" --save-suffix=v3 --plan /tmp/<plan> --auto-resolve --subreddits=homebridge,HomeKit,homeassistant,Scrypted,reolinkcam,selfhosted --github-repo=homebridge/HAP-NodeJS,homebridge-plugins/homebridge-camera-ffmpeg,AlexxIT/go2rtc,koush/scrypted --web-backend auto`
+
+Receipt:
+
+- raw file: `/Users/peterpine/Documents/Last30Days/homekit-camera-live-view-spinner-hap-nodejs-ffmpeg-rtp-go2rtc-homebridge-camera-ffmpeg-raw-v3.md`
+- result: thin current community evidence; 6 Reddit threads, 2 X posts, 1
+  GitHub project result, no YouTube/HN/Polymarket matches
+- appended primary-source supplements from `homebridge-camera-ffmpeg` issues,
+  go2rtc HomeKit docs/issues, and HAP-NodeJS docs
+
+High-signal findings:
+
+- `homebridge-camera-ffmpeg` 3.1.4 uses the controller request SRTP key/salt
+  for `-srtp_out_params` and echoes those same values in `PrepareStreamResponse`.
+  Argus already matches that, so SRTP key direction is not the likely blocker.
+- The maintained `homebridge-camera-ffmpeg` streaming delegate sends SRTP with
+  `rtcpport=<controller port>&pkt_size=<mtu>` and no FFmpeg `localrtcpport`.
+  Argus' iPhone tests above still used `ffmpeg-localrtcpport`, so the iPhone
+  path had not yet tested the camera-ffmpeg-style RTCP return-port shape.
+- go2rtc HomeKit examples/issues reinforce the same broad shape: H.264 video,
+  OPUS audio, Home-selected 1280x720/30 at ~299k, max MTU around 1378, and
+  packetization-mode 0 in HAP-NodeJS terms (`NON_INTERLEAVED`).
+
+While the research ran, the staged main-source video-only strict-bitrate profile
+was exercised by real Home traffic:
+
+- active env at the time: `ARGUS_AUDIO=0`, `ARGUS_LIVE_OBEY_BITRATE=1`,
+  `ARGUS_LIVE_CBR=1`, `ARGUS_LIVE_MAIN_SOURCE=1`
+- Home Hub `10.0.0.15` negotiated `640x360@30` at `132k`, then reconfigured to
+  `1280x720@30` at `299k` using source `rtsp://127.0.0.1:8554/garage-door`,
+  then reconfigured back to `640x360`
+- iPhone `10.0.0.41` then negotiated `1280x720@30`, asked/served `299k`,
+  source `rtsp://127.0.0.1:8554/garage-door`, video-only, RTCP via
+  `ffmpeg-localrtcpport`
+- FFmpeg exit:
+  `2026-06-22T21:02:29.903Z [argus Garage Door] ffmpeg exited code=null signal=SIGKILL`
+- visual result was not reported for this opportunistic session, so treat it as
+  transport evidence, not as a trusted pass/fail render verdict
+
+This weakens the theory that attempt 007's known render was explained only by
+main-source video. The next test should isolate RTCP return-port shape on the
+iPhone path.
+
+### Main-source video-only strict bitrate, Node RTCP monitor
+
+Mini was switched to:
+
+`ARGUS_HUB_ADDRESSES=10.0.0.15 ARGUS_LIVE_LADDER=compat ARGUS_FFMPEG=/Users/pointlabs/.local/bin/ffmpeg-homebridge ARGUS_HAP_BIND=en0 ARGUS_AUDIO=0 ARGUS_LIVE_OBEY_BITRATE=1 ARGUS_LIVE_CBR=1 ARGUS_LIVE_MAIN_SOURCE=1 ARGUS_RTCP_MONITOR=1`
+
+The install wrote the plist but hit the known transient `Bootstrap failed: 5:
+Input/output error`; direct `launchctl bootstrap` succeeded. `launchctl print`
+confirmed pid `9041` with `ARGUS_RTCP_MONITOR=1`, `ARGUS_LIVE_MAIN_SOURCE=1`,
+`ARGUS_AUDIO=0`, strict bitrate, CBR, and `ARGUS_HAP_BIND=en0`.
+
+Started a watcher after the cooldown:
+
+`npm run watch:home:mini -- --timeout-seconds 210 --json-out /tmp/argus-iphone-live-rtcpmonitor-main-videoonly-20260622T2113Z.json --mirror-log /tmp/argus-iphone-live-rtcpmonitor-main-videoonly-20260622T2113Z.log`
+
+Result:
+
+- started `2026-06-22T21:13:00.954Z`
+- timed out `2026-06-22T21:16:31.154Z`
+- ignored Mac controller `10.0.0.46`
+- `partialLines: []`
+- error: timed out waiting for a matching HomeKit live negotiation
+
+Interpretation: no non-Mac/iPhone live request reached Argus during that
+watcher window. This is a no-trigger receipt, not a live-render failure.
+
+On `2026-06-23T12:31Z`, the same RTCP-monitor profile was tested again with
+Peter watching the iPhone:
+
+`npm run watch:home:mini -- --timeout-seconds 210 --json-out /tmp/argus-iphone-live-rtcpmonitor-main-videoonly-20260623T1231Z.json --mirror-log /tmp/argus-iphone-live-rtcpmonitor-main-videoonly-20260623T1231Z.log`
+
+Result:
+
+- matched iPhone/Home controller `10.0.0.41`
+- negotiated at `2026-06-23T12:31:12.413Z`
+- exited at `2026-06-23T12:31:30.263Z`, session duration `17850ms`
+- negotiated `1280x720@30`, H.264 high level 4.0, payload type `99`
+- Home asked `299k`, Argus served exactly `299k`
+- Argus omitted `PrepareStreamResponse.audio`/audio RTP:
+  `argusAudioDisabled=true`, `ffmpegAudioLeg=false`, `aacEld=false`
+- source `rtsp://127.0.0.1:8554/garage-door`, mode `transcode`
+- RTCP mode was `node-monitor:62973`
+- FFmpeg RTP URL omitted `localrtcpport`:
+  `srtp://10.0.0.41:53578?rtcpport=53578&pkt_size=564`
+- RTCP monitor receipt:
+  `RTCP monitor video packets=63 port=62973`
+- FFmpeg exit line:
+  `2026-06-23T12:31:30.263Z [argus Garage Door] ffmpeg exited code=null signal=SIGKILL`
+- visible iPhone result, reported by Peter: no live video, spinner, then No
+  Response screen
+
+Home immediately retried once more outside the watcher capture:
+
+- negotiated at `2026-06-23T12:31:34.282Z`
+- same profile: `1280x720@30`, source `rtsp://127.0.0.1:8554/garage-door`,
+  video-only, asked/served `299k`, `rtcp=node-monitor:54053`
+- RTCP monitor receipt:
+  `RTCP monitor video packets=110 port=54053`
+- exited at `2026-06-23T12:32:04.866Z`, normal ~30s timeout
+
+This rules out the camera-ffmpeg-style RTCP return-port shape as the direct
+blocker. The iPhone receives enough media to send RTCP receiver reports, but
+still refuses to render the transcoded H.264 stream.
+
+### Copy-mode diagnostic staged
+
+After the RTCP-monitor failure, Mini was switched during cooldown to:
+
+`ARGUS_HUB_ADDRESSES=10.0.0.15 ARGUS_FFMPEG=/Users/pointlabs/.local/bin/ffmpeg-homebridge ARGUS_HAP_BIND=en0 ARGUS_AUDIO=0 ARGUS_LIVE_COPY=1 ARGUS_RTCP_MONITOR=1 ARGUS_HAP_CONFIG_BUMP="Garage Door"`
+
+The install again wrote the plist but hit the known transient `Bootstrap failed:
+5: Input/output error`; direct `launchctl bootstrap` succeeded.
+`launchctl print` confirmed pid `35133` with active envs
+`ARGUS_LIVE_COPY=1`, `ARGUS_AUDIO=0`, `ARGUS_RTCP_MONITOR=1`,
+`ARGUS_HAP_CONFIG_BUMP=Garage Door`, and `ARGUS_HAP_BIND=en0`. Startup logs
+confirmed Garage Door `live mode: copy` and forced HomeKit `configVersion=19`.
+
+After the cooldown, the copy-mode watcher was run at `2026-06-23T12:42Z`:
+
+`npm run watch:home:mini -- --timeout-seconds 210 --json-out /tmp/argus-iphone-live-copy-videoonly-20260623T1242Z.json --mirror-log /tmp/argus-iphone-live-copy-videoonly-20260623T1242Z.log`
+
+Result:
+
+- matched iPhone/Home controller `10.0.0.41`
+- negotiated at `2026-06-23T12:44:13.914Z`
+- exited at `2026-06-23T12:44:15.188Z`, session duration `1274ms`
+- Home still selected cached `1280x720@30`, H.264 high level 4.0, payload type
+  `99`, despite copy mode forcing Garage Door `configVersion=19`
+- mode `copy`, source `rtsp://127.0.0.1:8554/garage-door-sub`
+- Home asked `299k`, Argus log's effective floor still said `serving=2000k`
+  because copy mode does not control camera bitrate
+- Argus omitted `PrepareStreamResponse.audio`/audio RTP:
+  `argusAudioDisabled=true`, `ffmpegAudioLeg=false`, `aacEld=false`
+- FFmpeg command used H.264 passthrough:
+  `-c:v copy`
+- FFmpeg RTP URL omitted `localrtcpport`:
+  `srtp://10.0.0.41:65375?rtcpport=65375&pkt_size=564`
+- RTCP monitor receipt:
+  `RTCP monitor video packets=2 port=62087`
+- FFmpeg exit line:
+  `2026-06-23T12:44:15.188Z [argus Garage Door] ffmpeg exited code=null signal=SIGKILL`
+- visible iPhone result, reported by Peter: live video appeared pretty quickly
+
+The first copy-mode watcher ended after 1.274s because Home stopped that
+session, but Peter confirmed video rendered quickly. A second copy-mode hold
+watcher was started:
+
+`npm run watch:home:mini -- --timeout-seconds 120 --json-out /tmp/argus-iphone-live-copy-hold-20260623T1245Z.json --mirror-log /tmp/argus-iphone-live-copy-hold-20260623T1245Z.log`
+
+Result:
+
+- matched iPhone/Home controller `10.0.0.41`
+- negotiated at `2026-06-23T12:46:05.987Z`
+- watcher timed out at `2026-06-23T12:47:37.302Z` waiting for the active live
+  session to exit, which is positive: Home did not kill the copy-mode stream
+  inside the 120s watcher window
+- follow-up Mini log showed the session ended at `2026-06-23T12:48:03.245Z`,
+  for about `117s` of active FFmpeg runtime
+- RTCP monitor receipt:
+  `RTCP monitor video packets=234 port=54325`
+- visible result, reported by Peter while active: "I have had the live stream
+  going for a while now"
+- Peter later confirmed he backed out manually; Home did not end the long-hold
+  copy-mode stream on its own.
+
+Interpretation: copy mode is a valid live-render path for Garage Door. It is
+not the intended final high-resolution profile because it copies the 640x480
+substream while Home still requests the cached 1280x720 profile, but it proves
+HAP pairing, SRTP delivery, iPhone routing, RTCP, and HomeKit live plumbing are
+all viable. The remaining blocker is specifically Argus's transcoded H.264
+output shape.
+
+### Main-source transcode without exact-frame padding
+
+After copy mode proved the HomeKit path, Mini was switched to a main-source
+video-only transcode that preserved the 4:3 camera aspect ratio instead of
+padding the output into Home's cached 1280x720 frame:
+
+`ARGUS_HUB_ADDRESSES=10.0.0.15 ARGUS_LIVE_LADDER=compat ARGUS_FFMPEG=/Users/pointlabs/.local/bin/ffmpeg-homebridge ARGUS_HAP_BIND=en0 ARGUS_AUDIO=0 ARGUS_LIVE_MAIN_SOURCE=1 ARGUS_RTCP_MONITOR=1 ARGUS_LIVE_EXACT_FRAME=0 ARGUS_LIVE_OBEY_BITRATE=1 ARGUS_LIVE_CBR=1`
+
+Watcher:
+
+`npm run watch:home:mini -- --timeout-seconds 120 --json-out /tmp/argus-iphone-live-transcode-fitonly-videoonly-20260623T1250Z.json --mirror-log /tmp/argus-iphone-live-transcode-fitonly-videoonly-20260623T1250Z.log`
+
+Result:
+
+- matched iPhone/Home controller `10.0.0.41`
+- negotiated at `2026-06-23T12:52:18.907Z`
+- Mini log later showed exit at `2026-06-23T12:53:52.125Z`
+- negotiated `1280x720@30`, H.264 high level 4.0, payload type `99`
+- Home asked `299k`, Argus served exactly `299k`
+- mode `transcode`, source `rtsp://127.0.0.1:8554/garage-door`
+- FFmpeg filter omitted the 1280x720 pad:
+  `scale=854:480:force_original_aspect_ratio=decrease:force_divisible_by=2,setsar=1`
+- Argus omitted `PrepareStreamResponse.audio`/audio RTP:
+  `argusAudioDisabled=true`, `ffmpegAudioLeg=false`, `aacEld=false`
+- RTCP monitor receipt:
+  `RTCP monitor video packets=186 port=64771`
+- visible iPhone result, reported by Peter: live video rendered, but the image
+  was softer than before and the pixels appeared to pulse/focus on a regular
+  cadence
+
+Interpretation: removing exact-frame 1280x720 padding makes Argus's x264 output
+render in Home. The pulsing is likely the strict `299k` CBR cap and/or long
+keyframe cadence starving a 4:3 main-stream transcode, not the HAP/SRTP path.
+
+### Main-source fit-only transcode at LAN floor
+
+To isolate bitrate starvation from geometry, Mini was then switched to the same
+main-source fit-only video path but without `ARGUS_LIVE_OBEY_BITRATE=1` or
+`ARGUS_LIVE_CBR=1`, leaving Argus at the LAN quality floor while still omitting
+exact-frame padding:
+
+`ARGUS_HUB_ADDRESSES=10.0.0.15 ARGUS_LIVE_LADDER=compat ARGUS_FFMPEG=/Users/pointlabs/.local/bin/ffmpeg-homebridge ARGUS_HAP_BIND=en0 ARGUS_AUDIO=0 ARGUS_LIVE_MAIN_SOURCE=1 ARGUS_RTCP_MONITOR=1 ARGUS_LIVE_EXACT_FRAME=0`
+
+Watcher:
+
+`npm run watch:home:mini -- --timeout-seconds 120 --json-out /tmp/argus-iphone-live-transcode-fitonly-2000k-20260623T1300Z.json --mirror-log /tmp/argus-iphone-live-transcode-fitonly-2000k-20260623T1300Z.log`
+
+Result:
+
+- matched iPhone/Home controller `10.0.0.41`
+- negotiated at `2026-06-23T12:57:53.286Z`
+- exited at `2026-06-23T12:58:03.462Z`, session duration `10176ms`
+- negotiated `1280x720@30`, H.264 high level 4.0, payload type `99`
+- Home asked `299k`, Argus served `2000k`
+- mode `transcode`, source `rtsp://127.0.0.1:8554/garage-door`
+- FFmpeg filter again omitted exact-frame padding:
+  `scale=1280:720:force_original_aspect_ratio=decrease:force_divisible_by=2,setsar=1`
+- Argus omitted `PrepareStreamResponse.audio`/audio RTP:
+  `argusAudioDisabled=true`, `ffmpegAudioLeg=false`, `aacEld=false`
+- RTCP monitor receipt:
+  `RTCP monitor video packets=37 port=53924`
+- visible iPhone result, reported by Peter: no live stream, just spinner
+
+Home immediately retried outside the watcher capture:
+
+- negotiated at `2026-06-23T12:58:08.035Z`
+- same profile: main-source fit-only video, `1280x720@30`, asked `299k`,
+  served `2000k`, `rtcp=node-monitor:57009`, audio disabled
+- RTCP monitor receipt:
+  `RTCP monitor video packets=110 port=57009`
+- exited at `2026-06-23T12:58:38.643Z`, the normal ~30s spinner timeout
+
+This is the high-signal comparison against the previous 299k fit-only run. If
+the `299k` run rendered but pulsed while the uncapped `2000k` run spun, the
+important variable is actual output geometry: the `299k` starved path used an
+`854x480` content box and produced a roughly `640x480` 4:3 stream, while the
+uncapped path used a full `1280x720` content box and produced a roughly
+`960x720` 4:3 stream. The next test should force the previously-rendering
+content geometry while keeping the higher LAN bitrate floor.
+
+### Forced-content-resolution diagnostic
+
+Added a narrow rollback/diagnostic env:
+
+- `ARGUS_LIVE_CONTENT_RESOLUTION=WxH` forces the live transcode content scale
+  independently from bitrate, before the existing exact-frame/fit-only filter.
+- `scripts/install-launchd.sh` now passes it through to launchd.
+- New unit coverage confirms `ARGUS_LIVE_CONTENT_RESOLUTION=854x480` can
+  coexist with a `2000k` maxrate and does not force CBR.
+
+Verification:
+
+- local `npm run build`: passed
+- local `npm test -- tests/homekit.test.ts`: passed, 41 tests
+- local `npm test`: passed, 75 tests
+- Mini `npm test -- tests/homekit.test.ts`: passed, 41 tests
+- Mini `npm run build`: passed
+
+After the failed `2000k` large-frame attempt, Mini was staged for the next
+cooldown-safe test:
+
+`ARGUS_HUB_ADDRESSES=10.0.0.15 ARGUS_LIVE_LADDER=compat ARGUS_FFMPEG=/Users/pointlabs/.local/bin/ffmpeg-homebridge ARGUS_HAP_BIND=en0 ARGUS_AUDIO=0 ARGUS_LIVE_MAIN_SOURCE=1 ARGUS_RTCP_MONITOR=1 ARGUS_LIVE_EXACT_FRAME=0 ARGUS_LIVE_CONTENT_RESOLUTION=854x480`
+
+The install wrote the plist but hit the recurring `Bootstrap failed: 5:
+Input/output error`; direct `launchctl bootstrap` of
+`~/Library/LaunchAgents/dev.point-labs.argus.plist` succeeded. `launchctl
+print` confirmed active envs including `ARGUS_LIVE_CONTENT_RESOLUTION=854x480`,
+`ARGUS_LIVE_EXACT_FRAME=0`, `ARGUS_LIVE_MAIN_SOURCE=1`, `ARGUS_AUDIO=0`,
+`ARGUS_RTCP_MONITOR=1`, and `ARGUS_HAP_BIND=en0`.
+
+Cooldown note: the latest failed Home retry ended at
+`2026-06-23T12:58:38.643Z`; do not trust another iPhone/Home result before
+`2026-06-23T13:08:38Z`.
+
+After cooldown, the forced-content watcher was run:
+
+`npm run watch:home:mini -- --timeout-seconds 150 --json-out /tmp/argus-iphone-live-transcode-forced854-2000k-20260623T1309Z.json --mirror-log /tmp/argus-iphone-live-transcode-forced854-2000k-20260623T1309Z.log`
+
+First session:
+
+- matched iPhone/Home controller `10.0.0.41`
+- negotiated at `2026-06-23T13:09:57.665Z`
+- exited at `2026-06-23T13:09:58.713Z`, session duration `1048ms`
+- negotiated `1280x720@30`, H.264 high level 4.0, payload type `99`
+- Home asked `299k`, Argus served `2000k`
+- mode `transcode`, source `rtsp://127.0.0.1:8554/garage-door`
+- FFmpeg filter forced the previously-rendering content geometry without
+  exact-frame padding:
+  `scale=854:480:force_original_aspect_ratio=decrease:force_divisible_by=2,setsar=1`
+- Argus omitted `PrepareStreamResponse.audio`/audio RTP:
+  `argusAudioDisabled=true`, `ffmpegAudioLeg=false`, `aacEld=false`
+- RTCP monitor receipt:
+  `RTCP monitor video packets=2 port=61476`
+
+Home immediately retried:
+
+- negotiated at `2026-06-23T13:09:59.772Z`
+- same profile: forced `854x480` content, `serving=2000k`, main source,
+  video-only, `rtcp=node-monitor:51172`
+- visible iPhone result, reported by Peter: "it is back"
+- follow-up process check at `2026-06-23T13:12:10Z` showed the FFmpeg process
+  still active, so the second forced-content transcode held for more than two
+  minutes at that point
+- Mini log later showed the session ended at `2026-06-23T13:12:26.412Z`
+  with `RTCP monitor video packets=293 port=51172`, for about `146.6s` of
+  active runtime
+
+Peter then clicked back into Garage Door:
+
+- negotiated at `2026-06-23T13:12:30.708Z`
+- same forced `854x480` content / `2000k` / main-source / video-only profile
+- visible iPhone result, reported by Peter: live stream came up fast
+- follow-up process check at `2026-06-23T13:14:18Z` showed the new FFmpeg
+  session still active, so fast re-entry also held for at least `~108s`
+- Peter later closed the stream after it ran the full time. Mini log showed
+  exit at `2026-06-23T13:15:42.909Z` with
+  `RTCP monitor video packets=384 port=50541`, for about `192.2s` of active
+  runtime.
+
+Interpretation: forced `854x480` content at the LAN bitrate floor is the first
+stable main-source transcode profile observed on the iPhone in this attempt.
+This confirms the large actual H.264 output frame (`~960x720`) was the spinner
+trigger, while the smaller actual frame can render and hold when it is not
+starved to `299k`.
 
 ## Next steps
 
-1. Wait at least 10 minutes after the last failed Home live attempt before any
-   new Home tap. The latest failed Home live attempt ended at
-   `2026-06-22T17:19:58Z`, so the
-   next trustworthy Mac/Home verifier result should not start before
-   `2026-06-22T17:29:58Z`, and only after the macOS GUI is unlocked and Home is
-   no longer behind `loginwindow`.
-2. Get iPhone/Home evidence for the restored AAC-ELD profile while Argus is
-   hosted on the Mini. The Mac Home verifier is now useful instrumentation, but
-   today's results are not enough to declare the Home/iOS daily-driver path
-   stable.
-   Passive observer command for this:
-   `npm run watch:home:mini -- --timeout-seconds 180 --json-out /tmp/<receipt>.json`.
-   It mirrors Mini stderr automatically and ignores the Mac Home controller
-   `10.0.0.46` by default. The lower-level form remains available:
-   `npm run watch:home -- --err-log /tmp/<mini-tail>.log --ignore-controller 10.0.0.46 --timeout-seconds 180 --json-out /tmp/<receipt>.json`.
-3. The Mac-local failures now cover video-only, AAC-ELD camera audio,
+1. Capture Peter's quality report for the forced `854x480` / `2000k` run,
+   especially whether the regular pulsing/focus cadence is gone.
+2. If it renders cleanly, treat forced `854x480` content at the LAN floor as the
+   current best Garage Door video-only profile and then restore AAC-ELD audio on
+   that geometry.
+3. If it still pulses, test the same geometry with a shorter keyframe interval
+   or stricter x264 compatibility flags before restoring audio.
+4. If it starts spinning again, restore copy mode as the rollback-good live profile and
+   test stricter x264 compatibility settings at the known-rendering geometry. Do
+   not re-pair the other six cameras yet.
+5. The Mac-local failures now cover video-only, AAC-ELD camera audio,
    AAC-ELD silence at the LAN floor, AAC-ELD silence obeying Home's bitrate,
    1316-byte video RTP packets, a Mini-hosted LAN SRTP run, Mini-hosted
    preserved-720p 1000k CBR, and an attempted 640x360 advertised cap that Mac
    Home ignored by continuing to request cached 720p. Further Mac retries are
    lower value than iPhone/Home Hub evidence.
-4. Only after Garage Door passes stable high-res live should the other six
+6. Only after Garage Door passes stable high-res live should the other six
    cameras be re-paired and verified.
+
+### Forced-content profile with AAC-ELD audio
+
+Mini was switched from video-only to the same forced-content video geometry with
+AAC-ELD audio restored:
+
+`ARGUS_HUB_ADDRESSES=10.0.0.15 ARGUS_LIVE_LADDER=compat ARGUS_FFMPEG=/Users/pointlabs/.local/bin/ffmpeg-homebridge ARGUS_HAP_BIND=en0 ARGUS_LIVE_MAIN_SOURCE=1 ARGUS_RTCP_MONITOR=1 ARGUS_LIVE_EXACT_FRAME=0 ARGUS_LIVE_CONTENT_RESOLUTION=854x480 ARGUS_LIVE_AAC_ELD=1`
+
+The install wrote the plist but again hit `Bootstrap failed: 5: Input/output
+error`; direct `launchctl bootstrap` succeeded. `launchctl print` confirmed no
+`ARGUS_AUDIO=0`, plus active `ARGUS_LIVE_AAC_ELD=1`,
+`ARGUS_LIVE_CONTENT_RESOLUTION=854x480`, `ARGUS_LIVE_EXACT_FRAME=0`,
+`ARGUS_LIVE_MAIN_SOURCE=1`, and `ARGUS_HAP_BIND=en0`.
+
+Watcher:
+
+`npm run watch:home:mini -- --timeout-seconds 150 --json-out /tmp/argus-iphone-live-transcode-forced854-aaceld-20260623T1317Z.json --mirror-log /tmp/argus-iphone-live-transcode-forced854-aaceld-20260623T1317Z.log`
+
+Result:
+
+- matched iPhone/Home controller `10.0.0.41`
+- negotiated at `2026-06-23T13:17:22.743Z`
+- watcher timed out at `2026-06-23T13:19:25.787Z` waiting for the active
+  session to exit, which is positive: Home did not kill the audio-enabled stream
+  inside the 150s watcher window
+- negotiated `1280x720@30`, H.264 high level 4.0, payload type `99`
+- Home asked `299k`, Argus served `2000k`
+- mode `transcode`, source `rtsp://127.0.0.1:8554/garage-door`
+- FFmpeg filter forced the same stable content geometry:
+  `scale=854:480:force_original_aspect_ratio=decrease:force_divisible_by=2,setsar=1`
+- audio was restored and negotiated as AAC-ELD:
+  `audio: codec=AAC-eld 16kHz ptype=110 source=input`
+- FFmpeg command used `libfdk_aac -profile:a aac_eld -flags +global_header`
+- visible iPhone result, reported by Peter: video came up fast with audio
+- Peter closed the session; Mini log showed exit at
+  `2026-06-23T13:19:43.118Z` with
+  `RTCP monitor video packets=280 port=58763`, for about `140.4s` of active
+  runtime
+
+Interpretation: Garage Door live now has a stable audio-enabled Argus transcode
+profile on iPhone/Home: main source, forced `854x480` content, fit-only output,
+`2000k` cap, AAC-ELD input audio. This should be treated as the current
+rollback-good Garage Door live profile while deciding whether to turn the
+diagnostic envs into product defaults or a per-camera tuned setting.
+
+### Config-driven Garage Door tuning
+
+Converted the two previously global live-geometry knobs into per-camera config
+options so Garage Door can keep the proven profile without constraining every
+camera that will be re-paired later:
+
+- `cameras[].liveContentResolution: "854x480"` parses to
+  `{ width: 854, height: 480 }`
+- `cameras[].liveExactFrame: false` disables exact-frame padding for that camera
+- `ARGUS_LIVE_CONTENT_RESOLUTION` and `ARGUS_LIVE_EXACT_FRAME` remain global
+  env overrides for rollback/diagnostics
+- startup now logs the per-camera live mode as
+  `content=854x480, fit-only`
+
+Added tests for config parsing, per-camera FFmpeg content scale, per-camera
+fit-only output, and env override precedence.
+
+Garage Door was updated in the gitignored `argus.yaml` on both the working repo
+and Mini with:
+
+```yaml
+liveContentResolution: 854x480
+liveExactFrame: false
+```
+
+Mini was restarted without global `ARGUS_LIVE_CONTENT_RESOLUTION` or
+`ARGUS_LIVE_EXACT_FRAME` envs:
+
+`ARGUS_HUB_ADDRESSES=10.0.0.15 ARGUS_FFMPEG=/Users/pointlabs/.local/bin/ffmpeg-homebridge ARGUS_HAP_BIND=en0 ARGUS_LIVE_MAIN_SOURCE=1 ARGUS_RTCP_MONITOR=1 ARGUS_LIVE_AAC_ELD=1`
+
+Receipts:
+
+- `launchctl print` env showed no global content/exact-frame envs
+- startup log confirmed:
+  `[argus Garage Door] live mode: transcode (≥720p source: main, content=854x480, fit-only)`
+- Mini config parse confirmed Garage Door:
+  `{"liveContentResolution":{"width":854,"height":480},"liveExactFrame":false}`
+
+First config-based watcher:
+
+`npm run watch:home:mini -- --timeout-seconds 150 --json-out /tmp/argus-iphone-live-config-forced854-aaceld-20260623T1328Z.json --mirror-log /tmp/argus-iphone-live-config-forced854-aaceld-20260623T1328Z.log`
+
+Result: timed out after 150s with `partialLines: []`. No iPhone live request
+reached Argus; treat this as a no-trigger receipt, not a stream failure.
+
+Second config-based watcher:
+
+`npm run watch:home:mini -- --timeout-seconds 180 --json-out /tmp/argus-iphone-live-config-forced854-aaceld-20260623T1330Z.json --mirror-log /tmp/argus-iphone-live-config-forced854-aaceld-20260623T1330Z.log`
+
+Result:
+
+- matched iPhone/Home controller `10.0.0.41`
+- negotiated at `2026-06-23T13:31:02.185Z`
+- exited at `2026-06-23T13:32:18.207Z`, session duration `76022ms`
+- negotiated `1280x720@30`, H.264 high level 4.0, payload type `99`
+- Home asked `299k`, Argus served `2000k`
+- mode `transcode`, source `rtsp://127.0.0.1:8554/garage-door`
+- FFmpeg command confirmed config-driven fit-only content geometry:
+  `scale=854:480:force_original_aspect_ratio=decrease:force_divisible_by=2,setsar=1`
+- audio enabled and negotiated as AAC-ELD:
+  `audio: codec=AAC-eld 16kHz ptype=110 source=input`
+- FFmpeg command used `libfdk_aac -profile:a aac_eld -flags +global_header`
+- RTCP monitor receipt:
+  `RTCP monitor video packets=152 port=62731`
+- visible iPhone result, reported by Peter: pretty fast; about two or three
+  spinner revolutions, then the live feed came in
+
+Interpretation: the config-driven Garage Door profile preserves the proven
+behavior without depending on global content/exact-frame envs. Garage Door live
+view is now stable enough to stop geometry debugging and move to production
+cleanup: decide whether to keep RTCP monitor enabled or return to FFmpeg-managed
+local RTCP, then re-run a final hold on the chosen launchd profile before
+re-pairing the other six cameras.
+
+## Current Garage Door Profile
+
+Garage Door is currently running on Mini with:
+
+- gitignored camera config:
+  `liveContentResolution: 854x480`, `liveExactFrame: false`
+- launchd env:
+  `ARGUS_HUB_ADDRESSES=10.0.0.15`
+  `ARGUS_FFMPEG=/Users/pointlabs/.local/bin/ffmpeg-homebridge`
+  `ARGUS_HAP_BIND=en0`
+  `ARGUS_LIVE_MAIN_SOURCE=1`
+  `ARGUS_RTCP_MONITOR=1`
+  `ARGUS_LIVE_AAC_ELD=1`
+- no global `ARGUS_LIVE_CONTENT_RESOLUTION`
+- no global `ARGUS_LIVE_EXACT_FRAME`
+
+Verification after the per-camera config work:
+
+- local `npm run build`: passed
+- local `npm test`: passed, 81 tests
+- Mini `npm run build`: passed
+- Mini `npm test -- tests/config.test.ts tests/homekit.test.ts`: passed, 50 tests
+- Mini config parse confirmed:
+  `{"name":"Garage Door","liveContentResolution":{"width":854,"height":480},"liveExactFrame":false}`
+- startup log confirmed:
+  `[argus Garage Door] live mode: transcode (≥720p source: main, content=854x480, fit-only)`
+
+Next operational step: keep Garage Door on this profile as the rollback-good
+daily-driver live path. If no further Garage Door issues appear, the next phase
+is to re-pair the other six cameras one at a time and verify snapshot, fast live
+open, motion/HKSV clip, and Apple labels per camera.

@@ -137,8 +137,17 @@ export async function startArgusServer(config: ArgusConfig, configDir = process.
     // sub source instead.
     const standalone = config.cameras.filter((c) => c.host === camera.host).length === 1;
     const mainSourceEnabled = standalone && process.env.ARGUS_LIVE_MAIN_SOURCE === "1";
+    const liveModeDetails = videoMode === "transcode"
+      ? [
+          `≥720p source: ${mainSourceEnabled ? "main" : "sub"}`,
+          camera.liveContentResolution
+            ? `content=${camera.liveContentResolution.width}x${camera.liveContentResolution.height}`
+            : undefined,
+          camera.liveExactFrame === false ? "fit-only" : undefined,
+        ].filter(Boolean).join(", ")
+      : "";
     process.stdout.write(
-      `[argus ${camera.name}] live mode: ${videoMode}${videoMode === "transcode" ? ` (≥720p source: ${mainSourceEnabled ? "main" : "sub"})` : ""}\n`,
+      `[argus ${camera.name}] live mode: ${videoMode}${liveModeDetails ? ` (${liveModeDetails})` : ""}\n`,
     );
     const { accessory, setMotion } = createCameraAccessory(camera, liveUrl, mainUrl, cache, {
       includeAudio,
@@ -154,6 +163,8 @@ export async function startArgusServer(config: ArgusConfig, configDir = process.
       // offline validator. ARGUS_LIVE_MAIN_SOURCE=1 re-enables for tests.
       ...(mainSourceEnabled ? { mainStreamUrl: mainUrl } : {}),
       ...(liveResolution ? { liveResolution } : {}),
+      ...(camera.liveContentResolution ? { liveContentResolution: camera.liveContentResolution } : {}),
+      ...(camera.liveExactFrame !== undefined ? { liveExactFrame: camera.liveExactFrame } : {}),
     });
     setMotionByCamera.set(camera.name, setMotion);
     const username = macFromName(camera.name);
