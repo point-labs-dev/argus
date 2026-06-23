@@ -34,7 +34,7 @@ describe("buildRecordingFfmpegArgs", () => {
     const joined = buildRecordingFfmpegArgs("rtsp://x/main", recordingConfig()).join(" ");
     expect(joined).toContain("-profile:v high"); // profile 2
     expect(joined).toContain("-level 4.0"); // level 2
-    expect(joined).toContain("scale=1280:720");
+    expect(joined).toContain("scale=1280:720:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1");
     expect(joined).toContain("-b:v 2000k");
     expect(joined).toContain("-ar 32000"); // samplerate 3 = KHZ_32
     expect(joined).toContain("expr:gte(t,n_forced*4)"); // 4000ms fragment -> 4s keyframes
