@@ -7,7 +7,13 @@ import {
   ArgusStreamingDelegate,
   buildCameraControllerOptions,
   buildLiveFfmpegArgs,
+  exactLiveFrameEnabled,
   effectiveBitrateKbps,
+  keepNegotiatedLiveSize,
+  liveBitrateFloorKbps,
+  liveStartAckDelayMs,
+  liveVideoFilter,
+  liveVideoPacketSize,
   resolveSrtpTargetAddress,
   type LiveFfmpegInput,
 } from "../src/homekit.js";
@@ -73,7 +79,7 @@ describe("buildLiveFfmpegArgs", () => {
     expect(args).toContain("-i rtsp://127.0.0.1:8554/backyard-left-sub");
     expect(args).toContain("-c:v libx264");
     expect(args).toContain("-c:a libopus");
-    expect(args).toContain("scale=1280:720");
+    expect(args).toContain("scale=1280:720:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1");
     // Capped-CRF: easy scenes undershoot the cap, motion gets the full budget.
     // Hi-res sessions get the extra encoder effort and quality target.
     expect(args).toContain("-preset faster");
@@ -87,15 +93,162 @@ describe("buildLiveFfmpegArgs", () => {
     expect(args).not.toContain("intra-refresh");
   });
 
-  it("downscales starved sessions (relay-obeyed bitrates) inside the negotiated box", () => {
+  it("encodes AAC-ELD audio when the negotiated codec is aac_eld (libfdk_aac, no opus flags)", () => {
+    // HomeKit's canonical camera codec; the builder must produce exactly what
+    // was negotiated (16kHz mono from the controller's ask). homebridge-camera-
+    // ffmpeg's proven ELD args: libfdk_aac -profile:a aac_eld -flags +global_header.
+    const args = buildLiveFfmpegArgs(
+      liveInput({
+        audio: { ...liveInput().audio, audioCodec: "aac_eld", sampleRateKhz: 16 },
+      }),
+    ).join(" ");
+
+    expect(args).toContain("-c:a libfdk_aac");
+    expect(args).toContain("-profile:a aac_eld");
+    expect(args).toContain("-flags +global_header");
+    expect(args).toContain("-ar 16k");
+    expect(args).toContain("-ac 1");
+    // Opus-only options must NOT leak into the ELD command.
+    expect(args).not.toContain("libopus");
+    expect(args).not.toContain("-application lowdelay");
+    expect(args).not.toContain("-frame_duration 20");
+    // The synthetic audio clock still applies (it heals Reolink RTSP wobble
+    // regardless of codec).
+    expect(args).toContain("-af asetpts=N/SR/TB");
+  });
+
+  it("can feed HomeKit synthetic silence while keeping a real negotiated audio leg", () => {
+    const args = buildLiveFfmpegArgs(
+      liveInput({
+        audio: { ...liveInput().audio, audioCodec: "aac_eld", audioSource: "silence", sampleRateKhz: 16 },
+      }),
+    ).join(" ");
+
+    expect(args).toContain("-re -f lavfi -i anullsrc=channel_layout=mono:sample_rate=16000");
+    expect(args).toContain("-map 0:v:0");
+    expect(args).toContain("-map 1:a:0");
+    expect(args).toContain("-c:a libfdk_aac");
+    expect(args).toContain("-ar 16k");
+    expect(args).toContain("srtp://192.168.1.50:50002");
+  });
+
+  it("defaults to Opus audio when no codec is specified (back-compat)", () => {
+    const args = buildLiveFfmpegArgs(liveInput()).join(" ");
+    expect(args).toContain("-c:a libopus");
+    expect(args).not.toContain("libfdk_aac");
+  });
+
+  it("downscales starved sessions (relay-obeyed bitrates) inside the exact negotiated frame", () => {
     // A hub-relayed remote viewer negotiates 720p but obeys Apple's 132k ask —
-    // full 720p at 132k pulsates; 854x480 in the same box is merely soft.
+    // full 720p at 132k pulsates; 854x480 content in the same frame is merely soft.
     const args = buildLiveFfmpegArgs(
       liveInput({ video: { ...liveInput().video, maxBitrateKbps: 132 } }),
     ).join(" ");
 
-    expect(args).toContain("scale=854:480:force_original_aspect_ratio=decrease");
+    expect(args).toContain("scale=854:480:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1");
     expect(args).toContain("-maxrate 132k");
+  });
+
+  it("can keep the negotiated 720p box for low-bitrate acceptance diagnostics", () => {
+    process.env.ARGUS_LIVE_KEEP_NEGOTIATED_SIZE = "1";
+    try {
+      const args = buildLiveFfmpegArgs(
+        liveInput({ video: { ...liveInput().video, maxBitrateKbps: 600 } }),
+      ).join(" ");
+
+      expect(args).toContain("scale=1280:720:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1");
+      expect(args).toContain("-maxrate 600k");
+    } finally {
+      delete process.env.ARGUS_LIVE_KEEP_NEGOTIATED_SIZE;
+    }
+  });
+
+  it("can force the live content scale independently from the bitrate cap", () => {
+    process.env.ARGUS_LIVE_CONTENT_RESOLUTION = "854x480";
+    try {
+      const args = buildLiveFfmpegArgs(
+        liveInput({ video: { ...liveInput().video, maxBitrateKbps: 2000 } }),
+      ).join(" ");
+
+      expect(args).toContain("scale=854:480:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1");
+      expect(args).toContain("-maxrate 2000k");
+      expect(args).not.toContain("-b:v");
+    } finally {
+      delete process.env.ARGUS_LIVE_CONTENT_RESOLUTION;
+    }
+  });
+
+  it("accepts a per-camera live content scale when no env override is set", () => {
+    const args = buildLiveFfmpegArgs(
+      liveInput({
+        liveContentResolution: { width: 854, height: 480 },
+        video: { ...liveInput().video, maxBitrateKbps: 2000 },
+      }),
+    ).join(" ");
+
+    expect(args).toContain("scale=854:480:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1");
+    expect(args).toContain("-maxrate 2000k");
+  });
+
+  it("can disable exact-frame padding per camera", () => {
+    const args = buildLiveFfmpegArgs(
+      liveInput({
+        liveContentResolution: { width: 854, height: 480 },
+        liveExactFrame: false,
+        video: { ...liveInput().video, maxBitrateKbps: 2000 },
+      }),
+    ).join(" ");
+
+    expect(args).toContain("scale=854:480:force_original_aspect_ratio=decrease:force_divisible_by=2,setsar=1");
+    expect(args).not.toContain("pad=1280:720");
+  });
+
+  it("lets exact-frame env override per-camera config for diagnostics", () => {
+    process.env.ARGUS_LIVE_EXACT_FRAME = "1";
+    try {
+      const args = buildLiveFfmpegArgs(
+        liveInput({
+          liveContentResolution: { width: 854, height: 480 },
+          liveExactFrame: false,
+          video: { ...liveInput().video, maxBitrateKbps: 2000 },
+        }),
+      ).join(" ");
+
+      expect(args).toContain("scale=854:480:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1");
+    } finally {
+      delete process.env.ARGUS_LIVE_EXACT_FRAME;
+    }
+  });
+
+  it("lets the live content env override per-camera config for diagnostics", () => {
+    process.env.ARGUS_LIVE_CONTENT_RESOLUTION = "640x360";
+    try {
+      const args = buildLiveFfmpegArgs(
+        liveInput({
+          liveContentResolution: { width: 854, height: 480 },
+          video: { ...liveInput().video, maxBitrateKbps: 2000 },
+        }),
+      ).join(" ");
+
+      expect(args).toContain("scale=640:360:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1");
+    } finally {
+      delete process.env.ARGUS_LIVE_CONTENT_RESOLUTION;
+    }
+  });
+
+  it("can add a CBR video target for HomeKit stream-shape diagnostics", () => {
+    process.env.ARGUS_LIVE_CBR = "1";
+    try {
+      const args = buildLiveFfmpegArgs(
+        liveInput({ video: { ...liveInput().video, maxBitrateKbps: 1000 } }),
+      ).join(" ");
+
+      expect(args).toContain("-b:v 1000k");
+      expect(args).toContain("-maxrate 1000k");
+      expect(args).toContain("-bufsize 1000k");
+    } finally {
+      delete process.env.ARGUS_LIVE_CBR;
+    }
   });
 
   it("enables the intra-refresh experiment with ARGUS_LIVE_INTRA=1", () => {
@@ -168,6 +321,19 @@ describe("buildLiveFfmpegArgs", () => {
     expect(joined).toContain("-ssrc 1");
     expect(joined).toContain("-ssrc 2");
   });
+
+  it("can leave RTCP return ports to a Node monitor instead of FFmpeg localrtcpport", () => {
+    const args = buildLiveFfmpegArgs(
+      liveInput({
+        video: { ...liveInput().video, localRtcpPort: undefined },
+        audio: { ...liveInput().audio, localRtcpPort: undefined },
+      }),
+    ).join(" ");
+
+    expect(args).toContain("srtp://192.168.1.50:50000?rtcpport=50000&pkt_size=564");
+    expect(args).toContain("srtp://192.168.1.50:50002?rtcpport=50002&pkt_size=188");
+    expect(args).not.toContain("localrtcpport");
+  });
 });
 
 describe("effectiveBitrateKbps", () => {
@@ -183,6 +349,80 @@ describe("effectiveBitrateKbps", () => {
 
   it("honors the negotiated bitrate when it exceeds the floor", () => {
     expect(effectiveBitrateKbps(1280, 720, 4500)).toBe(4500);
+  });
+
+  it("supports env-gated bitrate floors for measured acceptance diagnostics", () => {
+    const env = {
+      ARGUS_LIVE_1080P_BITRATE_KBPS: "2500",
+      ARGUS_LIVE_720P_BITRATE_KBPS: "1000",
+      ARGUS_LIVE_360P_BITRATE_KBPS: "500",
+      ARGUS_LIVE_LOW_BITRATE_KBPS: "200",
+    };
+
+    expect(liveBitrateFloorKbps(1920, 1080, env)).toBe(2500);
+    expect(liveBitrateFloorKbps(1280, 720, env)).toBe(1000);
+    expect(liveBitrateFloorKbps(640, 360, env)).toBe(500);
+    expect(liveBitrateFloorKbps(320, 240, env)).toBe(200);
+    expect(effectiveBitrateKbps(1280, 720, 299, env)).toBe(1000);
+  });
+
+  it("ignores invalid env-gated bitrate floors", () => {
+    expect(liveBitrateFloorKbps(1280, 720, { ARGUS_LIVE_720P_BITRATE_KBPS: "0" })).toBe(2000);
+    expect(liveBitrateFloorKbps(1280, 720, { ARGUS_LIVE_720P_BITRATE_KBPS: "bad" })).toBe(2000);
+  });
+});
+
+describe("keepNegotiatedLiveSize", () => {
+  it("defaults off and only enables on explicit 1", () => {
+    expect(keepNegotiatedLiveSize(undefined)).toBe(false);
+    expect(keepNegotiatedLiveSize("0")).toBe(false);
+    expect(keepNegotiatedLiveSize("1")).toBe(true);
+  });
+});
+
+describe("liveVideoFilter", () => {
+  it("pads aspect-preserved content to the exact negotiated HomeKit frame by default", () => {
+    expect(liveVideoFilter(1280, 720, 1280, 720, true)).toBe(
+      "scale=1280:720:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1",
+    );
+    expect(liveVideoFilter(854, 480, 1280, 720, true)).toBe(
+      "scale=854:480:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1",
+    );
+  });
+
+  it("can restore the old fit-within-only filter for rollback diagnostics", () => {
+    expect(exactLiveFrameEnabled(undefined)).toBe(true);
+    expect(exactLiveFrameEnabled("1")).toBe(true);
+    expect(exactLiveFrameEnabled("0")).toBe(false);
+    expect(liveVideoFilter(1280, 720, 1280, 720, false)).toBe(
+      "scale=1280:720:force_original_aspect_ratio=decrease:force_divisible_by=2,setsar=1",
+    );
+  });
+});
+
+describe("liveStartAckDelayMs", () => {
+  it("defaults to the existing 500ms START acknowledgement delay", () => {
+    expect(liveStartAckDelayMs(undefined)).toBe(500);
+    expect(liveStartAckDelayMs("not-a-number")).toBe(500);
+    expect(liveStartAckDelayMs("-1")).toBe(500);
+  });
+
+  it("accepts zero or positive diagnostic delays", () => {
+    expect(liveStartAckDelayMs("0")).toBe(0);
+    expect(liveStartAckDelayMs("1500")).toBe(1500);
+  });
+});
+
+describe("liveVideoPacketSize", () => {
+  it("preserves the current hi-res small-packet default", () => {
+    expect(liveVideoPacketSize(1378, true, undefined)).toBe(564);
+    expect(liveVideoPacketSize(1378, false, undefined)).toBe(1378);
+  });
+
+  it("accepts a diagnostic packet-size override capped by the negotiated MTU", () => {
+    expect(liveVideoPacketSize(1378, true, "1316")).toBe(1316);
+    expect(liveVideoPacketSize(1200, true, "1316")).toBe(1200);
+    expect(liveVideoPacketSize(1378, true, "bad")).toBe(564);
   });
 });
 
@@ -201,6 +441,10 @@ describe("resolveSrtpTargetAddress", () => {
   it("leaves external controller addresses untouched", () => {
     expect(resolveSrtpTargetAddress("10.0.0.15", fakeInterfaces)).toBe("10.0.0.15");
   });
+
+  it("can leave a local controller address untouched for diagnostics", () => {
+    expect(resolveSrtpTargetAddress("10.0.0.46", fakeInterfaces, false)).toBe("10.0.0.46");
+  });
 });
 
 describe("buildCameraControllerOptions", () => {
@@ -213,6 +457,25 @@ describe("buildCameraControllerOptions", () => {
     const resolutions = opts.streamingOptions.video.resolutions.map((r) => `${r[0]}x${r[1]}`);
     expect(resolutions).toContain("1280x720");
     expect(opts.streamingOptions.audio?.codecs?.[0]?.type).toBe("OPUS");
+  });
+
+  it("advertises AAC-ELD at 16kHz with ARGUS_LIVE_AAC_ELD=1 (Apple's canonical codec)", () => {
+    const delegate = new ArgusStreamingDelegate("Backyard Left", "rtsp://x", cacheWith(Buffer.from([0xff, 0xd8])));
+    process.env.ARGUS_LIVE_AAC_ELD = "1";
+    try {
+      const opts = buildCameraControllerOptions(delegate);
+      expect(opts.streamingOptions.audio?.codecs?.[0]?.type).toBe("AAC-eld");
+      expect(opts.streamingOptions.audio?.codecs?.[0]?.samplerate).toBe(16); // KHZ_16
+    } finally {
+      delete process.env.ARGUS_LIVE_AAC_ELD;
+    }
+  });
+
+  it("omits the advertised audio service when includeAudio is false", () => {
+    const delegate = new ArgusStreamingDelegate("Backyard Left", "rtsp://x", cacheWith(Buffer.from([0xff, 0xd8])));
+    const opts = buildCameraControllerOptions(delegate, false);
+
+    expect(opts.streamingOptions.audio).toBeUndefined();
   });
 
   it("advertises ONLY the native resolution in copy mode (mismatch kills the session)", () => {
@@ -247,6 +510,23 @@ describe("buildCameraControllerOptions", () => {
       expect(resolutions).toContain("320x240");
     } finally {
       delete process.env.ARGUS_LIVE_LADDER;
+    }
+  });
+
+  it("can cap advertised live resolutions for stable fallback verification", () => {
+    const delegate = new ArgusStreamingDelegate("Backyard Right", "rtsp://x", cacheWith(Buffer.from([0xff, 0xd8])));
+    process.env.ARGUS_LIVE_LADDER = "compat";
+    process.env.ARGUS_LIVE_MAX_RESOLUTION = "640x360";
+    try {
+      const opts = buildCameraControllerOptions(delegate, true, undefined, undefined, "transcode");
+      expect(opts.streamingOptions.video.resolutions.map((r) => `${r[0]}x${r[1]}`)).toEqual([
+        "640x360",
+        "480x270",
+        "320x240",
+      ]);
+    } finally {
+      delete process.env.ARGUS_LIVE_LADDER;
+      delete process.env.ARGUS_LIVE_MAX_RESOLUTION;
     }
   });
 });
@@ -309,6 +589,92 @@ describe("ArgusStreamingDelegate", () => {
     // generated one), or the device can't decrypt — the forever-spinner bug.
     const expectedVideoSrtp = Buffer.concat([Buffer.alloc(16, 1), Buffer.alloc(14, 2)]).toString("base64");
     expect(args.join(" ")).toContain(`-srtp_out_params ${expectedVideoSrtp}`);
+  });
+
+  it("omits the PrepareStream audio response and ffmpeg audio leg when includeAudio is false", async () => {
+    const fakeProc = Object.assign(new EventEmitter(), { kill: vi.fn() });
+    const spawnFn = vi.fn(() => fakeProc) as unknown as typeof import("node:child_process").spawn;
+    const delegate = new ArgusStreamingDelegate(
+      "Backyard Left",
+      "rtsp://127.0.0.1:8554/backyard-left-sub",
+      cacheWith(Buffer.from([0xff, 0xd8])),
+      { includeAudio: false, spawnFn },
+    );
+
+    const prepareResponse = await new Promise<unknown>((resolve, reject) => {
+      delegate.prepareStream(
+        { sessionID: "s1", targetAddress: "192.168.1.50",
+          video: { port: 50000, srtp_key: Buffer.alloc(16, 1), srtp_salt: Buffer.alloc(14, 2) },
+          audio: { port: 50002, srtp_key: Buffer.alloc(16, 3), srtp_salt: Buffer.alloc(14, 4) } } as never,
+        (error, response) => (error ? reject(error) : resolve(response)),
+      );
+    }) as { audio?: unknown };
+
+    expect(prepareResponse.audio).toBeUndefined();
+
+    await new Promise<void>((resolve, reject) => {
+      delegate.handleStreamRequest(
+        { type: "start", sessionID: "s1",
+          video: { pt: 99, max_bit_rate: 299, fps: 30, width: 1280, height: 720, mtu: 1378, profile: 2, level: 2 },
+          audio: { pt: 110, sample_rate: 24, max_bit_rate: 24, codec: 3 } } as never,
+        (error) => (error ? reject(error) : resolve()),
+      );
+    });
+
+    expect(spawnFn).toHaveBeenCalledOnce();
+    const args = (spawnFn as unknown as { mock: { calls: [string, string[]][] } }).mock.calls[0]![1].join(" ");
+    expect(args).toContain("srtp://192.168.1.50:50000");
+    expect(args).not.toContain("-c:a");
+    expect(args).not.toContain("srtp://192.168.1.50:50002");
+  });
+
+  it("can hold the advertised video RTCP return port in Node for stream-acceptance diagnostics", async () => {
+    const fakeProc = Object.assign(new EventEmitter(), { kill: vi.fn() });
+    const spawnFn = vi.fn(() => fakeProc) as unknown as typeof import("node:child_process").spawn;
+    const delegate = new ArgusStreamingDelegate(
+      "Backyard Left",
+      "rtsp://127.0.0.1:8554/backyard-left-sub",
+      cacheWith(Buffer.from([0xff, 0xd8])),
+      { spawnFn },
+    );
+
+    process.env.ARGUS_RTCP_MONITOR = "1";
+    try {
+      const prepareResponse = await new Promise<unknown>((resolve, reject) => {
+        delegate.prepareStream(
+          { sessionID: "rtcp1", targetAddress: "192.168.1.50",
+            video: { port: 50000, srtp_key: Buffer.alloc(16, 1), srtp_salt: Buffer.alloc(14, 2) },
+            audio: { port: 50002, srtp_key: Buffer.alloc(16, 3), srtp_salt: Buffer.alloc(14, 4) } } as never,
+          (error, response) => (error ? reject(error) : resolve(response)),
+        );
+      }) as { video: { port: number }; audio?: { port: number } };
+
+      expect(prepareResponse.video.port).toBeGreaterThan(0);
+      expect(prepareResponse.audio?.port).toBeGreaterThan(0);
+
+      await new Promise<void>((resolve, reject) => {
+        delegate.handleStreamRequest(
+          { type: "start", sessionID: "rtcp1",
+            video: { pt: 99, max_bit_rate: 299, fps: 30, width: 1280, height: 720, mtu: 1378, profile: 2, level: 2 },
+            audio: { pt: 110, sample_rate: 24, max_bit_rate: 24, codec: 3 } } as never,
+          (error) => (error ? reject(error) : resolve()),
+        );
+      });
+
+      const args = (spawnFn as unknown as { mock: { calls: [string, string[]][] } }).mock.calls[0]![1].join(" ");
+      expect(args).toContain("srtp://192.168.1.50:50000?rtcpport=50000&pkt_size=564");
+      expect(args).toContain("srtp://192.168.1.50:50002?rtcpport=50002&pkt_size=188");
+      expect(args).not.toContain("localrtcpport");
+
+      await new Promise<void>((resolve, reject) => {
+        delegate.handleStreamRequest(
+          { type: "stop", sessionID: "rtcp1" } as never,
+          (error) => (error ? reject(error) : resolve()),
+        );
+      });
+    } finally {
+      delete process.env.ARGUS_RTCP_MONITOR;
+    }
   });
 
   it("respawns the encoder at the upgraded resolution on RECONFIGURE", async () => {

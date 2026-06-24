@@ -28,6 +28,33 @@ export interface ArgusServer {
   stop(): Promise<void>;
 }
 
+function shouldForceHomeKitConfigBump(cameraName: string): boolean {
+  const raw = process.env.ARGUS_HAP_CONFIG_BUMP?.trim();
+  if (!raw) return false;
+  if (raw === "1" || raw.toLowerCase() === "all") return true;
+  return raw.split(",").map((s) => s.trim()).filter(Boolean).includes(cameraName);
+}
+
+function forceHomeKitConfigBump(accessory: unknown, cameraName: string): void {
+  if (!shouldForceHomeKitConfigBump(cameraName)) return;
+
+  const internal = accessory as {
+    _accessoryInfo?: { configVersion: number; ensureConfigVersionBounds?: () => void; save?: () => void };
+    _advertiser?: { updateAdvertisement?: () => void };
+  };
+  const info = internal._accessoryInfo;
+  if (!info) {
+    process.stderr.write(`[argus ${cameraName}] unable to force HomeKit config bump: accessory info unavailable\n`);
+    return;
+  }
+
+  info.configVersion += 1;
+  info.ensureConfigVersionBounds?.();
+  info.save?.();
+  internal._advertiser?.updateAdvertisement?.();
+  process.stdout.write(`[argus ${cameraName}] forced HomeKit configVersion=${info.configVersion}\n`);
+}
+
 export async function startArgusServer(config: ArgusConfig, configDir = process.cwd()): Promise<ArgusServer> {
   HAPStorage.setCustomStoragePath(path.join(configDir, ".homekit"));
 
@@ -77,6 +104,19 @@ export async function startArgusServer(config: ArgusConfig, configDir = process.
   );
 
   const streamNames = buildGo2RtcStreamNames(config.cameras);
+  // ARGUS_HAP_BIND restricts HAP/mDNS advertisement to specific interface(s) or
+  // IP(s) (comma-separated; HAP-NodeJS accepts interface names like "en0"). When
+  // unset, HAP binds ALL interfaces — which on a multi-homed host advertises the
+  // accessory on dead/secondary interfaces too (e.g. a 169.254 link-local from a
+  // failed-DHCP adapter), so the hub flaps trying the unreachable address. Pin to
+  // the real LAN interface (e.g. en0) to stop that. See progress/attempt-009.md.
+  const hapBindRaw = process.env.ARGUS_HAP_BIND?.trim();
+  const hapBind = hapBindRaw
+    ? hapBindRaw.split(",").map((s) => s.trim()).filter(Boolean)
+    : undefined;
+  if (hapBind) {
+    process.stdout.write(`[argus] HAP/mDNS bind restricted to: ${hapBind.join(", ")}\n`);
+  }
   const setMotionByCamera = new Map<string, (detected: boolean) => void>();
   const published = config.cameras.map((camera, index) => {
     const names = streamNames[index]!;
@@ -85,19 +125,29 @@ export async function startArgusServer(config: ArgusConfig, configDir = process.
     // ARGUS_AUDIO=0 publishes video-only accessories (diagnostic isolation).
     const includeAudio = process.env.ARGUS_AUDIO !== "0";
     const liveResolution = liveResolutions.get(camera.name);
-    // Transcode is the validated live path: tiles/<720p transcode the sub stream,
-    // ≥720p sessions (Apple's standard ladder, advertised up to 1080p) transcode
-    // the full-res main. ARGUS_LIVE_COPY=1 opts into the experimental passthrough
-    // (needs the probed resolution; macOS Home kills mismatched copy sessions).
+    // Transcode is the validated live path. ARGUS_LIVE_COPY=1 opts into the
+    // experimental passthrough (needs the probed resolution; macOS Home kills
+    // mismatched copy sessions).
     const videoMode =
       process.env.ARGUS_LIVE_COPY === "1" && liveResolution ? "copy" : "transcode";
-    // Standalone cameras (their own host) source ≥720p live from the main stream.
-    // NVR-fronted channels don't: their mains keyframe every 4s (hard limit) and
-    // the D1200s encode 12MP HEVC — both blow the live start-time budget. Their
-    // ≥720p sessions upscale the 896-wide sub source instead.
+    // Main-source live is parked by default. When enabled, standalone cameras
+    // can source ≥720p live from the main stream. NVR-fronted channels don't:
+    // their mains keyframe every 4s (hard limit) and the D1200s encode 12MP HEVC
+    // — both blow the live start-time budget. Their ≥720p sessions upscale the
+    // sub source instead.
     const standalone = config.cameras.filter((c) => c.host === camera.host).length === 1;
+    const mainSourceEnabled = standalone && process.env.ARGUS_LIVE_MAIN_SOURCE === "1";
+    const liveModeDetails = videoMode === "transcode"
+      ? [
+          `≥720p source: ${mainSourceEnabled ? "main" : "sub"}`,
+          camera.liveContentResolution
+            ? `content=${camera.liveContentResolution.width}x${camera.liveContentResolution.height}`
+            : undefined,
+          camera.liveExactFrame === false ? "fit-only" : undefined,
+        ].filter(Boolean).join(", ")
+      : "";
     process.stdout.write(
-      `[argus ${camera.name}] live mode: ${videoMode}${videoMode === "transcode" ? ` (≥720p source: ${standalone ? "main" : "sub"})` : ""}\n`,
+      `[argus ${camera.name}] live mode: ${videoMode}${liveModeDetails ? ` (${liveModeDetails})` : ""}\n`,
     );
     const { accessory, setMotion } = createCameraAccessory(camera, liveUrl, mainUrl, cache, {
       includeAudio,
@@ -111,14 +161,23 @@ export async function startArgusServer(config: ArgusConfig, configDir = process.
       // keyframes/audio filters (see progress/attempt-007). Re-grant per
       // camera once the main restream's A/V timing is proven by the
       // offline validator. ARGUS_LIVE_MAIN_SOURCE=1 re-enables for tests.
-      ...(standalone && process.env.ARGUS_LIVE_MAIN_SOURCE === "1" ? { mainStreamUrl: mainUrl } : {}),
+      ...(mainSourceEnabled ? { mainStreamUrl: mainUrl } : {}),
       ...(liveResolution ? { liveResolution } : {}),
+      ...(camera.liveContentResolution ? { liveContentResolution: camera.liveContentResolution } : {}),
+      ...(camera.liveExactFrame !== undefined ? { liveExactFrame: camera.liveExactFrame } : {}),
     });
     setMotionByCamera.set(camera.name, setMotion);
     const username = macFromName(camera.name);
     const port = HOMEKIT_PORT_BASE + index;
 
-    accessory.publish({ username, pincode: config.homekit.pin, port, category: Categories.IP_CAMERA });
+    accessory.publish({
+      username,
+      pincode: config.homekit.pin,
+      port,
+      category: Categories.IP_CAMERA,
+      ...(hapBind ? { bind: hapBind } : {}),
+    });
+    forceHomeKitConfigBump(accessory, camera.name);
 
     process.stdout.write(
       `\n  📷 ${camera.name}\n     pair code: ${config.homekit.pin}\n     setup URI: ${accessory.setupURI()}\n     (port ${port}, id ${username})\n`,

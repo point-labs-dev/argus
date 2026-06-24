@@ -1,6 +1,6 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { createSocket } from "node:dgram";
+import { createSocket, type Socket } from "node:dgram";
 import { networkInterfaces } from "node:os";
 
 import {
@@ -73,9 +73,13 @@ export interface LiveFfmpegInput {
    * Enable via ARGUS_LIVE_COPY=1 to test against other clients (iPhone).
    */
   videoMode: "copy" | "transcode";
+  /** Optional per-camera content box for aspect-preserved transcodes. Env override still wins. */
+  liveContentResolution?: { width: number; height: number };
+  /** Whether to pad to Home's negotiated frame. Env override still wins. */
+  liveExactFrame?: boolean;
   video: {
     port: number;
-    localRtcpPort: number;
+    localRtcpPort?: number;
     ssrc: number;
     payloadType: number;
     maxBitrateKbps: number;
@@ -91,12 +95,27 @@ export interface LiveFfmpegInput {
   };
   audio: {
     port: number;
-    localRtcpPort: number;
+    localRtcpPort?: number;
     ssrc: number;
     payloadType: number;
     sampleRateKhz: number;
     maxBitrateKbps: number;
     srtpParams: string;
+    /**
+     * HomeKit audio codec to encode. "opus" (default) is what Argus has always
+     * shipped; "aac_eld" is Apple's canonical camera codec (HomeKit negotiates
+     * AAC-ELD at 16kHz mono). Set from the NEGOTIATED codec at the call site, so
+     * the builder always produces exactly what the controller asked for. AAC-ELD
+     * requires a libfdk_aac-enabled ffmpeg (Homebrew's default build lacks it) —
+     * see ARGUS_FFMPEG and progress/attempt-008.md.
+     */
+    audioCodec?: "opus" | "aac_eld";
+    /**
+     * Audio samples to feed HomeKit. "input" uses the camera/restream audio.
+     * "silence" keeps a real, steady audio RTP leg while removing camera audio
+     * timing/stall risk from the live-start path.
+     */
+    audioSource?: "input" | "silence";
   };
 }
 
@@ -108,17 +127,112 @@ export interface LiveFfmpegInput {
  * matter of course. Floors are conventional IP-camera rates per tier; the ask
  * is still honored when it EXCEEDS the floor.
  */
-export function effectiveBitrateKbps(width: number, height: number, negotiatedKbps: number): number {
+function positiveInt(value: string | undefined): number | undefined {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : undefined;
+}
+
+export function liveBitrateFloorKbps(
+  width: number,
+  height: number,
+  env: NodeJS.ProcessEnv = process.env,
+): number {
   const pixels = width * height;
   // 2000k@720p / 3000k@1080p are the community-proven LAN rates (Scrypted
   // defaults): 3500k+ with 2x VBV burst headroom hung real iPhone sessions on
   // WiFi (2026-06-12: tiles at 600k always rendered, 720p at 3500k hung on
   // most attempts — delivery, not negotiation; the sender was healthy).
-  const floor =
-    pixels >= 1920 * 1080 ? 3000 :
-    pixels >= 1280 * 720 ? 2000 :
-    pixels >= 640 * 360 ? 600 : 300;
+  if (pixels >= 1920 * 1080) return positiveInt(env.ARGUS_LIVE_1080P_BITRATE_KBPS) ?? 3000;
+  if (pixels >= 1280 * 720) return positiveInt(env.ARGUS_LIVE_720P_BITRATE_KBPS) ?? 2000;
+  if (pixels >= 640 * 360) return positiveInt(env.ARGUS_LIVE_360P_BITRATE_KBPS) ?? 600;
+  return positiveInt(env.ARGUS_LIVE_LOW_BITRATE_KBPS) ?? 300;
+}
+
+export function effectiveBitrateKbps(
+  width: number,
+  height: number,
+  negotiatedKbps: number,
+  env: NodeJS.ProcessEnv = process.env,
+): number {
+  const floor = liveBitrateFloorKbps(width, height, env);
   return Math.max(negotiatedKbps, floor);
+}
+
+export function keepNegotiatedLiveSize(value = process.env.ARGUS_LIVE_KEEP_NEGOTIATED_SIZE): boolean {
+  return value === "1";
+}
+
+function parseResolution(value: string | undefined): { width: number; height: number } | undefined {
+  const match = value?.trim().match(/^(\d+)x(\d+)$/i);
+  if (!match) return undefined;
+  const width = Number(match[1]);
+  const height = Number(match[2]);
+  return width > 0 && height > 0 ? { width, height } : undefined;
+}
+
+function parseMaxLiveResolution(value = process.env.ARGUS_LIVE_MAX_RESOLUTION): { width: number; height: number } | undefined {
+  return parseResolution(value);
+}
+
+function forcedLiveContentResolution(value = process.env.ARGUS_LIVE_CONTENT_RESOLUTION): { width: number; height: number } | undefined {
+  return parseResolution(value);
+}
+
+function capResolutions(resolutions: [number, number, number][]): [number, number, number][] {
+  const cap = parseMaxLiveResolution();
+  if (!cap) return resolutions;
+  const capped = resolutions.filter(([width, height]) => width <= cap.width && height <= cap.height);
+  return capped.length > 0 ? capped : resolutions;
+}
+
+export function liveStartAckDelayMs(value = process.env.ARGUS_START_ACK_DELAY_MS): number {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 500;
+}
+
+export function liveVideoPacketSize(
+  mtu: number,
+  hiResSession: boolean,
+  value = process.env.ARGUS_LIVE_PACKET_SIZE,
+): number {
+  const parsed = Number(value);
+  if (Number.isFinite(parsed) && parsed > 0) {
+    return Math.min(Math.floor(parsed), mtu);
+  }
+  return hiResSession ? Math.min(564, mtu) : mtu;
+}
+
+export function exactLiveFrameEnabled(value = process.env.ARGUS_LIVE_EXACT_FRAME): boolean {
+  return value !== "0";
+}
+
+function exactLiveFrameFor(inputExactFrame: boolean | undefined): boolean {
+  return process.env.ARGUS_LIVE_EXACT_FRAME !== undefined
+    ? exactLiveFrameEnabled(process.env.ARGUS_LIVE_EXACT_FRAME)
+    : inputExactFrame ?? true;
+}
+
+export function liveVideoFilter(
+  contentWidth: number,
+  contentHeight: number,
+  frameWidth: number,
+  frameHeight: number,
+  exactFrame = exactLiveFrameEnabled(),
+): string {
+  const scale = `scale=${contentWidth}:${contentHeight}:force_original_aspect_ratio=decrease:force_divisible_by=2`;
+  if (!exactFrame) {
+    return `${scale},setsar=1`;
+  }
+  return `${scale},pad=${frameWidth}:${frameHeight}:(ow-iw)/2:(oh-ih)/2,setsar=1`;
+}
+
+function rtpUrl(targetAddress: string, port: number, remoteRtcpPort: number, localRtcpPort: number | undefined, packetSize: number): string {
+  const params = [`rtcpport=${remoteRtcpPort}`];
+  if (localRtcpPort !== undefined) {
+    params.push(`localrtcpport=${localRtcpPort}`);
+  }
+  params.push(`pkt_size=${packetSize}`);
+  return `srtp://${targetAddress}:${port}?${params.join("&")}`;
 }
 
 /**
@@ -129,6 +243,7 @@ export function buildLiveFfmpegArgs(input: LiveFfmpegInput, includeAudio = true)
   const { inputUrl, targetAddress, videoMode, video, audio } = input;
 
   const hiResSession = video.width >= 1280 || video.height >= 720;
+  const silentAudio = includeAudio && audio.audioSource === "silence";
 
   // Keyframe strategy: periodic IDRs (1s tiles / 2s hi-res). Intra-refresh
   // was tried 2026-06-12 (flat bitrate — no keyframe burst pulse, no trampled
@@ -150,13 +265,17 @@ export function buildLiveFfmpegArgs(input: LiveFfmpegInput, includeAudio = true)
       ];
 
   // Starved sessions (hub-relayed remote viewers obeying Apple's 132-300k
-  // asks) get fewer pixels per bit: encoding a full 1280x720 at 132k is
-  // pulsating mush, 854x480 in the same negotiated box is merely soft.
-  // Controllers accept smaller-than-negotiated dimensions (the fit-within
-  // scale below already relies on that).
-  const starved = hiResSession && video.maxBitrateKbps < 800;
-  const boxWidth = starved ? Math.min(854, video.width) : video.width;
-  const boxHeight = starved ? Math.min(480, video.height) : video.height;
+  // asks) get fewer content pixels per bit: encoding a full 1280x720 at 132k is
+  // pulsating mush, 854x480 content padded back into the negotiated frame is
+  // merely soft while preserving the exact HomeKit stream dimensions.
+  const forcedContent = videoMode === "transcode"
+    ? (forcedLiveContentResolution() ?? input.liveContentResolution)
+    : undefined;
+  const starved = hiResSession && video.maxBitrateKbps < 800 && !keepNegotiatedLiveSize();
+  const contentWidth = forcedContent?.width ?? (starved ? Math.min(854, video.width) : video.width);
+  const contentHeight = forcedContent?.height ?? (starved ? Math.min(480, video.height) : video.height);
+  const exactFrame = exactLiveFrameFor(input.liveExactFrame);
+  const cbrVideo = process.env.ARGUS_LIVE_CBR === "1";
 
   // Everything transcoded goes through libx264 capped-CRF: constant visual
   // quality up to the bitrate cap, easy scenes undershoot, motion gets the
@@ -169,7 +288,10 @@ export function buildLiveFfmpegArgs(input: LiveFfmpegInput, includeAudio = true)
   // - Fit within the negotiated box, preserving aspect (homebridge-camera-ffmpeg
   //   pattern). A plain WxH scale would stretch the 4:3 sources (RLC-520A main is
   //   2560x1920) into the 16:9 sizes Apple negotiates. Never exceeds the
-  //   negotiated dimensions — oversize is what controllers kill sessions over.
+  //   negotiated dimensions, then pad to the exact negotiated frame. This keeps
+  //   the H.264 SPS/output dimensions aligned with what Home asked for while
+  //   avoiding distortion. ARGUS_LIVE_EXACT_FRAME=0 restores the older
+  //   fit-within-only behavior for rollback diagnostics.
   // - HomeKit needs periodic IDRs and no B-frames, or the iOS client waits
   //   forever for a decodable keyframe (the "spinner that never resolves" symptom).
   const videoCodecArgs =
@@ -187,10 +309,11 @@ export function buildLiveFfmpegArgs(input: LiveFfmpegInput, includeAudio = true)
           "-pix_fmt", "yuv420p",
           "-color_range", "tv",
           "-r", String(video.fps),
-          "-vf", `scale=${boxWidth}:${boxHeight}:force_original_aspect_ratio=decrease:force_divisible_by=2`,
+          "-vf", liveVideoFilter(contentWidth, contentHeight, video.width, video.height, exactFrame),
           "-bf", "0",
           ...keyframeArgs,
           "-crf", hiResSession ? "18" : "20",
+          ...(cbrVideo ? ["-b:v", `${video.maxBitrateKbps}k`] : []),
           "-maxrate", `${video.maxBitrateKbps}k`,
           // 1x VBV: momentary bursts toward 2x maxrate were part of what WiFi
           // delivery choked on; a tight buffer keeps the wire rate honest.
@@ -221,9 +344,13 @@ export function buildLiveFfmpegArgs(input: LiveFfmpegInput, includeAudio = true)
     // never exhausts.
     "-rtsp_transport", "tcp",
     "-i", inputUrl,
+    ...(silentAudio
+      ? ["-re", "-f", "lavfi", "-i", `anullsrc=channel_layout=mono:sample_rate=${audio.sampleRateKhz}000`]
+      : []),
 
     // --- video: SRTP out ---
     "-an",
+    ...(silentAudio ? ["-map", "0:v:0"] : []),
     ...videoCodecArgs,
     "-payload_type", String(video.payloadType),
     "-ssrc", String(video.ssrc),
@@ -235,20 +362,39 @@ export function buildLiveFfmpegArgs(input: LiveFfmpegInput, includeAudio = true)
     // (relay + tile sessions rendered; payload decode-validated locally) —
     // smaller datagrams lose less per WiFi drop and aggregate better. The
     // documented mitigation rung from the goal prompt's WiFi ladder.
-    `srtp://${targetAddress}:${video.port}?rtcpport=${video.port}&localrtcpport=${video.localRtcpPort}&pkt_size=${hiResSession ? Math.min(564, video.mtu) : video.mtu}`,
+    rtpUrl(
+      targetAddress,
+      video.port,
+      video.port,
+      video.localRtcpPort,
+      liveVideoPacketSize(video.mtu, hiResSession),
+    ),
   ];
 
   if (!includeAudio) {
     return videoArgs;
   }
 
+  // Audio codec: Opus (Argus's long-time default) or AAC-ELD. AAC-ELD is
+  // Apple's canonical HomeKit camera codec; the research sweep (2026-06-19,
+  // progress/attempt-008.md) found the "audio gates ≥720p video" hang is an
+  // iOS-wide behavior tied to non-standard audio, and that go2rtc/Scrypted/
+  // homebridge all feed HomeKit AAC-ELD rather than Opus. AAC-ELD needs a
+  // libfdk_aac-enabled ffmpeg (Homebrew's default build has neither libfdk_aac
+  // nor an ELD-capable aac_at) — point ARGUS_FFMPEG at one (e.g.
+  // ffmpeg-for-homebridge). homebridge-camera-ffmpeg's proven ELD args are
+  // `libfdk_aac -profile:a aac_eld -flags +global_header`.
+  const audioCodecArgs =
+    audio.audioCodec === "aac_eld"
+      ? ["-c:a", "libfdk_aac", "-profile:a", "aac_eld", "-flags", "+global_header"]
+      : ["-c:a", "libopus", "-application", "lowdelay", "-frame_duration", "20"];
+
   return [
     ...videoArgs,
-    // --- audio: transcode to Opus, SRTP out ---
+    // --- audio: transcode (Opus or AAC-ELD), SRTP out ---
     "-vn",
-    "-c:a", "libopus",
-    "-application", "lowdelay",
-    "-frame_duration", "20",
+    ...(silentAudio ? ["-map", "1:a:0"] : []),
+    ...audioCodecArgs,
     // SYNTHETIC audio clock: regenerate pts from the cumulative sample count,
     // discarding the camera's wobbly timestamps entirely. The video leg
     // already gets a steady clock from the -r CFR grid; audio passing the
@@ -267,7 +413,7 @@ export function buildLiveFfmpegArgs(input: LiveFfmpegInput, includeAudio = true)
     "-f", "rtp",
     "-srtp_out_suite", "AES_CM_128_HMAC_SHA1_80",
     "-srtp_out_params", audio.srtpParams,
-    `srtp://${targetAddress}:${audio.port}?rtcpport=${audio.port}&localrtcpport=${audio.localRtcpPort}&pkt_size=188`,
+    rtpUrl(targetAddress, audio.port, audio.port, audio.localRtcpPort, 188),
   ];
 }
 
@@ -283,7 +429,11 @@ export function buildLiveFfmpegArgs(input: LiveFfmpegInput, includeAudio = true)
 export function resolveSrtpTargetAddress(
   requested: string,
   interfaces: () => ReturnType<typeof networkInterfaces> = networkInterfaces,
+  loopbackLocal = process.env.ARGUS_SRTP_LOOPBACK !== "0",
 ): string {
+  if (!loopbackLocal) {
+    return requested;
+  }
   for (const addresses of Object.values(interfaces())) {
     for (const address of addresses ?? []) {
       if (address.address === requested) {
@@ -306,6 +456,18 @@ async function reserveUdpPort(): Promise<number> {
   });
 }
 
+async function bindUdpSocket(): Promise<Socket> {
+  return new Promise((resolve, reject) => {
+    const socket = createSocket("udp4");
+    socket.once("error", reject);
+    socket.bind(0, () => {
+      socket.off("error", reject);
+      socket.unref();
+      resolve(socket);
+    });
+  });
+}
+
 /**
  * FFmpeg srtp_out_params for the stream WE send to the controller. Critically,
  * HomeKit encrypts/decrypts each direction with the controller's OWN key material
@@ -321,19 +483,24 @@ interface ActiveSession {
   ffmpeg?: ChildProcess;
   /** The input used for the running FFmpeg — kept so RECONFIGURE can respawn with new video params. */
   liveInput?: LiveFfmpegInput;
+  rtcpMonitor?: {
+    videoSocket: Socket;
+    videoPort: number;
+    videoPackets: number;
+  };
   prepared: {
     targetAddress: string;
     /** The controller's requested address BEFORE any loopback rewrite — identity, not routing. */
     controllerAddress: string;
-    video: { port: number; localRtcpPort: number; ssrc: number; srtpParams: string };
-    audio: { port: number; localRtcpPort: number; ssrc: number; srtpParams: string };
+    video: { port: number; returnPort: number; localRtcpPort?: number; ssrc: number; srtpParams: string };
+    audio?: { port: number; returnPort: number; localRtcpPort?: number; ssrc: number; srtpParams: string };
   };
 }
 
 export interface StreamingDelegateOptions {
   /** Which stream's stills to serve for HomeKit snapshot requests. Default "sub". */
   snapshotProfile?: SnapshotProfile;
-  /** Override FFmpeg binary path (default "ffmpeg"). */
+  /** Override FFmpeg binary path (default: ARGUS_FFMPEG env, else "ffmpeg"). */
   ffmpegPath?: string;
   /** Log the FFmpeg command + stderr to the console. Default true. */
   verbose?: boolean;
@@ -357,6 +524,14 @@ export interface StreamingDelegateOptions {
    * (measured 2026-06-11 — non-standard sizes are dead weight).
    */
   liveResolution?: { width: number; height: number };
+  /**
+   * Per-camera content box for aspect-preserved transcodes. Used to keep the
+   * encoded H.264 frame inside a known Home-accepted geometry while retaining a
+   * higher bitrate. ARGUS_LIVE_CONTENT_RESOLUTION overrides globally for tests.
+   */
+  liveContentResolution?: { width: number; height: number };
+  /** Per-camera override for exact-frame padding; ARGUS_LIVE_EXACT_FRAME overrides globally. */
+  liveExactFrame?: boolean;
   /** Injectable spawn for tests. */
   spawnFn?: typeof spawn;
 }
@@ -375,6 +550,8 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
   private readonly includeAudio: boolean;
   private readonly videoMode: "copy" | "transcode";
   private readonly mainStreamUrl?: string;
+  private readonly liveContentResolution?: { width: number; height: number };
+  private readonly liveExactFrame?: boolean;
   private readonly spawnFn: typeof spawn;
 
   public constructor(
@@ -385,11 +562,16 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
     options: StreamingDelegateOptions = {},
   ) {
     this.snapshotProfile = options.snapshotProfile ?? "sub";
-    this.ffmpegPath = options.ffmpegPath ?? "ffmpeg";
+    // ARGUS_FFMPEG lets the daemon point at a libfdk_aac-enabled ffmpeg (needed
+    // for AAC-ELD live audio) without replacing the system binary — explicit
+    // option still wins. See progress/attempt-008.md.
+    this.ffmpegPath = options.ffmpegPath ?? process.env.ARGUS_FFMPEG ?? "ffmpeg";
     this.verbose = options.verbose ?? true;
     this.includeAudio = options.includeAudio ?? true;
     this.videoMode = options.videoMode ?? "transcode";
     if (options.mainStreamUrl !== undefined) this.mainStreamUrl = options.mainStreamUrl;
+    if (options.liveContentResolution !== undefined) this.liveContentResolution = options.liveContentResolution;
+    if (options.liveExactFrame !== undefined) this.liveExactFrame = options.liveExactFrame;
     this.spawnFn = options.spawnFn ?? spawn;
   }
 
@@ -447,38 +629,73 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
   ): Promise<void> {
     try {
       const videoSsrc = randomBytes(4).readUInt32BE(0) >>> 1;
-      const audioSsrc = randomBytes(4).readUInt32BE(0) >>> 1;
-      const videoRtcp = await reserveUdpPort();
-      const audioRtcp = await reserveUdpPort();
+      const useRtcpMonitor = process.env.ARGUS_RTCP_MONITOR === "1";
+      const videoRtcpMonitor = useRtcpMonitor ? await bindUdpSocket() : undefined;
+      const videoReturnPort = videoRtcpMonitor
+        ? (videoRtcpMonitor.address() as { port: number }).port
+        : await reserveUdpPort();
       // Encrypt outbound with the controller's own key material (from the request),
       // and echo it back in the response. Generating fresh keys here is the classic
       // "stream sends but the device shows a forever-spinner" bug.
       const videoSrtpParams = srtpParamsFromRequest(request.video.srtp_key, request.video.srtp_salt);
-      const audioSrtpParams = srtpParamsFromRequest(request.audio.srtp_key, request.audio.srtp_salt);
+      const audioReturnPort = this.includeAudio ? await reserveUdpPort() : undefined;
+      const audioPrepared = this.includeAudio && audioReturnPort !== undefined
+        ? {
+            port: request.audio.port,
+            returnPort: audioReturnPort,
+            ...(!useRtcpMonitor ? { localRtcpPort: audioReturnPort } : {}),
+            ssrc: randomBytes(4).readUInt32BE(0) >>> 1,
+            srtpParams: srtpParamsFromRequest(request.audio.srtp_key, request.audio.srtp_salt),
+          }
+        : undefined;
+      const rtcpMonitor = videoRtcpMonitor
+        ? {
+            videoSocket: videoRtcpMonitor,
+            videoPort: videoReturnPort,
+            videoPackets: 0,
+          }
+        : undefined;
+      if (rtcpMonitor) {
+        rtcpMonitor.videoSocket.on("message", () => {
+          rtcpMonitor.videoPackets += 1;
+        });
+        rtcpMonitor.videoSocket.on("error", (error) => {
+          this.logLine(`RTCP monitor error on video return port ${videoReturnPort}: ${error.message}`);
+        });
+      }
 
       this.sessions.set(request.sessionID, {
+        ...(rtcpMonitor ? { rtcpMonitor } : {}),
         prepared: {
           targetAddress: resolveSrtpTargetAddress(request.targetAddress),
           controllerAddress: request.targetAddress,
-          video: { port: request.video.port, localRtcpPort: videoRtcp, ssrc: videoSsrc, srtpParams: videoSrtpParams },
-          audio: { port: request.audio.port, localRtcpPort: audioRtcp, ssrc: audioSsrc, srtpParams: audioSrtpParams },
+          video: {
+            port: request.video.port,
+            returnPort: videoReturnPort,
+            ...(useRtcpMonitor ? {} : { localRtcpPort: videoReturnPort }),
+            ssrc: videoSsrc,
+            srtpParams: videoSrtpParams,
+          },
+          ...(audioPrepared ? { audio: audioPrepared } : {}),
         },
       });
 
       const response: PrepareStreamResponse = {
         video: {
-          port: videoRtcp,
+          port: videoReturnPort,
           ssrc: videoSsrc,
           srtp_key: request.video.srtp_key,
           srtp_salt: request.video.srtp_salt,
         },
-        audio: {
-          port: audioRtcp,
-          ssrc: audioSsrc,
+      };
+      if (audioPrepared) {
+        response.audio = {
+          port: audioPrepared.returnPort,
+          ssrc: audioPrepared.ssrc,
           srtp_key: request.audio.srtp_key,
           srtp_salt: request.audio.srtp_salt,
-        },
-      };
+        };
+      }
       callback(undefined, response);
     } catch (error) {
       callback(error instanceof Error ? error : new Error(String(error)));
@@ -557,20 +774,40 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
       request.video.max_bit_rate,
       session.prepared.controllerAddress,
     );
+    const audioSource = process.env.ARGUS_LIVE_AUDIO_SOURCE === "silence" ? "silence" : "input";
+    const rtcpMode = session.rtcpMonitor ? `node-monitor:${session.rtcpMonitor.videoPort}` : "ffmpeg-localrtcpport";
+    const audioLog = this.includeAudio
+      ? `audio: codec=${request.audio.codec} ${request.audio.sample_rate}kHz ptype=${request.audio.pt} source=${audioSource}`
+      : `audio: disabled (controller selected codec=${request.audio.codec} ${request.audio.sample_rate}kHz ptype=${request.audio.pt})`;
     this.logLine(
       `HomeKit negotiated video: ${request.video.width}x${request.video.height}@${request.video.fps} ` +
         `profile=${profile} level=${level} ptype=${request.video.pt} asked=${request.video.max_bit_rate}k serving=${bitrate}k mtu=${request.video.mtu} ` +
-        `mode=${this.videoMode} source=${this.pickInputUrl(request.video.width, request.video.height)}; ` +
-        `audio: codec=${request.audio.codec} ${request.audio.sample_rate}kHz ptype=${request.audio.pt}`,
+        `mode=${this.videoMode} source=${this.pickInputUrl(request.video.width, request.video.height)} ` +
+        `controller=${session.prepared.controllerAddress} target=${session.prepared.targetAddress} rtcp=${rtcpMode}; ` +
+        audioLog,
     );
+    const preparedAudio: {
+      port: number;
+      localRtcpPort?: number;
+      ssrc: number;
+      srtpParams: string;
+    } = session.prepared.audio ?? {
+      port: 0,
+      ssrc: 0,
+      srtpParams: "",
+    };
 
     const liveInput: LiveFfmpegInput = {
       inputUrl: this.pickInputUrl(request.video.width, request.video.height),
       targetAddress: session.prepared.targetAddress,
       videoMode: this.videoMode,
+      ...(this.liveContentResolution ? { liveContentResolution: this.liveContentResolution } : {}),
+      ...(this.liveExactFrame !== undefined ? { liveExactFrame: this.liveExactFrame } : {}),
       video: {
         port: session.prepared.video.port,
-        localRtcpPort: session.prepared.video.localRtcpPort,
+        ...(session.prepared.video.localRtcpPort !== undefined
+          ? { localRtcpPort: session.prepared.video.localRtcpPort }
+          : {}),
         ssrc: session.prepared.video.ssrc,
         payloadType: request.video.pt,
         maxBitrateKbps: bitrate,
@@ -583,13 +820,22 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
         srtpParams: session.prepared.video.srtpParams,
       },
       audio: {
-        port: session.prepared.audio.port,
-        localRtcpPort: session.prepared.audio.localRtcpPort,
-        ssrc: session.prepared.audio.ssrc,
+        port: preparedAudio.port,
+        ...(preparedAudio.localRtcpPort !== undefined
+          ? { localRtcpPort: preparedAudio.localRtcpPort }
+          : {}),
+        ssrc: preparedAudio.ssrc,
         payloadType: request.audio.pt,
         sampleRateKhz: request.audio.sample_rate,
         maxBitrateKbps: request.audio.max_bit_rate,
-        srtpParams: session.prepared.audio.srtpParams,
+        srtpParams: preparedAudio.srtpParams,
+        // Encode whatever HomeKit negotiated. The advertised codec (Opus vs
+        // AAC-ELD) is gated by ARGUS_LIVE_AAC_ELD in buildCameraControllerOptions;
+        // deriving from the actual ask keeps the encoder correct even if a
+        // controller picks the other codec.
+        audioCodec:
+          request.audio.codec === AudioStreamingCodecType.AAC_ELD ? "aac_eld" : "opus",
+        audioSource,
       },
     };
 
@@ -642,12 +888,20 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
     });
 
     // Give FFmpeg a beat to fail fast (bad args / unreachable source) before we
-    // tell HomeKit the stream is live; otherwise report success so it starts pulling.
-    setTimeout(() => answer(), 500);
+    // tell HomeKit the stream is live; otherwise report success so it starts
+    // pulling. ARGUS_START_ACK_DELAY_MS is a diagnostic knob for Home's spinner
+    // path: HAP-NodeJS's example acks only after FFmpeg has produced output.
+    setTimeout(() => answer(), liveStartAckDelayMs());
   }
 
   private stopStream(sessionID: string): void {
     const session = this.sessions.get(sessionID);
+    if (session?.rtcpMonitor) {
+      this.logLine(
+        `RTCP monitor video packets=${session.rtcpMonitor.videoPackets} port=${session.rtcpMonitor.videoPort}`,
+      );
+      session.rtcpMonitor.videoSocket.close();
+    }
     session?.ffmpeg?.kill("SIGKILL");
     this.sessions.delete(sessionID);
   }
@@ -691,11 +945,11 @@ export function buildCameraControllerOptions(
     [320, 240, 15],
   ];
   const resolutions: [number, number, number][] =
-    videoMode === "copy" && liveResolution
+    capResolutions(videoMode === "copy" && liveResolution
       ? [[liveResolution.width, liveResolution.height, 30]]
       : process.env.ARGUS_LIVE_LADDER === "compat"
         ? compatSet
-        : hiResSet;
+        : hiResSet);
 
   return {
     cameraStreamCount: 2, // allow two concurrent viewers
@@ -717,28 +971,38 @@ export function buildCameraControllerOptions(
         },
         resolutions,
       },
-      // Omitting audio entirely makes HomeKit treat this as a video-only camera —
-      // useful for isolating whether audio negotiation is what stalls a session.
-      audio: {
-        codecs: includeAudio
-          ? [{ type: AudioStreamingCodecType.OPUS, samplerate: AudioStreamingSamplerate.KHZ_24 }]
-          : [],
-      },
+      // Omitting audio puts HAP-NodeJS into its videoOnly fallback: the library
+      // still advertises a fake OPUS capability because HomeKit needs one to
+      // start the video stream, but Argus omits PrepareStreamResponse.audio and
+      // sends no FFmpeg audio leg. Useful for isolating whether RTP audio output
+      // is what stalls a session.
+      // ARGUS_LIVE_AAC_ELD=1 advertises Apple's canonical AAC-ELD codec (16kHz)
+      // instead of Opus (24kHz) — the experimental fix for the ≥720p audio-gates-
+      // video hang (progress/attempt-008.md). Requires ARGUS_FFMPEG pointed at a
+      // libfdk_aac build, or the live audio leg fails to start.
+      ...(includeAudio
+        ? {
+            audio: {
+              codecs: [
+                process.env.ARGUS_LIVE_AAC_ELD === "1"
+                  ? { type: AudioStreamingCodecType.AAC_ELD, samplerate: AudioStreamingSamplerate.KHZ_16 }
+                  : { type: AudioStreamingCodecType.OPUS, samplerate: AudioStreamingSamplerate.KHZ_24 },
+              ],
+            },
+          }
+        : {}),
     },
   };
 }
 
 /**
- * Advertised accessory firmware version — the controller cache-buster. iOS
- * pins camera streaming profiles hard: a manual configVersion bump alone did
- * NOT make a paired iPhone re-read the resolution list (measured 2026-06-12:
- * c#=8 visible in mDNS for 12h, phone still requested the long-removed
- * 640x360). Controllers DO refresh accessory metadata on a firmware update,
- * and HAP-NodeJS auto-bumps c# when this increases (it tracks
- * lastFirmwareVersion in AccessoryInfo for exactly that). BUMP THIS whenever
- * the advertised streaming configuration changes.
+ * Advertised accessory firmware metadata. This is useful visible accessory
+ * metadata, but it is NOT a reliable streaming-profile cache-buster in
+ * HAP-NodeJS 0.14.3: AccessoryInfo tracks the HAP-NodeJS package version for
+ * its own config hash, and streaming TLVs did not move c# in attempt 011. Use
+ * ARGUS_HAP_CONFIG_BUMP when a paired controller must see a new stream profile.
  */
-export const ARGUS_FIRMWARE_REVISION = "1.1.0";
+export const ARGUS_FIRMWARE_REVISION = "1.2.1";
 
 export interface CameraAccessoryHandle {
   accessory: Accessory;

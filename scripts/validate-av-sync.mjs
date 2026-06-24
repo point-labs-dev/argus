@@ -111,7 +111,7 @@ const last = samples[samples.length - 1];
 if (first && last && last.t > first.t) {
   const driftMsPerMin = ((last.skewMs - first.skewMs) / (last.t - first.t)) * 60;
   console.log(`\nVERDICT: skew ${first.skewMs}ms -> ${last.skewMs}ms; drift ${driftMsPerMin.toFixed(0)} ms/min`);
-  console.log(driftMsPerMin > 100 || Math.abs(last.skewMs) > 1000
+  console.log(Math.abs(driftMsPerMin) > 100 || Math.abs(last.skewMs) > 1000
     ? "A/V CLOCKS DIVERGE — this is what trips the iOS gate."
     : "A/V clocks track — stream-side sync looks healthy.");
 } else {

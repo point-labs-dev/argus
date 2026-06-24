@@ -34,6 +34,11 @@ const SAMPLERATE_TO_HZ: Record<number, number> = {
   [AudioRecordingSamplerate.KHZ_48]: 48000,
 };
 
+function recordingVideoFilter(width: number, height: number): string {
+  const scale = `scale=${width}:${height}:force_original_aspect_ratio=decrease:force_divisible_by=2`;
+  return `${scale},pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2,setsar=1`;
+}
+
 /** Recording options Argus offers to HomeKit (resolutions cover the required set). */
 export function buildRecordingOptions(): CameraRecordingOptions {
   return {
@@ -74,8 +79,9 @@ export function buildRecordingOptions(): CameraRecordingOptions {
 
 /**
  * Pure builder for the FFmpeg fragmented-MP4 command HKSV records from. Unlike live
- * view, recording uses the full-res MAIN stream (transcoded H.264 + AAC-LC), with
- * keyframes aligned to the fragment length so each fragment starts on an IDR.
+ * view, recording uses the full-res MAIN stream (transcoded H.264 + AAC-LC).
+ * The filter preserves source aspect ratio inside HomeKit's negotiated recording
+ * frame, so 4:3 camera mains are not stretched into 16:9 clips.
  */
 export function buildRecordingFfmpegArgs(mainUrl: string, config: CameraRecordingConfiguration): string[] {
   const [width, height, fps] = config.videoCodec.resolution;
@@ -104,7 +110,7 @@ export function buildRecordingFfmpegArgs(mainUrl: string, config: CameraRecordin
     "-pix_fmt", "yuv420p",
     "-color_range", "tv",
     "-r", String(fps),
-    "-vf", `scale=${width}:${height}`,
+    "-vf", recordingVideoFilter(width, height),
     "-b:v", `${params.bitRate}k`,
     "-maxrate", `${params.bitRate}k`,
     "-bufsize", `${2 * params.bitRate}k`,
