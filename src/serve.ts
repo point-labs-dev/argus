@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 
 import { Categories, HAPStorage } from "hap-nodejs";
 
+import { nvrHevcMainStreams, verifyNvrCodecLocks } from "./codec-watchdog.js";
 import { loadArgusConfig, type ArgusConfig } from "./config.js";
 import { buildGo2RtcStreamNames } from "./go2rtc.js";
 import { startGo2Rtc, type Go2RtcSupervisor } from "./go2rtc-supervisor.js";
@@ -102,6 +103,20 @@ export async function startArgusServer(config: ArgusConfig, configDir = process.
       process.stderr.write(`[argus ${camera.name}] live-resolution probe failed (${message}); advertising defaults\n`);
     }),
   );
+
+  // Before publishing accessories: make sure go2rtc detected the true codec of
+  // every NVR-fronted HEVC main (the NVR's SDP lies; detection is a coin flip
+  // per producer start — see codec-watchdog.ts). Restarting go2rtc here is
+  // invisible to HomeKit; once accessories are live it would break sessions.
+  if (process.env.ARGUS_CODEC_WATCHDOG !== "0") {
+    await verifyNvrCodecLocks(nvrHevcMainStreams(config), {
+      apiBaseUrl: `http://127.0.0.1:${config.go2rtc.api_port}`,
+      restart: async () => {
+        await supervisor.stop();
+        await supervisor.start();
+      },
+    });
+  }
 
   const streamNames = buildGo2RtcStreamNames(config.cameras);
   // ARGUS_HAP_BIND restricts HAP/mDNS advertisement to specific interface(s) or
