@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { detectedVideoCodec, nvrHevcMainStreams, verifyNvrCodecLocks } from "../src/codec-watchdog.js";
+import { detectedVideoCodec, mislockedStreams, nvrHevcMainStreams, verifyNvrCodecLocks } from "../src/codec-watchdog.js";
 import type { ArgusConfig } from "../src/config.js";
 
 const cam = (name: string, channel: number, mainCodec: "h264" | "h265") =>
@@ -104,7 +104,7 @@ describe("verifyNvrCodecLocks", () => {
     expect(result.healthy).toBe(false);
     expect(result.restarts).toBe(2);
     expect(rolls).toBe(2);
-    expect(lines.some((l) => l.includes("WILL NOT RECORD"))).toBe(true);
+    expect(lines.some((l) => l.includes("falls back HKSV to the sub stream"))).toBe(true);
   });
 
   it("does not restart on unknown codec info alone (NVR offline must not loop boot)", async () => {
@@ -119,6 +119,20 @@ describe("verifyNvrCodecLocks", () => {
     expect(result.healthy).toBe(true);
     expect(rolls).toBe(0);
     expect(result.detected.get("front-l")).toBeUndefined();
+  });
+
+  it("mislockedStreams exposes only positive h264 locks (not unknowns), empty when watchdog disabled", async () => {
+    const result = await verifyNvrCodecLocks(expectations, {
+      ...FAST,
+      maxRestarts: 0,
+      apiBaseUrl: "http://x",
+      restart: async () => {},
+      fetch: (async (url: string) =>
+        streamsResponse(String(url).includes("front-l") ? "h264" : undefined)) as never,
+      log: () => {},
+    });
+    expect([...mislockedStreams(result)]).toEqual(["front-l"]);
+    expect(mislockedStreams(undefined).size).toBe(0);
   });
 
   it("treats API failures as unknown, not as mislock", async () => {

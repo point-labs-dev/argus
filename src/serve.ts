@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 
 import { Categories, HAPStorage } from "hap-nodejs";
 
-import { nvrHevcMainStreams, verifyNvrCodecLocks } from "./codec-watchdog.js";
+import { mislockedStreams, nvrHevcMainStreams, verifyNvrCodecLocks } from "./codec-watchdog.js";
 import { loadArgusConfig, type ArgusConfig } from "./config.js";
 import { buildGo2RtcStreamNames } from "./go2rtc.js";
 import { startGo2Rtc, type Go2RtcSupervisor } from "./go2rtc-supervisor.js";
@@ -108,15 +108,17 @@ export async function startArgusServer(config: ArgusConfig, configDir = process.
   // every NVR-fronted HEVC main (the NVR's SDP lies; detection is a coin flip
   // per producer start — see codec-watchdog.ts). Restarting go2rtc here is
   // invisible to HomeKit; once accessories are live it would break sessions.
-  if (process.env.ARGUS_CODEC_WATCHDOG !== "0") {
-    await verifyNvrCodecLocks(nvrHevcMainStreams(config), {
-      apiBaseUrl: `http://127.0.0.1:${config.go2rtc.api_port}`,
-      restart: async () => {
-        await supervisor.stop();
-        await supervisor.start();
-      },
-    });
-  }
+  const codecHealth =
+    process.env.ARGUS_CODEC_WATCHDOG !== "0"
+      ? await verifyNvrCodecLocks(nvrHevcMainStreams(config), {
+          apiBaseUrl: `http://127.0.0.1:${config.go2rtc.api_port}`,
+          restart: async () => {
+            await supervisor.stop();
+            await supervisor.start();
+          },
+        })
+      : undefined;
+  const mislockedMains = mislockedStreams(codecHealth);
 
   const streamNames = buildGo2RtcStreamNames(config.cameras);
   // ARGUS_HAP_BIND restricts HAP/mDNS advertisement to specific interface(s) or
@@ -136,7 +138,16 @@ export async function startArgusServer(config: ArgusConfig, configDir = process.
   const published = config.cameras.map((camera, index) => {
     const names = streamNames[index]!;
     const liveUrl = `${RTSP_RESTREAM_BASE}/${names.sub}`; // live view = light sub stream
-    const mainUrl = `${RTSP_RESTREAM_BASE}/${names.main}`; // HKSV recording = full-res main stream
+    let mainUrl = `${RTSP_RESTREAM_BASE}/${names.main}`; // HKSV recording = full-res main stream
+    // A mislocked NVR HEVC main is undecodable for consumers (see
+    // codec-watchdog.ts). A working sub-sourced recording beats no recording:
+    // the Home Hub classifies either; detail returns when detection heals.
+    if (mislockedMains.has(names.main)) {
+      mainUrl = liveUrl;
+      process.stderr.write(
+        `[argus ${camera.name}] HKSV falling back to the sub stream: go2rtc mislocked ${names.main} as h264\n`,
+      );
+    }
     // ARGUS_AUDIO=0 publishes video-only accessories (diagnostic isolation).
     const includeAudio = process.env.ARGUS_AUDIO !== "0";
     const liveResolution = liveResolutions.get(camera.name);

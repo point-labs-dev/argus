@@ -86,6 +86,17 @@ export interface WatchdogResult {
   detected: Map<string, string | undefined>;
 }
 
+/** Stream names that POSITIVELY detect the wrong codec (h264) — the set serve
+ * uses to reroute HKSV to the sub stream. Unknown/absent info is not included. */
+export function mislockedStreams(result: WatchdogResult | undefined): Set<string> {
+  const mislocked = new Set<string>();
+  if (!result) return mislocked;
+  for (const [stream, codec] of result.detected) {
+    if (codec === "h264") mislocked.add(stream);
+  }
+  return mislocked;
+}
+
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
@@ -144,8 +155,8 @@ export async function verifyNvrCodecLocks(
       for (const e of mislocked) {
         log(
           `[argus ${e.cameraName}] codec watchdog: ${e.streamName} still detects h264 after ${restarts} go2rtc ` +
-            `restarts — HKSV for this camera WILL NOT RECORD until go2rtc re-detects (giving up; ` +
-            `restart the argus service to re-roll)`,
+            `restarts — giving up; the main restream is undecodable for consumers until go2rtc re-detects ` +
+            `(serve falls back HKSV to the sub stream)`,
         );
       }
       return { healthy: false, restarts, detected };
