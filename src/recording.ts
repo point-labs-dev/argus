@@ -13,6 +13,7 @@ import {
   VideoCodecType,
 } from "hap-nodejs";
 
+import { createStderrBudget, envFlag } from "./child-log.js";
 import { readFragmentedMp4 } from "./mp4.js";
 
 const PROFILE_TO_X264: Record<number, string> = {
@@ -131,9 +132,15 @@ export function buildRecordingFfmpegArgs(mainUrl: string, config: CameraRecordin
 
 export interface RecordingDelegateOptions {
   ffmpegPath?: string;
+  /** Full ffmpeg stderr passthrough + arg dump. Default: ARGUS_HKSV_VERBOSE env, else false. */
   verbose?: boolean;
   spawnFn?: typeof spawn;
+  /** Injectable log sink for tests. Default writes process.stderr. */
+  logFn?: (line: string) => void;
 }
+
+/** First stderr lines forwarded per HKSV session before suppression (mid-GOP join spew lives here). */
+const HKSV_STDERR_MAX_LINES = 20;
 
 /**
  * HKSV recording delegate for one camera. When the Home Hub requests a recording
@@ -148,6 +155,7 @@ export class ArgusRecordingDelegate implements CameraRecordingDelegate {
   private readonly ffmpegPath: string;
   private readonly verbose: boolean;
   private readonly spawnFn: typeof spawn;
+  private readonly logFn: (line: string) => void;
 
   public constructor(
     private readonly cameraName: string,
@@ -155,8 +163,14 @@ export class ArgusRecordingDelegate implements CameraRecordingDelegate {
     options: RecordingDelegateOptions = {},
   ) {
     this.ffmpegPath = options.ffmpegPath ?? "ffmpeg";
-    this.verbose = options.verbose ?? true;
+    this.verbose = options.verbose ?? envFlag(process.env.ARGUS_HKSV_VERBOSE);
     this.spawnFn = options.spawnFn ?? spawn;
+    this.logFn = options.logFn ?? ((line) => process.stderr.write(`${line}\n`));
+  }
+
+  /** Timestamped like the live-session log — the 42 GB incident log had no timestamps to correlate. */
+  private logLine(msg: string): void {
+    this.logFn(`${new Date().toISOString()} [argus ${this.cameraName}] ${msg}`);
   }
 
   public updateRecordingActive(active: boolean): void {
@@ -174,13 +188,26 @@ export class ArgusRecordingDelegate implements CameraRecordingDelegate {
     }
 
     const args = buildRecordingFfmpegArgs(this.mainUrl, config);
+    // One start line per session always (forensics); the full arg dump only when verbose.
+    this.logLine(`HKSV recording start ${config.videoCodec.resolution.join("x")} <- ${this.mainUrl}`);
     if (this.verbose) {
-      process.stderr.write(`[argus ${this.cameraName}] HKSV recording ${config.videoCodec.resolution.join("x")} -> ffmpeg ${args.join(" ")}\n`);
+      this.logLine(`HKSV recording -> ffmpeg ${args.join(" ")}`);
     }
+    const startedAt = Date.now();
     const ffmpeg = this.spawnFn(this.ffmpegPath, args, { stdio: ["ignore", "pipe", "pipe"] });
     this.processes.set(streamId, ffmpeg);
-    ffmpeg.stderr?.on("data", (chunk: Buffer) => {
-      if (this.verbose) process.stderr.write(`[argus ${this.cameraName}] hksv-ffmpeg: ${chunk.toString().trimEnd()}\n`);
+    const stderrBudget = createStderrBudget({
+      maxLines: HKSV_STDERR_MAX_LINES,
+      verbose: this.verbose,
+      log: (line) => this.logLine(`hksv-ffmpeg: ${line}`),
+    });
+    ffmpeg.stderr?.on("data", (chunk: Buffer) => stderrBudget.onChunk(chunk));
+    ffmpeg.once("exit", (code, signal) => {
+      stderrBudget.flush();
+      const seconds = ((Date.now() - startedAt) / 1000).toFixed(1);
+      const suppressed = stderrBudget.summary();
+      // SIGKILL is normal teardown (the finally block and closeRecordingStream retire sessions that way).
+      this.logLine(`hksv-ffmpeg exited code=${code} signal=${signal} after ${seconds}s${suppressed ? `; ${suppressed}` : ""}`);
     });
 
     // Hold one segment back so the final one can be flagged isLast.

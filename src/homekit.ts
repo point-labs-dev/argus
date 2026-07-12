@@ -27,6 +27,7 @@ import {
   uuid,
 } from "hap-nodejs";
 
+import { createStderrBudget, envFlag } from "./child-log.js";
 import type { CameraConfig } from "./config.js";
 import { ArgusRecordingDelegate, buildRecordingOptions } from "./recording.js";
 import type { SnapshotCache, SnapshotProfile } from "./snapshot-cache.js";
@@ -497,12 +498,19 @@ interface ActiveSession {
   };
 }
 
+/** First raw ffmpeg stderr lines forwarded per live session before suppression. */
+const LIVE_STDERR_MAX_LINES = 40;
+
 export interface StreamingDelegateOptions {
   /** Which stream's stills to serve for HomeKit snapshot requests. Default "sub". */
   snapshotProfile?: SnapshotProfile;
   /** Override FFmpeg binary path (default: ARGUS_FFMPEG env, else "ffmpeg"). */
   ffmpegPath?: string;
-  /** Log the FFmpeg command + stderr to the console. Default true. */
+  /**
+   * Log session lifecycle lines (negotiation, ffmpeg command, exit) to the
+   * console. Default true. Raw ffmpeg stderr passthrough is budgeted
+   * separately per session; ARGUS_LIVE_FFMPEG_VERBOSE=1 lifts that budget.
+   */
   verbose?: boolean;
   /** Send audio (Opus) alongside video. Default true; set false for a video-only stream. */
   includeAudio?: boolean;
@@ -860,7 +868,14 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
 
     // Drain stderr both to surface failures and to avoid the pipe filling and
     // stalling FFmpeg (a silent cause of a stream that "starts" but never flows).
-    ffmpeg.stderr?.on("data", (chunk: Buffer) => log(`ffmpeg: ${chunk.toString().trimEnd()}`));
+    // Drained ≠ logged: passthrough is budgeted per session (42 GB log incident,
+    // 2026-07-12) — ARGUS_LIVE_FFMPEG_VERBOSE=1 restores the full stream.
+    const stderrBudget = createStderrBudget({
+      maxLines: LIVE_STDERR_MAX_LINES,
+      verbose: envFlag(process.env.ARGUS_LIVE_FFMPEG_VERBOSE),
+      log: (line) => log(`ffmpeg: ${line}`),
+    });
+    ffmpeg.stderr?.on("data", (chunk: Buffer) => stderrBudget.onChunk(chunk));
 
     let answered = false;
     const answer = (error?: Error): void => {
@@ -874,7 +889,9 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
       answer(error);
     });
     ffmpeg.once("exit", (code, signal) => {
-      log(`ffmpeg exited code=${code} signal=${signal}`);
+      stderrBudget.flush();
+      const suppressed = stderrBudget.summary();
+      log(`ffmpeg exited code=${code} signal=${signal}${suppressed ? `; ${suppressed}` : ""}`);
       if (!answered) {
         // Died before we acknowledged START — report failure to HomeKit.
         answer(new Error(`ffmpeg exited code=${code} signal=${signal}`));
