@@ -154,6 +154,7 @@ export async function writeGo2RtcConfigFile(
     await writeFile(resolvedConfigPath, contents, {
       encoding: "utf8",
       flag: options.force === true ? "w" : "wx",
+      mode: 0o600,
     });
   } catch (error) {
     if (isNodeErrorWithCode(error, "EEXIST")) {

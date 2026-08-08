@@ -29,6 +29,23 @@ export interface ArgusServer {
   stop(): Promise<void>;
 }
 
+/**
+ * Safety override for damaged or unstable main streams. Accepts "1"/"all",
+ * "h265"/"hevc", or a comma-separated list of camera names.
+ */
+function shouldForceHksvSub(cameraName: string, mainCodec: "h264" | "h265"): boolean {
+  const raw = process.env.ARGUS_HKSV_FORCE_SUB?.trim();
+  if (!raw) return false;
+  const normalized = raw.toLowerCase();
+  if (normalized === "1" || normalized === "all") return true;
+  if ((normalized === "h265" || normalized === "hevc") && mainCodec === "h265") return true;
+  return raw
+    .split(",")
+    .map((value) => value.trim().toLowerCase())
+    .filter(Boolean)
+    .includes(cameraName.trim().toLowerCase());
+}
+
 function shouldForceHomeKitConfigBump(cameraName: string): boolean {
   const raw = process.env.ARGUS_HAP_CONFIG_BUMP?.trim();
   if (!raw) return false;
@@ -142,7 +159,12 @@ export async function startArgusServer(config: ArgusConfig, configDir = process.
     // A mislocked NVR HEVC main is undecodable for consumers (see
     // codec-watchdog.ts). A working sub-sourced recording beats no recording:
     // the Home Hub classifies either; detail returns when detection heals.
-    if (mislockedMains.has(names.main)) {
+    if (shouldForceHksvSub(camera.name, camera.mainCodec)) {
+      mainUrl = liveUrl;
+      process.stderr.write(
+        `[argus ${camera.name}] HKSV safety fallback: using the H.264 sub stream instead of the ${camera.mainCodec} main\n`,
+      );
+    } else if (mislockedMains.has(names.main)) {
       mainUrl = liveUrl;
       process.stderr.write(
         `[argus ${camera.name}] HKSV falling back to the sub stream: go2rtc mislocked ${names.main} as h264\n`,

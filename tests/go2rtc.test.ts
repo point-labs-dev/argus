@@ -133,6 +133,15 @@ describe("go2rtc generation", () => {
     expect(go2rtcConfig.streams["front-door-sub"]).toBeDefined();
   });
 
+  it("binds every listener to localhost (nothing exposed to the LAN)", () => {
+    const config = createCameraConfig();
+    const go2rtcConfig = generateGo2RtcConfig(config);
+
+    expect(go2rtcConfig.api.listen).toBe("127.0.0.1:1984");
+    expect(go2rtcConfig.rtsp.listen).toBe("127.0.0.1:8554");
+    expect(go2rtcConfig.webrtc.listen).toBe("127.0.0.1:8555");
+  });
+
   it("preloads every sub AND main stream (warm producers for fast live starts)", () => {
     const config = createCameraConfig();
     const go2rtcConfig = generateGo2RtcConfig(config);

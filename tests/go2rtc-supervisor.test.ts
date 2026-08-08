@@ -1,5 +1,5 @@
 import { EventEmitter } from "node:events";
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 
@@ -89,6 +89,9 @@ describe("go2rtc supervisor", () => {
     expect(contents).toContain("listen: 127.0.0.1:1984");
     expect(contents).toContain("front-door:");
     expect(contents.endsWith("\n")).toBe(true);
+    // The generated config embeds camera credentials — keep it owner-only.
+    const mode = (await stat(result.path)).mode & 0o777;
+    expect(mode).toBe(0o600);
   });
 
   it("refuses accidental overwrite unless forced", async () => {

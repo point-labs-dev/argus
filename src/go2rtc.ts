@@ -9,6 +9,9 @@ export interface Go2RtcConfig {
   rtsp: {
     listen: string;
   };
+  webrtc: {
+    listen: string;
+  };
   streams: Record<string, string[]>;
   /**
    * Streams whose producers go2rtc connects at startup and keeps connected
@@ -150,6 +153,11 @@ export function generateGo2RtcConfig(config: ArgusConfig): Go2RtcConfig {
     },
     rtsp: {
       listen: "127.0.0.1:8554",
+    },
+    // Argus consumes go2rtc over local RTSP only. Do not expose go2rtc's
+    // default WebRTC listener to the LAN.
+    webrtc: {
+      listen: "127.0.0.1:8555",
     },
     streams,
     preload,
