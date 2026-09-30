@@ -43,6 +43,8 @@ HomeKit  NVR       Web UI
 - [ ] Reolink camera discovery
 - [ ] Motion/person/vehicle detection forwarding
 - [x] Snapshot caching service (go2rtc-backed cache module; not wired to HomeKit yet)
+- [x] Alert latency instrumentation (structured telemetry for motion→notification→live timing)
+- [x] Stream pre-warming on motion detection (reduces cold-start wait when user opens live view)
 - [ ] Web UI with timeline
 - [ ] Two-way audio
 - [ ] PTZ controls
@@ -92,6 +94,18 @@ Run the Vitest suite:
 ```bash
 npm test
 ```
+
+### Alert Latency
+
+Argus instruments the motion→notification→live path with structured telemetry. See [LATENCY.md](LATENCY.md) for:
+- How to measure alert→action latency
+- What Argus can/can't control in HomeKit notifications
+- Testing guide for verifying improvements on the Mac Mini
+
+Quick summary:
+- Motion detection emits timestamped events
+- Stream pre-warming reduces cold-start delay
+- Telemetry logs are machine-readable JSON (grep `ARGUS_TELEMETRY:`)
 
 ### go2rtc Supervisor
 
