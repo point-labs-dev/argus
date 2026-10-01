@@ -189,7 +189,10 @@ export function buildLiveFfmpegArgs(input: LiveFfmpegInput, includeAudio = true)
           "-pix_fmt", "yuv420p",
           "-color_range", "tv",
           "-r", String(video.fps),
-          "-vf", `scale=${boxWidth}:${boxHeight}:force_original_aspect_ratio=decrease:force_divisible_by=2`,
+          // Scale to fit then pad to EXACT negotiated dimensions. Field 2026-10-01:
+          // 4:3 source (2560×1920) scaled to 960×720 != negotiated 1280×720 → Home blank.
+          // Home enforces exact W×H. Pad centers with black bars (pillarbox/letterbox).
+          "-vf", `scale=${boxWidth}:${boxHeight}:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=${boxWidth}:${boxHeight}:(ow-iw)/2:(oh-ih)/2`,
           "-bf", "0",
           ...keyframeArgs,
           "-crf", hiResSession ? "18" : "20",

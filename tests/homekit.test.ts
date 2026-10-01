@@ -103,7 +103,8 @@ describe("buildLiveFfmpegArgs", () => {
     expect(args).toContain("-i rtsp://127.0.0.1:8554/backyard-left-sub");
     expect(args).toContain("-c:v libx264");
     expect(args).toContain("-c:a libopus");
-    expect(args).toContain("scale=1280:720");
+    // Pad to exact negotiated dimensions (field 2026-10-01: 4:3 source → 960×720 != 1280×720)
+    expect(args).toContain("scale=1280:720:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=1280:720:(ow-iw)/2:(oh-ih)/2");
     // Capped-CRF: easy scenes undershoot the cap, motion gets the full budget.
     // Hi-res sessions get the extra encoder effort and quality target.
     expect(args).toContain("-preset faster");
@@ -124,8 +125,23 @@ describe("buildLiveFfmpegArgs", () => {
       liveInput({ video: { ...liveInput().video, width: 1280, height: 720, maxBitrateKbps: 132 } }),
     ).join(" ");
 
-    expect(args).toContain("scale=1280:720:force_original_aspect_ratio=decrease");
+    expect(args).toContain("scale=1280:720:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=1280:720");
     expect(args).toContain("-maxrate 132k");
+  });
+
+  it("pads to exact negotiated dimensions for all aspect ratios", () => {
+    // Field 2026-10-01: 4:3 source (2560×1920) scaled to fit 1280×720 (16:9) becomes
+    // 960×720 without padding. Home expects EXACT 1280×720 → blank. Pad fills the gap.
+    const input720p = liveInput({ video: { ...liveInput().video, width: 1280, height: 720 } });
+    const args720p = buildLiveFfmpegArgs(input720p).join(" ");
+    
+    // Should scale to fit then pad to exact 1280×720
+    expect(args720p).toContain("scale=1280:720:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=1280:720:(ow-iw)/2:(oh-ih)/2");
+    
+    // Same for other resolutions
+    const input1080p = liveInput({ video: { ...liveInput().video, width: 1920, height: 1080 } });
+    const args1080p = buildLiveFfmpegArgs(input1080p).join(" ");
+    expect(args1080p).toContain("pad=1920:1080:(ow-iw)/2:(oh-ih)/2");
   });
 
   it("enables the intra-refresh experiment with ARGUS_LIVE_INTRA=1", () => {
@@ -149,7 +165,7 @@ describe("buildLiveFfmpegArgs", () => {
     expect(args).toContain("-crf 20");
     expect(args).toContain("-maxrate 600k");
     expect(args).toContain("-force_key_frames expr:gte(t,n_forced*1)");
-    expect(args).toContain("scale=640:360");
+    expect(args).toContain("scale=640:360:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=640:360");
             expect(args).not.toContain("-hwaccel");
   });
 
@@ -338,7 +354,7 @@ describe("ArgusStreamingDelegate", () => {
     expect(args.join(" ")).toContain("srtp://192.168.1.50:50000");
     // Transcode is the default live mode (validated on real devices).
     expect(args.join(" ")).toContain("-c:v libx264");
-    expect(args.join(" ")).toContain("scale=1280:720");
+    expect(args.join(" ")).toContain("scale=1280:720:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=1280:720");
     // Honor the negotiated bitrate exactly (field 2026-10-01: floor caused blank screen).
     expect(args.join(" ")).toContain("-maxrate 299k");
     // FFmpeg must encrypt with the CONTROLLER's key from the request (not a
@@ -390,7 +406,7 @@ describe("ArgusStreamingDelegate", () => {
     expect(spawnFn).toHaveBeenCalledTimes(2);
     expect(procs[0]!.kill).toHaveBeenCalledWith("SIGKILL");
     const secondArgs = (spawnFn as unknown as { mock: { calls: [string, string[]][] } }).mock.calls[1]![1].join(" ");
-    expect(secondArgs).toContain("scale=896:672");
+    expect(secondArgs).toContain("scale=896:672:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=896:672");
     expect(secondArgs).toContain("-maxrate 600k");
   });
 
