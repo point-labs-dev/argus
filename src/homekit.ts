@@ -106,23 +106,18 @@ export interface LiveFfmpegInput {
 
 /**
  * What we actually encode at, given HomeKit's ask. Apple clients negotiate
- * absurdly conservative bitrates (measured 2026-06-11 on Peter's iPhone, LAN:
- * 299k for 1280x720, 802k for 1920x1080 — mush at those sizes) and mature
- * bridges (homebridge-camera-ffmpeg videoBitrate, Scrypted) override them as a
- * matter of course. Floors are conventional IP-camera rates per tier; the ask
- * is still honored when it EXCEEDS the floor.
+ * conservative bitrates (299k for 1280x720, 802k for 1920x1080 on LAN) but
+ * field evidence (2026-10-01) shows HONORING the ask is critical: serving
+ * 2000k when Home negotiated 299k (6.7x over-budget) caused blank screen
+ * despite healthy encode. Home enforces its budget and rejects over-rate streams.
+ * Floors removed — the negotiation IS the contract.
  */
 export function effectiveBitrateKbps(width: number, height: number, negotiatedKbps: number): number {
-  const pixels = width * height;
-  // 2000k@720p / 3000k@1080p are the community-proven LAN rates (Scrypted
-  // defaults): 3500k+ with 2x VBV burst headroom hung real iPhone sessions on
-  // WiFi (2026-06-12: tiles at 600k always rendered, 720p at 3500k hung on
-  // most attempts — delivery, not negotiation; the sender was healthy).
-  const floor =
-    pixels >= 1920 * 1080 ? 3000 :
-    pixels >= 1280 * 720 ? 2000 :
-    pixels >= 640 * 360 ? 600 : 300;
-  return Math.max(negotiatedKbps, floor);
+  // Honor the negotiated bitrate exactly. The old floor logic (2000k@720p,
+  // 3000k@1080p) was causing blank screens when Home enforced its budget.
+  // If users need higher quality on fast networks, they should increase the
+  // ADVERTISED max bitrate in controller options, not override the negotiation.
+  return negotiatedKbps;
 }
 
 /**
@@ -158,14 +153,12 @@ export function buildLiveFfmpegArgs(input: LiveFfmpegInput, includeAudio = true)
         "-force_key_frames", `expr:gte(t,n_forced*${idrSeconds})`,
       ];
 
-  // Starved sessions (hub-relayed remote viewers obeying Apple's 132-300k
-  // asks) get fewer pixels per bit: encoding a full 1280x720 at 132k is
-  // pulsating mush, 854x480 in the same negotiated box is merely soft.
-  // Controllers accept smaller-than-negotiated dimensions (the fit-within
-  // scale below already relies on that).
-  const starved = hiResSession && video.maxBitrateKbps < 800;
-  const boxWidth = starved ? Math.min(854, video.width) : video.width;
-  const boxHeight = starved ? Math.min(480, video.height) : video.height;
+  // Honor the negotiated dimensions exactly. Earlier logic downscaled starved
+  // sessions (<800k) to 854×480, but field evidence (2026-10-01) shows this
+  // violates Home's expectations: negotiating 1280×720 then receiving 854×480
+  // contributes to blank screen. Home enforces BOTH bitrate AND dimensions.
+  const boxWidth = video.width;
+  const boxHeight = video.height;
 
   // Everything transcoded goes through libx264 capped-CRF: constant visual
   // quality up to the bitrate cap, easy scenes undershoot, motion gets the

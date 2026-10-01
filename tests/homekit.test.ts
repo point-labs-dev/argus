@@ -117,14 +117,14 @@ describe("buildLiveFfmpegArgs", () => {
     expect(args).not.toContain("intra-refresh");
   });
 
-  it("downscales starved sessions (relay-obeyed bitrates) inside the negotiated box", () => {
-    // A hub-relayed remote viewer negotiates 720p but obeys Apple's 132k ask —
-    // full 720p at 132k pulsates; 854x480 in the same box is merely soft.
+  it("honors negotiated dimensions at any bitrate (no starved downscaling)", () => {
+    // Field 2026-10-01: downscaling 1280x720 to 854x480 at low bitrate caused
+    // blank screen. Home enforces BOTH bitrate AND dimensions — honor the ask.
     const args = buildLiveFfmpegArgs(
-      liveInput({ video: { ...liveInput().video, maxBitrateKbps: 132 } }),
+      liveInput({ video: { ...liveInput().video, width: 1280, height: 720, maxBitrateKbps: 132 } }),
     ).join(" ");
 
-    expect(args).toContain("scale=854:480:force_original_aspect_ratio=decrease");
+    expect(args).toContain("scale=1280:720:force_original_aspect_ratio=decrease");
     expect(args).toContain("-maxrate 132k");
   });
 
@@ -204,18 +204,18 @@ describe("buildLiveFfmpegArgs", () => {
 });
 
 describe("effectiveBitrateKbps", () => {
-  it("floors Apple's conservative asks per resolution tier", () => {
-    // Measured asks from a real iPhone session (2026-06-11): 299k @720p, 802k
-    // @1080p — visibly starved. Floors are generous LAN rates: every session
-    // is now hi-res (hi-res-only ladder) and quality is the stated goal.
-    expect(effectiveBitrateKbps(1920, 1080, 802)).toBe(3000);
-    expect(effectiveBitrateKbps(1280, 720, 299)).toBe(2000);
-    expect(effectiveBitrateKbps(640, 360, 132)).toBe(600);
-    expect(effectiveBitrateKbps(320, 240, 100)).toBe(300);
+  it("honors the negotiated bitrate exactly (no floors)", () => {
+    // Field 2026-10-01: asked=299k serving=2000k (6.7x over) → Home blank despite
+    // healthy encode. Home ENFORCES its budget; we must honor the negotiation.
+    expect(effectiveBitrateKbps(1920, 1080, 802)).toBe(802);
+    expect(effectiveBitrateKbps(1280, 720, 299)).toBe(299);
+    expect(effectiveBitrateKbps(640, 360, 132)).toBe(132);
+    expect(effectiveBitrateKbps(320, 240, 100)).toBe(100);
   });
 
-  it("honors the negotiated bitrate when it exceeds the floor", () => {
+  it("still honors higher negotiated bitrates when Home allows them", () => {
     expect(effectiveBitrateKbps(1280, 720, 4500)).toBe(4500);
+    expect(effectiveBitrateKbps(1920, 1080, 5000)).toBe(5000);
   });
 });
 
@@ -339,8 +339,8 @@ describe("ArgusStreamingDelegate", () => {
     // Transcode is the default live mode (validated on real devices).
     expect(args.join(" ")).toContain("-c:v libx264");
     expect(args.join(" ")).toContain("scale=1280:720");
-    // Apple asked 299k for 720p (its asks are mush); the floor policy serves 3500k.
-    expect(args.join(" ")).toContain("-maxrate 2000k");
+    // Honor the negotiated bitrate exactly (field 2026-10-01: floor caused blank screen).
+    expect(args.join(" ")).toContain("-maxrate 299k");
     // FFmpeg must encrypt with the CONTROLLER's key from the request (not a
     // generated one), or the device can't decrypt — the forever-spinner bug.
     const expectedVideoSrtp = Buffer.concat([Buffer.alloc(16, 1), Buffer.alloc(14, 2)]).toString("base64");
