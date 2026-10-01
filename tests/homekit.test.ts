@@ -36,7 +36,7 @@ function liveInput(overrides: Partial<LiveFfmpegInput> = {}): LiveFfmpegInput {
       localRtcpPort: 60002,
       ssrc: 2,
       payloadType: 110,
-      codec: 3, // AudioCodecTypes.OPUS
+      codec: "OPUS", // AudioStreamingCodecType.OPUS
       sampleRateKhz: 24,
       maxBitrateKbps: 24,
       srtpParams: "AUDIOKEY==",
@@ -63,8 +63,8 @@ function cacheWith(jpeg: Buffer): SnapshotCache {
 }
 
 describe("buildLiveFfmpegArgs", () => {
-  it("encodes AAC-ELD audio when HomeKit negotiates AAC-ELD (codec=2)", () => {
-    const input = liveInput({ audio: { ...liveInput().audio, codec: 2 } }); // AudioCodecTypes.AAC_ELD = 2
+  it("encodes AAC-ELD audio when HomeKit negotiates AAC-ELD", () => {
+    const input = liveInput({ audio: { ...liveInput().audio, codec: "AAC-eld" } });
     const args = buildLiveFfmpegArgs(input, true);
     const joined = args.join(" ");
 
@@ -78,8 +78,8 @@ describe("buildLiveFfmpegArgs", () => {
     expect(joined).not.toContain("-frame_duration");
   });
 
-  it("encodes Opus audio when HomeKit negotiates Opus (codec=3)", () => {
-    const input = liveInput({ audio: { ...liveInput().audio, codec: 3 } }); // AudioCodecTypes.OPUS = 3
+  it("encodes Opus audio when HomeKit negotiates Opus", () => {
+    const input = liveInput({ audio: { ...liveInput().audio, codec: "OPUS" } });
     const args = buildLiveFfmpegArgs(input, true);
     const joined = args.join(" ");
 

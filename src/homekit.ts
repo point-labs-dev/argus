@@ -96,8 +96,8 @@ export interface LiveFfmpegInput {
       localRtcpPort: number;
       ssrc: number;
       payloadType: number;
-      /** Codec HomeKit negotiated: AudioCodecTypes numeric enum (2=AAC_ELD, 3=OPUS). */
-      codec: number;
+      /** Codec HomeKit negotiated: AudioStreamingCodecType string ("AAC-eld", "OPUS", etc). */
+      codec: AudioStreamingCodecType;
       sampleRateKhz: number;
       maxBitrateKbps: number;
       srtpParams: string;
@@ -262,8 +262,8 @@ export function buildLiveFfmpegArgs(input: LiveFfmpegInput, includeAudio = true)
   // encoder (no libfdk_aac required); Opus uses libopus. Critical to match negotiation
   // or Home waits forever for the expected codec (field 2026-10-01: negotiated AAC-eld,
   // sent Opus → spinner despite video frames).
-  // request.audio.codec is numeric (AudioCodecTypes enum): 2=AAC_ELD, 3=OPUS
-  const isAacEld = audio.codec === AudioCodecTypes.AAC_ELD;
+  // request.audio.codec is AudioStreamingCodecType string: "AAC-eld", "OPUS", etc.
+  const isAacEld = audio.codec === AudioStreamingCodecType.AAC_ELD;
   const audioCodecArgs = isAacEld
     ? [
         "-c:a", "aac",
@@ -598,11 +598,13 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
       request.video.max_bit_rate,
       session.prepared.controllerAddress,
     );
+    // Derive actual encoder from codec for accurate logging
+    const audioEncoder = request.audio.codec === AudioStreamingCodecType.AAC_ELD ? "aac/aac_eld" : "libopus";
     this.logLine(
       `HomeKit negotiated video: ${request.video.width}x${request.video.height}@${request.video.fps} ` +
         `profile=${profile} level=${level} ptype=${request.video.pt} asked=${request.video.max_bit_rate}k serving=${bitrate}k mtu=${request.video.mtu} ` +
         `mode=${this.videoMode} source=${this.pickInputUrl(request.video.width, request.video.height)}; ` +
-        `audio: codec=${request.audio.codec} ${request.audio.sample_rate}kHz ptype=${request.audio.pt} (will encode ${request.audio.codec})`,
+        `audio: codec=${request.audio.codec} ${request.audio.sample_rate}kHz ptype=${request.audio.pt} (encoding ${audioEncoder})`,
     );
 
     const liveInput: LiveFfmpegInput = {
