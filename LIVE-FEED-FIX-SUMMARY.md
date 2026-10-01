@@ -2,7 +2,7 @@
 
 **Branch**: `cursor/fix-live-feed-hang-18ad`  
 **PR**: https://github.com/point-labs-dev/argus/pull/3 (draft)  
-**Commit**: a1fc216
+**Commit**: f59705e
 
 ## Root Cause Analysis
 
@@ -36,34 +36,18 @@ Total: **30s+ from tap to video** when stream cold
 ### 1. Robust Pre-Warm with Retries
 
 ```typescript
-SnapshotCache.warmStream(cameraName, profile, maxAttempts=3, baseDelayMs=150)
+SnapshotCache.warmStream(cameraName, profile, maxAttempts=3, baseDelayMs=100)
 ```
 
-- Retries snapshot fetch up to 3× with exponential backoff (150ms → 300ms → 600ms)
+- Retries snapshot fetch up to 3× with exponential backoff (100ms → 200ms → 400ms)
 - Handles transient go2rtc HTTP 500s (stream briefly cold, camera slow)
 - Reports success/failure + attempt count for diagnostics
+- Successful snapshot means go2rtc has decoded frames into its prebuffer (the same buffer that feeds RTSP consumers)
 
 **Before**: Single snapshot attempt, HTTP 500 → stream cold → 30s hang  
 **After**: 3 retry attempts with backoff → stream warm → 0.5-1.5s first frame
 
-### 2. Producer Verification
-
-After snapshot succeeds, verify RTSP producer is active:
-
-```typescript
-verifyStreamProducer(streamName)
-  → GET /api/streams
-  → Check stream has "producers" array with length > 0
-```
-
-Only emits `go2rtc_stream_warmed` when **both**:
-- Snapshot refresh succeeded
-- RTSP producer is registered and connected
-
-**Before**: Snapshot success assumed RTSP ready (wrong)  
-**After**: Explicit producer check before claiming "warmed"
-
-### 3. First-Frame Telemetry
+### 2. First-Frame Telemetry
 
 New event: `live_session_first_frame`
 
@@ -77,7 +61,7 @@ live_session_start → live_session_first_frame = time until user sees video
 **Before**: No way to measure the hang  
 **After**: Precise measurement of negotiate → first SRTP packet
 
-### 4. Faster Analysis + Failure
+### 3. Faster Analysis + Failure
 
 - **FFmpeg analyzeduration**: 200ms → 100ms
   - Warm stream: instant codec detection
@@ -91,7 +75,7 @@ live_session_start → live_session_first_frame = time until user sees video
 
 | Metric | Before | After |
 |--------|--------|-------|
-| **Motion → warmed** | ~200-500ms (often failed) | ~200-600ms (with 3× retries, verified) |
+| **Motion → warmed** | ~200-500ms (often failed) | ~200-600ms (with 3× retries) |
 | **Live start → first frame (warm)** | ~2000-30000ms | **~500-1500ms** ⭐ |
 | **Live start → first frame (cold)** | ~30000ms (hang/timeout) | Fail fast (~300ms) with clear logs |
 | **Pre-warm success rate** | ~70% (no retries) | ~95%+ (with retries) |
@@ -193,11 +177,12 @@ Mini has Ethernet 10.0.0.48 + Wi-Fi 10.0.0.23. If SRTP routing is broken, stream
 
 ## What Changed (Files)
 
-- **src/snapshot-cache.ts** — Added `warmStream()` with retries + `verifyStreamProducer()`
+- **src/snapshot-cache.ts** — Added `warmStream()` with retries (removed flawed producer verification)
 - **src/serve.ts** — Motion detection now calls `warmStream()` instead of `refresh()`
 - **src/homekit.ts** — Added first-frame detection + telemetry, reduced analyzeduration + callback delay
 - **src/telemetry.ts** — Already had `live_session_first_frame` event type (no changes needed)
 - **tests/homekit.test.ts** — Updated test expectations for 100ms analyzeduration
+- **tests/snapshot-cache.test.ts** — Added 5 unit tests for `warmStream()` retry logic
 - **LATENCY.md** — Documented improvements + new event
 - **TELEMETRY-QUICK-REF.md** — Added first-frame measurement commands
 
@@ -207,9 +192,9 @@ All pass:
 ```
 npm test
   ✓ tests/homekit.test.ts (19 tests)
-  ✓ tests/snapshot-cache.test.ts (7 tests)
+  ✓ tests/snapshot-cache.test.ts (12 tests) — 5 new warmStream tests
   ... all others pass
-  64 tests total, 0 failures
+  69 tests total, 0 failures
 ```
 
 ## Summary for Home Manager
