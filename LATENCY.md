@@ -42,7 +42,7 @@ argus-serve ./argus.yaml 2> argus-telemetry.log
 Parse telemetry events:
 
 ```bash
-grep 'ARGUS_TELEMETRY:' argus.log | jq -s '.'
+grep 'ARGUS_TELEMETRY:' argus.log | sed 's/^.*ARGUS_TELEMETRY: //' | jq -s '.'
 ```
 
 ### Measuring Latency
@@ -50,6 +50,7 @@ grep 'ARGUS_TELEMETRY:' argus.log | jq -s '.'
 **Motion → HomeKit notification:**
 ```bash
 grep 'ARGUS_TELEMETRY:' argus.log | \
+  sed 's/^.*ARGUS_TELEMETRY: //' | \
   jq -r 'select(.camera == "Front Door") | 
          select(.event == "motion_detected" or .event == "homekit_motion_updated") | 
          .timestamp' | \
@@ -59,6 +60,7 @@ grep 'ARGUS_TELEMETRY:' argus.log | \
 **Motion → Live session start:**
 ```bash
 grep 'ARGUS_TELEMETRY:' argus.log | \
+  sed 's/^.*ARGUS_TELEMETRY: //' | \
   jq -r 'select(.camera == "Front Door") | 
          select(.event == "motion_detected" or .event == "live_session_start") | 
          .timestamp' | \
@@ -68,6 +70,7 @@ grep 'ARGUS_TELEMETRY:' argus.log | \
 **Motion → Stream warmed:**
 ```bash
 grep 'ARGUS_TELEMETRY:' argus.log | \
+  sed 's/^.*ARGUS_TELEMETRY: //' | \
   jq -r 'select(.camera == "Front Door") | 
          select(.event == "motion_detected" or .event == "go2rtc_stream_warmed") | 
          .timestamp' | \

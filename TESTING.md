@@ -42,7 +42,7 @@ npm run serve -- ./argus.yaml 2>&1 | tee argus-test.log
 Extract telemetry events:
 
 ```bash
-grep 'ARGUS_TELEMETRY:' argus-test.log > telemetry.jsonl
+grep 'ARGUS_TELEMETRY:' argus-test.log | sed 's/^.*ARGUS_TELEMETRY: //' > telemetry.jsonl
 ```
 
 Check the event sequence for your camera (replace `"Front Door"` with your camera name):
@@ -81,7 +81,7 @@ If **HomeKit → iOS notification** is consistently >5 seconds, the bottleneck i
 ### Analysis
 
 ```bash
-grep 'ARGUS_TELEMETRY:' argus-test.log | jq -r 'select(.camera == "Front Door") | "\(.timestamp) \(.event)"'
+grep 'ARGUS_TELEMETRY:' argus-test.log | sed 's/^.*ARGUS_TELEMETRY: //' | jq -r 'select(.camera == "Front Door") | "\(.timestamp) \(.event)"'
 ```
 
 Expected sequence:
@@ -115,7 +115,7 @@ The improvement from pre-warming is the difference between a cold start (~3-4s) 
 ### Analysis
 
 ```bash
-grep 'ARGUS_TELEMETRY:' argus-test.log | jq -r 'select(.camera == "Front Door") | "\(.timestamp) \(.event)"'
+grep 'ARGUS_TELEMETRY:' argus-test.log | sed 's/^.*ARGUS_TELEMETRY: //' | jq -r 'select(.camera == "Front Door") | "\(.timestamp) \(.event)"'
 ```
 
 Expected sequence:

@@ -30,15 +30,22 @@ export interface TelemetryEvent {
 /**
  * Emit a structured telemetry event. Written to stderr as JSON Lines so it can
  * be filtered/parsed independently of the human-readable stdout logs.
+ * 
+ * Boundary discipline: telemetry must never throw into critical paths (motion
+ * detection, stream start, HKSV recording). All failures are silently swallowed.
  */
 export function emitTelemetry(camera: string, event: TelemetryEventType, metadata?: Record<string, unknown>): void {
-  const entry: TelemetryEvent = {
-    timestamp: Date.now(),
-    camera,
-    event,
-    ...(metadata ? { metadata } : {}),
-  };
-  process.stderr.write(`ARGUS_TELEMETRY: ${JSON.stringify(entry)}\n`);
+  try {
+    const entry: TelemetryEvent = {
+      timestamp: Date.now(),
+      camera,
+      event,
+      ...(metadata ? { metadata } : {}),
+    };
+    process.stderr.write(`ARGUS_TELEMETRY: ${JSON.stringify(entry)}\n`);
+  } catch {
+    // Telemetry failures must never break the hot path
+  }
 }
 
 /**

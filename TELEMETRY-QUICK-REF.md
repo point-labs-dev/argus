@@ -19,30 +19,30 @@ npm run serve -- ./argus.yaml 2>&1 | tee argus.log
 
 ```bash
 # All events
-grep 'ARGUS_TELEMETRY:' argus.log | jq -s '.'
+grep 'ARGUS_TELEMETRY:' argus.log | sed 's/^.*ARGUS_TELEMETRY: //' | jq -s '.'
 
 # Events for one camera
-grep 'ARGUS_TELEMETRY:' argus.log | jq 'select(.camera == "Front Door")'
+grep 'ARGUS_TELEMETRY:' argus.log | sed 's/^.*ARGUS_TELEMETRY: //' | jq 'select(.camera == "Front Door")'
 
 # Just timestamps and event names
-grep 'ARGUS_TELEMETRY:' argus.log | jq -r '"\(.timestamp) \(.event) \(.camera)"'
+grep 'ARGUS_TELEMETRY:' argus.log | sed 's/^.*ARGUS_TELEMETRY: //' | jq -r '"\(.timestamp) \(.event) \(.camera)"'
 ```
 
 ## Measure Latency
 
 ### Motion → HomeKit Updated
 ```bash
-cat argus.log | grep 'ARGUS_TELEMETRY:' | jq -r 'select(.camera == "Front Door") | select(.event == "motion_detected" or .event == "homekit_motion_updated") | .timestamp' | awk 'NR==1{a=$1} NR==2{print ($1-a) "ms"}'
+cat argus.log | grep 'ARGUS_TELEMETRY:' | sed 's/^.*ARGUS_TELEMETRY: //' | jq -r 'select(.camera == "Front Door") | select(.event == "motion_detected" or .event == "homekit_motion_updated") | .timestamp' | awk 'NR==1{a=$1} NR==2{print ($1-a) "ms"}'
 ```
 
 ### Motion → Stream Warmed
 ```bash
-cat argus.log | grep 'ARGUS_TELEMETRY:' | jq -r 'select(.camera == "Front Door") | select(.event == "motion_detected" or .event == "go2rtc_stream_warmed") | .timestamp' | awk 'NR==1{a=$1} NR==2{print ($1-a) "ms"}'
+cat argus.log | grep 'ARGUS_TELEMETRY:' | sed 's/^.*ARGUS_TELEMETRY: //' | jq -r 'select(.camera == "Front Door") | select(.event == "motion_detected" or .event == "go2rtc_stream_warmed") | .timestamp' | awk 'NR==1{a=$1} NR==2{print ($1-a) "ms"}'
 ```
 
 ### Motion → Live Session
 ```bash
-cat argus.log | grep 'ARGUS_TELEMETRY:' | jq -r 'select(.camera == "Front Door") | select(.event == "motion_detected" or .event == "live_session_start") | .timestamp' | awk 'NR==1{a=$1} NR==2{print ($1-a) "ms"}'
+cat argus.log | grep 'ARGUS_TELEMETRY:' | sed 's/^.*ARGUS_TELEMETRY: //' | jq -r 'select(.camera == "Front Door") | select(.event == "motion_detected" or .event == "live_session_start") | .timestamp' | awk 'NR==1{a=$1} NR==2{print ($1-a) "ms"}'
 ```
 
 ## Event Types
@@ -116,6 +116,7 @@ When sharing results, capture:
 ```bash
 # Telemetry for one motion event
 grep 'ARGUS_TELEMETRY:' argus.log | \
+  sed 's/^.*ARGUS_TELEMETRY: //' | \
   jq -r 'select(.camera == "Front Door")' | \
   jq -s 'sort_by(.timestamp) | .[]' > front-door-event.json
 
