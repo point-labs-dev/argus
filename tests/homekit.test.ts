@@ -68,10 +68,9 @@ describe("buildLiveFfmpegArgs", () => {
     const args = buildLiveFfmpegArgs(input, true);
     const joined = args.join(" ");
 
-    // AAC-ELD encoder
-    expect(joined).toContain("-c:a aac");
-    expect(joined).toContain("-profile:a aac_eld");
-    expect(joined).toContain("-q:a 4");
+    // AAC-ELD encoder (aac_at on macOS)
+    expect(joined).toContain("-c:a aac_at");
+    expect(joined).toContain("-aac_at_mode aac_eld");
     // Opus NOT used
     expect(joined).not.toContain("libopus");
     expect(joined).not.toContain("-application lowdelay");
@@ -88,8 +87,8 @@ describe("buildLiveFfmpegArgs", () => {
     expect(joined).toContain("-application lowdelay");
     expect(joined).toContain("-frame_duration 20");
     // AAC-ELD NOT used
-    expect(joined).not.toContain("-c:a aac");
-    expect(joined).not.toContain("-profile:a aac_eld");
+    expect(joined).not.toContain("-c:a aac_at");
+    expect(joined).not.toContain("-aac_at_mode");
   });
 
   it("encodes ≥720p sessions with capped-CRF libx264 and intra-refresh", () => {

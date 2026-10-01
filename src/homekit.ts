@@ -49,8 +49,8 @@ const H264_LEVEL_TO_X264: Record<number, string> = {
 
 // Argus serves HomeKit live view from go2rtc's local RTSP restream. We pull the
 // H.264 sub stream (light, always H.264 on Reolink — no H.265 transcode) and let
-// FFmpeg transcode to the resolution/bitrate HomeKit negotiates. Audio is Opus
-// (HomeKit-supported, and libopus avoids the libfdk_aac/AAC-ELD build dependency).
+// FFmpeg transcode to the resolution/bitrate HomeKit negotiates. Audio uses Opus
+// (universally supported; AAC-ELD requires libfdk_aac which most ffmpeg builds omit).
 
 export interface SrtpParameters {
   /** base64 of the 16-byte key + 14-byte salt that FFmpeg encrypts the outbound stream with. */
@@ -258,19 +258,21 @@ export function buildLiveFfmpegArgs(input: LiveFfmpegInput, includeAudio = true)
     return videoArgs;
   }
 
-  // Audio codec: encode what HomeKit negotiated. AAC-ELD uses ffmpeg's native aac
-  // encoder (no libfdk_aac required); Opus uses libopus. Critical to match negotiation
-  // or Home waits forever for the expected codec (field 2026-10-01: negotiated AAC-eld,
+  // Audio codec: encode what HomeKit negotiated. AAC-ELD uses Apple AudioToolbox
+  // (aac_at on macOS) or libfdk_aac where available; Opus works everywhere. Critical
+  // to match negotiation or Home waits forever (field 2026-10-01: negotiated AAC-eld,
   // sent Opus → spinner despite video frames).
   // request.audio.codec is AudioStreamingCodecType string: "AAC-eld", "OPUS", etc.
   const isAacEld = audio.codec === AudioStreamingCodecType.AAC_ELD;
   const audioCodecArgs = isAacEld
     ? [
-        "-c:a", "aac",
-        "-profile:a", "aac_eld",
-        // AAC-ELD at 24kHz needs low complexity for real-time; q 4-5 is the
-        // "medium" quality band (tradeoff: artifacts vs encode speed).
-        "-q:a", "4",
+        // aac_at (Apple AudioToolbox) is the macOS-native AAC encoder with proper
+        // AAC-ELD support. profile:a aac_eld works on macOS; on Linux without
+        // libfdk_aac, controller should advertise Opus-only to avoid negotiating
+        // a codec we can't encode. aac_eld profile_level 1 = AAC-ELD (vs 2=LD).
+        "-c:a", "aac_at",
+        "-aac_at_mode", "aac_eld",
+        "-b:a", `${audio.maxBitrateKbps}k`,
       ]
     : [
         "-c:a", "libopus",
@@ -599,7 +601,7 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
       session.prepared.controllerAddress,
     );
     // Derive actual encoder from codec for accurate logging
-    const audioEncoder = request.audio.codec === AudioStreamingCodecType.AAC_ELD ? "aac/aac_eld" : "libopus";
+    const audioEncoder = request.audio.codec === AudioStreamingCodecType.AAC_ELD ? "aac_at/aac_eld" : "libopus";
     this.logLine(
       `HomeKit negotiated video: ${request.video.width}x${request.video.height}@${request.video.fps} ` +
         `profile=${profile} level=${level} ptype=${request.video.pt} asked=${request.video.max_bit_rate}k serving=${bitrate}k mtu=${request.video.mtu} ` +
