@@ -2,7 +2,7 @@
 
 **Branch**: `cursor/fix-live-feed-hang-18ad`  
 **PR**: https://github.com/point-labs-dev/argus/pull/3 (draft)  
-**Commit**: 12f28ca
+**Latest commit**: Audio codec matching fix
 
 ## Root Cause Analysis
 
@@ -47,7 +47,25 @@ SnapshotCache.warmStream(cameraName, profile, maxAttempts=3, baseDelayMs=100)
 **Before**: Single snapshot attempt, HTTP 500 → stream cold → 30s hang  
 **After**: 3 retry attempts with backoff → stream warm → 0.5-1.5s first frame
 
-### 2. First-Frame Telemetry
+### 2. Audio Codec Matching (SHA `[current]`)
+
+**Field evidence**: After SHA `9da3966`, first_frame telemetry fired (~1290ms), progress output worked, no decoder floods — but Home **still showed spinner/black screen**.
+
+**Root cause**: Audio codec mismatch
+- HomeKit negotiated `audio: codec=AAC-eld` (AudioCodecTypes enum value 2)
+- FFmpeg hardcoded `-c:a libopus` regardless of negotiation
+- Home receives Opus audio while expecting AAC-ELD → A/V sync stalls → video never renders
+
+**Fix**:
+1. Pass `request.audio.codec` through `LiveFfmpegInput` interface
+2. Conditionally encode matching codec:
+   - AAC-ELD (codec=2): `-c:a aac -profile:a aac_eld -q:a 4`
+   - Opus (codec=3): `-c:a libopus -application lowdelay -frame_duration 20`
+3. Advertise both AAC-ELD and Opus in `buildCameraControllerOptions` (HomeKit picks based on device/network)
+
+**Tests**: Added unit tests for AAC-ELD vs Opus codec selection (71/71 pass)
+
+### 3. First-Frame Telemetry
 
 New event: `live_session_first_frame`
 

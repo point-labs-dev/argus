@@ -5,6 +5,7 @@ import { networkInterfaces } from "node:os";
 
 import {
   Accessory,
+  AudioCodecTypes,
   AudioStreamingCodecType,
   AudioStreamingSamplerate,
   CameraController,
@@ -90,15 +91,17 @@ export interface LiveFfmpegInput {
     level: string;
     srtpParams: string;
   };
-  audio: {
-    port: number;
-    localRtcpPort: number;
-    ssrc: number;
-    payloadType: number;
-    sampleRateKhz: number;
-    maxBitrateKbps: number;
-    srtpParams: string;
-  };
+    audio: {
+      port: number;
+      localRtcpPort: number;
+      ssrc: number;
+      payloadType: number;
+      /** Codec HomeKit negotiated: AudioCodecTypes numeric enum (2=AAC_ELD, 3=OPUS). */
+      codec: number;
+      sampleRateKhz: number;
+      maxBitrateKbps: number;
+      srtpParams: string;
+    };
 }
 
 /**
@@ -255,13 +258,31 @@ export function buildLiveFfmpegArgs(input: LiveFfmpegInput, includeAudio = true)
     return videoArgs;
   }
 
+  // Audio codec: encode what HomeKit negotiated. AAC-ELD uses ffmpeg's native aac
+  // encoder (no libfdk_aac required); Opus uses libopus. Critical to match negotiation
+  // or Home waits forever for the expected codec (field 2026-10-01: negotiated AAC-eld,
+  // sent Opus → spinner despite video frames).
+  // request.audio.codec is numeric (AudioCodecTypes enum): 2=AAC_ELD, 3=OPUS
+  const isAacEld = audio.codec === AudioCodecTypes.AAC_ELD;
+  const audioCodecArgs = isAacEld
+    ? [
+        "-c:a", "aac",
+        "-profile:a", "aac_eld",
+        // AAC-ELD at 24kHz needs low complexity for real-time; q 4-5 is the
+        // "medium" quality band (tradeoff: artifacts vs encode speed).
+        "-q:a", "4",
+      ]
+    : [
+        "-c:a", "libopus",
+        "-application", "lowdelay",
+        "-frame_duration", "20",
+      ];
+
   return [
     ...videoArgs,
-    // --- audio: transcode to Opus, SRTP out ---
+    // --- audio: transcode to negotiated codec, SRTP out ---
     "-vn",
-    "-c:a", "libopus",
-    "-application", "lowdelay",
-    "-frame_duration", "20",
+    ...audioCodecArgs,
     // SYNTHETIC audio clock: regenerate pts from the cumulative sample count,
     // discarding the camera's wobbly timestamps entirely. The video leg
     // already gets a steady clock from the -r CFR grid; audio passing the
@@ -581,7 +602,7 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
       `HomeKit negotiated video: ${request.video.width}x${request.video.height}@${request.video.fps} ` +
         `profile=${profile} level=${level} ptype=${request.video.pt} asked=${request.video.max_bit_rate}k serving=${bitrate}k mtu=${request.video.mtu} ` +
         `mode=${this.videoMode} source=${this.pickInputUrl(request.video.width, request.video.height)}; ` +
-        `audio: codec=${request.audio.codec} ${request.audio.sample_rate}kHz ptype=${request.audio.pt}`,
+        `audio: codec=${request.audio.codec} ${request.audio.sample_rate}kHz ptype=${request.audio.pt} (will encode ${request.audio.codec})`,
     );
 
     const liveInput: LiveFfmpegInput = {
@@ -607,6 +628,7 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
         localRtcpPort: session.prepared.audio.localRtcpPort,
         ssrc: session.prepared.audio.ssrc,
         payloadType: request.audio.pt,
+        codec: request.audio.codec,
         sampleRateKhz: request.audio.sample_rate,
         maxBitrateKbps: request.audio.max_bit_rate,
         srtpParams: session.prepared.audio.srtpParams,
@@ -761,9 +783,14 @@ export function buildCameraControllerOptions(
       },
       // Omitting audio entirely makes HomeKit treat this as a video-only camera —
       // useful for isolating whether audio negotiation is what stalls a session.
+      // Advertise both AAC-ELD and Opus (Apple's preferred + our original). HomeKit
+      // picks based on device/network: AAC-ELD often chosen by iOS, Opus by others.
       audio: {
         codecs: includeAudio
-          ? [{ type: AudioStreamingCodecType.OPUS, samplerate: AudioStreamingSamplerate.KHZ_24 }]
+          ? [
+              { type: AudioStreamingCodecType.AAC_ELD, samplerate: AudioStreamingSamplerate.KHZ_24 },
+              { type: AudioStreamingCodecType.OPUS, samplerate: AudioStreamingSamplerate.KHZ_24 },
+            ]
           : [],
       },
     },

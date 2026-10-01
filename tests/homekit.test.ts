@@ -36,6 +36,7 @@ function liveInput(overrides: Partial<LiveFfmpegInput> = {}): LiveFfmpegInput {
       localRtcpPort: 60002,
       ssrc: 2,
       payloadType: 110,
+      codec: 3, // AudioCodecTypes.OPUS
       sampleRateKhz: 24,
       maxBitrateKbps: 24,
       srtpParams: "AUDIOKEY==",
@@ -62,6 +63,35 @@ function cacheWith(jpeg: Buffer): SnapshotCache {
 }
 
 describe("buildLiveFfmpegArgs", () => {
+  it("encodes AAC-ELD audio when HomeKit negotiates AAC-ELD (codec=2)", () => {
+    const input = liveInput({ audio: { ...liveInput().audio, codec: 2 } }); // AudioCodecTypes.AAC_ELD = 2
+    const args = buildLiveFfmpegArgs(input, true);
+    const joined = args.join(" ");
+
+    // AAC-ELD encoder
+    expect(joined).toContain("-c:a aac");
+    expect(joined).toContain("-profile:a aac_eld");
+    expect(joined).toContain("-q:a 4");
+    // Opus NOT used
+    expect(joined).not.toContain("libopus");
+    expect(joined).not.toContain("-application lowdelay");
+    expect(joined).not.toContain("-frame_duration");
+  });
+
+  it("encodes Opus audio when HomeKit negotiates Opus (codec=3)", () => {
+    const input = liveInput({ audio: { ...liveInput().audio, codec: 3 } }); // AudioCodecTypes.OPUS = 3
+    const args = buildLiveFfmpegArgs(input, true);
+    const joined = args.join(" ");
+
+    // Opus encoder
+    expect(joined).toContain("-c:a libopus");
+    expect(joined).toContain("-application lowdelay");
+    expect(joined).toContain("-frame_duration 20");
+    // AAC-ELD NOT used
+    expect(joined).not.toContain("-c:a aac");
+    expect(joined).not.toContain("-profile:a aac_eld");
+  });
+
   it("encodes ≥720p sessions with capped-CRF libx264 and intra-refresh", () => {
     // 3500k = the post-floor bitrate a LAN 720p session actually arrives with
     // (the delegate floors before building args; sub-800k here means a
@@ -207,7 +237,7 @@ describe("resolveSrtpTargetAddress", () => {
 });
 
 describe("buildCameraControllerOptions", () => {
-  it("advertises the HomeKit-required crypto suite, H.264 levels, and Opus audio", () => {
+  it("advertises the HomeKit-required crypto suite, H.264 levels, and AAC-ELD + Opus audio", () => {
     const delegate = new ArgusStreamingDelegate("Backyard Left", "rtsp://x", cacheWith(Buffer.from([0xff, 0xd8])));
     const opts = buildCameraControllerOptions(delegate);
 
@@ -215,7 +245,10 @@ describe("buildCameraControllerOptions", () => {
     expect(opts.streamingOptions.supportedCryptoSuites).toContain(0); // AES_CM_128_HMAC_SHA1_80
     const resolutions = opts.streamingOptions.video.resolutions.map((r) => `${r[0]}x${r[1]}`);
     expect(resolutions).toContain("1280x720");
-    expect(opts.streamingOptions.audio?.codecs?.[0]?.type).toBe("OPUS");
+    // Advertise both AAC-ELD (Apple's preference) and Opus
+    expect(opts.streamingOptions.audio?.codecs).toHaveLength(2);
+    expect(opts.streamingOptions.audio?.codecs?.[0]?.type).toBe("AAC-eld");
+    expect(opts.streamingOptions.audio?.codecs?.[1]?.type).toBe("OPUS");
   });
 
   it("advertises ONLY the native resolution in copy mode (mismatch kills the session)", () => {
