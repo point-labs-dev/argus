@@ -49,8 +49,8 @@ const H264_LEVEL_TO_X264: Record<number, string> = {
 
 // Argus serves HomeKit live view from go2rtc's local RTSP restream. We pull the
 // H.264 sub stream (light, always H.264 on Reolink — no H.265 transcode) and let
-// FFmpeg transcode to the resolution/bitrate HomeKit negotiates. Audio uses Opus
-// (universally supported; AAC-ELD requires libfdk_aac which most ffmpeg builds omit).
+// FFmpeg transcode to the resolution/bitrate HomeKit negotiates. Audio: AAC-ELD when
+// negotiated (requires libfdk_aac — use ffmpeg-homebridge via ARGUS_FFMPEG), else Opus.
 
 export interface SrtpParameters {
   /** base64 of the 16-byte key + 14-byte salt that FFmpeg encrypts the outbound stream with. */
@@ -258,20 +258,21 @@ export function buildLiveFfmpegArgs(input: LiveFfmpegInput, includeAudio = true)
     return videoArgs;
   }
 
-  // Audio codec: encode what HomeKit negotiated. AAC-ELD uses Apple AudioToolbox
-  // (aac_at on macOS) or libfdk_aac where available; Opus works everywhere. Critical
-  // to match negotiation or Home waits forever (field 2026-10-01: negotiated AAC-eld,
-  // sent Opus → spinner despite video frames).
+  // Audio codec: encode what HomeKit negotiated. AAC-ELD requires libfdk_aac
+  // (Homebrew ffmpeg-for-homebridge has it; stock builds don't). Opus works
+  // everywhere. Critical to match negotiation or Home waits forever (field
+  // 2026-10-01: negotiated AAC-eld, sent Opus → spinner despite video frames).
   // request.audio.codec is AudioStreamingCodecType string: "AAC-eld", "OPUS", etc.
   const isAacEld = audio.codec === AudioStreamingCodecType.AAC_ELD;
   const audioCodecArgs = isAacEld
     ? [
-        // aac_at (Apple AudioToolbox) is the macOS-native AAC encoder with proper
-        // AAC-ELD support. profile:a aac_eld works on macOS; on Linux without
-        // libfdk_aac, controller should advertise Opus-only to avoid negotiating
-        // a codec we can't encode. aac_eld profile_level 1 = AAC-ELD (vs 2=LD).
-        "-c:a", "aac_at",
-        "-aac_at_mode", "aac_eld",
+        // libfdk_aac is the only reliable AAC-ELD encoder (native aac fails
+        // "Profile not supported!", aac_at doesn't expose ELD cleanly). Needs
+        // +global_header for RTP streaming. Mini uses ffmpeg-homebridge binary
+        // with libfdk_aac via ARGUS_FFMPEG env var.
+        "-c:a", "libfdk_aac",
+        "-profile:a", "aac_eld",
+        "-flags", "+global_header",
         "-b:a", `${audio.maxBitrateKbps}k`,
       ]
     : [
@@ -601,7 +602,7 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
       session.prepared.controllerAddress,
     );
     // Derive actual encoder from codec for accurate logging
-    const audioEncoder = request.audio.codec === AudioStreamingCodecType.AAC_ELD ? "aac_at/aac_eld" : "libopus";
+    const audioEncoder = request.audio.codec === AudioStreamingCodecType.AAC_ELD ? "libfdk_aac/aac_eld" : "libopus";
     this.logLine(
       `HomeKit negotiated video: ${request.video.width}x${request.video.height}@${request.video.fps} ` +
         `profile=${profile} level=${level} ptype=${request.video.pt} asked=${request.video.max_bit_rate}k serving=${bitrate}k mtu=${request.video.mtu} ` +

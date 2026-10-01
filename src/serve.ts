@@ -103,6 +103,7 @@ export async function startArgusServer(config: ArgusConfig, configDir = process.
     const { accessory, setMotion } = createCameraAccessory(camera, liveUrl, mainUrl, cache, {
       includeAudio,
       videoMode,
+      ...(process.env.ARGUS_FFMPEG ? { ffmpegPath: process.env.ARGUS_FFMPEG } : {}),
       // HomeKit snapshot requests serve the full-res main-stream stills the
       // cache polls — the 640-wide sub stills read as "pixelated" on the grid.
       snapshotProfile: "main",
