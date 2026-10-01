@@ -14,6 +14,7 @@ import {
 } from "hap-nodejs";
 
 import { readFragmentedMp4 } from "./mp4.js";
+import { emitTelemetry } from "./telemetry.js";
 
 const PROFILE_TO_X264: Record<number, string> = {
   [H264Profile.BASELINE]: "baseline",
@@ -167,6 +168,11 @@ export class ArgusRecordingDelegate implements CameraRecordingDelegate {
       return;
     }
 
+    emitTelemetry(this.cameraName, "hksv_recording_start", {
+      streamId,
+      resolution: config.videoCodec.resolution,
+    });
+
     const args = buildRecordingFfmpegArgs(this.mainUrl, config);
     if (this.verbose) {
       process.stderr.write(`[argus ${this.cameraName}] HKSV recording ${config.videoCodec.resolution.join("x")} -> ffmpeg ${args.join(" ")}\n`);
@@ -193,6 +199,7 @@ export class ArgusRecordingDelegate implements CameraRecordingDelegate {
         yield { data: pending, isLast: true };
       }
     } finally {
+      emitTelemetry(this.cameraName, "hksv_recording_stop", { streamId });
       ffmpeg.kill("SIGKILL");
       this.processes.delete(streamId);
     }

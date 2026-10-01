@@ -30,6 +30,7 @@ import {
 import type { CameraConfig } from "./config.js";
 import { ArgusRecordingDelegate, buildRecordingOptions } from "./recording.js";
 import type { SnapshotCache, SnapshotProfile } from "./snapshot-cache.js";
+import { emitTelemetry } from "./telemetry.js";
 
 // HomeKit negotiates ONE H.264 profile/level during stream setup and rejects video
 // encoded outside it (the device receives SRTP but can't decode → forever-spinner).
@@ -487,10 +488,17 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
 
   public handleStreamRequest(request: StreamingRequest, callback: StreamRequestCallback): void {
     if (request.type === StreamRequestTypes.START) {
+      emitTelemetry(this.cameraName, "live_session_start", {
+        sessionId: request.sessionID,
+        width: request.video.width,
+        height: request.video.height,
+        fps: request.video.fps,
+      });
       this.startStream(request, callback);
       return;
     }
     if (request.type === StreamRequestTypes.STOP) {
+      emitTelemetry(this.cameraName, "live_session_stop", { sessionId: request.sessionID });
       this.stopStream(request.sessionID);
       callback();
       return;

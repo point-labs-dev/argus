@@ -13,6 +13,7 @@ import { startGo2Rtc, type Go2RtcSupervisor } from "./go2rtc-supervisor.js";
 import { createCameraAccessory } from "./homekit.js";
 import { MotionMonitor } from "./motion.js";
 import { parseJpegDimensions, SnapshotCache } from "./snapshot-cache.js";
+import { emitTelemetry } from "./telemetry.js";
 
 const HOMEKIT_PORT_BASE = 51200;
 const RTSP_RESTREAM_BASE = "rtsp://127.0.0.1:8554";
@@ -131,7 +132,25 @@ export async function startArgusServer(config: ArgusConfig, configDir = process.
     config.cameras,
     (cameraName, detected) => {
       setMotionByCamera.get(cameraName)?.(detected);
+      emitTelemetry(cameraName, "homekit_motion_updated", { detected });
       process.stdout.write(`[argus ${cameraName}] motion ${detected ? "DETECTED" : "cleared"}\n`);
+      
+      // Pre-warm streams on motion detection: immediately refresh both main and sub
+      // snapshots so go2rtc has fresh frames ready when a live session opens. This
+      // reduces cold-start latency (the first keyframe wait) by ensuring the producer
+      // is active and buffered before the viewer taps the tile.
+      if (detected) {
+        void cache.refresh(cameraName, "main").catch((error: unknown) => {
+          const message = error instanceof Error ? error.message : String(error);
+          process.stderr.write(`[argus ${cameraName}] stream pre-warm (main) failed: ${message}\n`);
+        });
+        void cache.refresh(cameraName, "sub").then(() => {
+          emitTelemetry(cameraName, "go2rtc_stream_warmed");
+        }).catch((error: unknown) => {
+          const message = error instanceof Error ? error.message : String(error);
+          process.stderr.write(`[argus ${cameraName}] stream pre-warm (sub) failed: ${message}\n`);
+        });
+      }
     },
     { onError: (cameraName, error) => process.stderr.write(`[argus ${cameraName}] motion poll error: ${error.message}\n`) },
   );
