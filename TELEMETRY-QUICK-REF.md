@@ -56,7 +56,7 @@ cat argus.log | grep 'ARGUS_TELEMETRY:' | sed 's/^.*ARGUS_TELEMETRY: //' | jq -r
 |-------|------|------------|
 | `motion_detected` | Reolink reports motion | Start of pipeline |
 | `homekit_motion_updated` | HomeKit characteristic updated | <1100ms after motion |
-| `go2rtc_stream_warmed` | Pre-warm snapshot complete + producer verified | <500ms after motion |
+| `go2rtc_stream_warmed` | Pre-warm snapshot complete (with retries) | <500ms after motion |
 | `live_session_start` | User tapped tile/notification | User-dependent |
 | `live_session_first_frame` | FFmpeg outputs first encoded frame | <2000ms after session start |
 | `live_session_stop` | User closed view | — |
@@ -69,7 +69,7 @@ cat argus.log | grep 'ARGUS_TELEMETRY:' | sed 's/^.*ARGUS_TELEMETRY: //' | jq -r
 ```
 0ms:    motion_detected               <- Reolink API
 50ms:   homekit_motion_updated        <- Argus → HomeKit
-200ms:  go2rtc_stream_warmed          <- Snapshot + producer verified (with retries)
+200ms:  go2rtc_stream_warmed          <- Snapshot refresh complete (with retries)
 ???:    (iOS notification)             <- Apple push (0.5-15s, not measurable)
 ???:    live_session_start             <- User tapped notification
 +500ms: live_session_first_frame      <- FFmpeg outputs first SRTP packet

@@ -136,7 +136,7 @@ export async function startArgusServer(config: ArgusConfig, configDir = process.
       process.stdout.write(`[argus ${cameraName}] motion ${detected ? "DETECTED" : "cleared"}\n`);
       
       // Pre-warm streams on motion detection: immediately refresh both main and sub
-      // snapshots WITH RETRIES so go2rtc's producers are actually ready when a live
+      // snapshots WITH RETRIES so go2rtc's prebuffer has recent frames when a live
       // session opens. Retries handle transient go2rtc 500s (stream briefly cold,
       // camera slow to respond). Both profiles warm in parallel; telemetry waits for
       // the sub (live source for tiles/<720p) to confirm readiness.
