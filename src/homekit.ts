@@ -131,6 +131,11 @@ export function buildLiveFfmpegArgs(input: LiveFfmpegInput, includeAudio = true)
 
   const hiResSession = video.width >= 1280 || video.height >= 720;
 
+  // Progress reporting to stderr (pipe:2) for first-frame telemetry. Works with
+  // -loglevel error: progress is always emitted regardless of loglevel, letting us
+  // detect frame=1 without switching to a noisier log level.
+  const progressArgs = ["-progress", "pipe:2"];
+
   // Keyframe strategy: periodic IDRs (1s tiles / 2s hi-res). Intra-refresh
   // was tried 2026-06-12 (flat bitrate — no keyframe burst pulse, no trampled
   // audio) and reverted the same evening: a session's ONLY IDR is its first
@@ -210,7 +215,12 @@ export function buildLiveFfmpegArgs(input: LiveFfmpegInput, includeAudio = true)
   const videoArgs = [
     "-hide_banner",
     "-loglevel", "error",
-    "-fflags", "nobuffer",
+    ...progressArgs,
+    // Resilience flags for corrupt/incomplete input from go2rtc RTSP. Field evidence
+    // (2026-10-01): "Error submitting packet to decoder: Invalid data" floods during
+    // live sessions — go2rtc RTSP sends bad h264 mid-stream. These flags let FFmpeg
+    // discard corrupt packets and regenerate timestamps rather than aborting.
+    "-fflags", "+discardcorrupt+genpts+nobuffer",
     "-flags", "low_delay",
     ...analyzeArgs,
     // SOFTWARE decode only. -hwaccel videotoolbox was tried 2026-06-12 and
@@ -222,6 +232,7 @@ export function buildLiveFfmpegArgs(input: LiveFfmpegInput, includeAudio = true)
     // STOP at 30s). Software decode of a 2560x1920 main is ~0.3 core and
     // never exhausts.
     "-rtsp_transport", "tcp",
+    "-err_detect", "ignore_err",
     "-i", inputUrl,
 
     // --- video: SRTP out ---
@@ -621,9 +632,11 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
     const ffmpeg = this.spawnFn(this.ffmpegPath, args, { stdio: ["ignore", "ignore", "pipe"] });
     session.ffmpeg = ffmpeg;
 
-    // Detect first frame from FFmpeg stderr. FFmpeg outputs progress like "frame= 1 fps=..."
-    // when it encodes frames. Emit telemetry on the FIRST frame output (measures negotiate
-    // → first SRTP packet sent — the "hang" Peter sees is before this event).
+    // Detect first frame from FFmpeg progress output (pipe:2 → stderr). Progress format:
+    // "frame=N\nfps=...\n..." with frame=0 first, then frame=1 when first encode completes.
+    // This works with -loglevel error (progress always emitted) unlike the frame= STATUS
+    // lines which require info/verbose. Emit telemetry on frame≥1 (measures negotiate →
+    // first SRTP packet sent — the "hang" Peter sees is before this event).
     let firstFrameEmitted = false;
     const stderrBuffer: string[] = [];
     ffmpeg.stderr?.on("data", (chunk: Buffer) => {
@@ -634,7 +647,9 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
       
       log(`ffmpeg: ${text.trimEnd()}`);
       
-      if (!firstFrameEmitted && /frame=\s*[1-9]/.test(text)) {
+      // Parse progress format: "frame=N" on its own line. Detect frame≥1 (frame=0 is the
+      // pre-encode state; frame=1 means first packet encoded and sent).
+      if (!firstFrameEmitted && /^frame=([1-9]\d*)$/m.test(text)) {
         firstFrameEmitted = true;
         emitTelemetry(this.cameraName, "live_session_first_frame", { sessionId: sessionID });
       }

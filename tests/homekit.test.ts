@@ -148,11 +148,14 @@ describe("buildLiveFfmpegArgs", () => {
     // Low-latency flags must come BEFORE -i to apply to the input. Reduced to 100ms
     // (2026-10-01): when pre-warming works, go2rtc's producer is ready and codec detection
     // is instant. Faster analysis = faster first frame when warm, faster failure when cold.
+    // Also includes error resilience flags (+discardcorrupt+genpts) for corrupt go2rtc input.
     const inputIndex = args.indexOf("-i");
     const head = args.slice(0, inputIndex).join(" ");
-    expect(head).toContain("-fflags nobuffer");
+    expect(head).toContain("-progress pipe:2");
+    expect(head).toContain("-fflags +discardcorrupt+genpts+nobuffer");
     expect(head).toContain("-probesize 100000");
     expect(head).toContain("-analyzeduration 100000");
+    expect(head).toContain("-err_detect ignore_err");
   });
 
   it("targets the device address with matching SRTP params and SSRCs", () => {

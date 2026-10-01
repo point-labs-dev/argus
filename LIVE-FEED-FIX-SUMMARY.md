@@ -2,7 +2,7 @@
 
 **Branch**: `cursor/fix-live-feed-hang-18ad`  
 **PR**: https://github.com/point-labs-dev/argus/pull/3 (draft)  
-**Commit**: f59705e
+**Commit**: 12f28ca
 
 ## Root Cause Analysis
 
