@@ -131,9 +131,9 @@ describe("buildLiveFfmpegArgs", () => {
     expect(args).not.toContain("scale=");
     expect(args).not.toContain("-force_key_frames");
     expect(args).not.toContain("-b:v");
-    // Copy trims input analysis to ~0.2s — every analysis ms delays the keyframe
-    // that stream-copy waits for (bench 2026-06-11: 1s analysis ≈ +1s start).
-    expect(args).toContain("-analyzeduration 200000");
+    // Copy trims input analysis to 100ms — when stream is pre-warmed, faster analysis
+    // means faster first frame out. Fails fast when stream is cold (bench 2026-10-01).
+    expect(args).toContain("-analyzeduration 100000");
     expect(args).toContain("-probesize 100000");
     // Audio is still transcoded to Opus, and SRTP targeting is unchanged.
     expect(args).toContain("-c:a libopus");
@@ -145,14 +145,14 @@ describe("buildLiveFfmpegArgs", () => {
 
   it("caps RTSP input analysis so the stream starts fast (else HomeKit times out)", () => {
     const args = buildLiveFfmpegArgs(liveInput());
-    // Low-latency flags must come BEFORE -i to apply to the input. 0.2s analysis
-    // is bench-validated for transcode too (2026-06-11: 1s of analysis was 1s of
-    // start latency; AAC detection stayed reliable at 0.2s/100k).
+    // Low-latency flags must come BEFORE -i to apply to the input. Reduced to 100ms
+    // (2026-10-01): when pre-warming works, go2rtc's producer is ready and codec detection
+    // is instant. Faster analysis = faster first frame when warm, faster failure when cold.
     const inputIndex = args.indexOf("-i");
     const head = args.slice(0, inputIndex).join(" ");
     expect(head).toContain("-fflags nobuffer");
     expect(head).toContain("-probesize 100000");
-    expect(head).toContain("-analyzeduration 200000");
+    expect(head).toContain("-analyzeduration 100000");
   });
 
   it("targets the device address with matching SRTP params and SSRCs", () => {

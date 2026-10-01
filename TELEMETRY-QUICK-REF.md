@@ -45,14 +45,20 @@ cat argus.log | grep 'ARGUS_TELEMETRY:' | sed 's/^.*ARGUS_TELEMETRY: //' | jq -r
 cat argus.log | grep 'ARGUS_TELEMETRY:' | sed 's/^.*ARGUS_TELEMETRY: //' | jq -r 'select(.camera == "Front Door") | select(.event == "motion_detected" or .event == "live_session_start") | .timestamp' | awk 'NR==1{a=$1} NR==2{print ($1-a) "ms"}'
 ```
 
+### Live Session Start → First Frame
+```bash
+cat argus.log | grep 'ARGUS_TELEMETRY:' | sed 's/^.*ARGUS_TELEMETRY: //' | jq -r 'select(.camera == "Front Door") | select(.event == "live_session_start" or .event == "live_session_first_frame") | .timestamp' | awk 'NR==1{a=$1} NR==2{print ($1-a) "ms"}'
+```
+
 ## Event Types
 
 | Event | When | Good Value |
 |-------|------|------------|
 | `motion_detected` | Reolink reports motion | Start of pipeline |
 | `homekit_motion_updated` | HomeKit characteristic updated | <1100ms after motion |
-| `go2rtc_stream_warmed` | Pre-warm snapshot complete | <500ms after motion |
+| `go2rtc_stream_warmed` | Pre-warm snapshot complete + producer verified | <500ms after motion |
 | `live_session_start` | User tapped tile/notification | User-dependent |
+| `live_session_first_frame` | FFmpeg outputs first encoded frame | <2000ms after session start |
 | `live_session_stop` | User closed view | — |
 | `hksv_recording_start` | Home Hub requested clip | Shortly after motion |
 | `hksv_recording_stop` | HKSV clip complete | — |
@@ -61,12 +67,12 @@ cat argus.log | grep 'ARGUS_TELEMETRY:' | sed 's/^.*ARGUS_TELEMETRY: //' | jq -r
 ## Expected Timeline
 
 ```
-0ms:    motion_detected          <- Reolink API
-50ms:   homekit_motion_updated   <- Argus → HomeKit
-200ms:  go2rtc_stream_warmed     <- Snapshot refresh complete
-???:    (iOS notification)        <- Apple push (0.5-15s, not measurable)
-???:    live_session_start        <- User tapped notification
-+1-2s:  (first frame)             <- With pre-warming
+0ms:    motion_detected               <- Reolink API
+50ms:   homekit_motion_updated        <- Argus → HomeKit
+200ms:  go2rtc_stream_warmed          <- Snapshot + producer verified (with retries)
+???:    (iOS notification)             <- Apple push (0.5-15s, not measurable)
+???:    live_session_start             <- User tapped notification
++500ms: live_session_first_frame      <- FFmpeg outputs first SRTP packet
 ```
 
 ## Common Patterns
@@ -77,8 +83,9 @@ cat argus.log | grep 'ARGUS_TELEMETRY:' | sed 's/^.*ARGUS_TELEMETRY: //' | jq -r
 {"timestamp":1042,"camera":"Front Door","event":"homekit_motion_updated","metadata":{"detected":true}}
 {"timestamp":1220,"camera":"Front Door","event":"go2rtc_stream_warmed"}
 {"timestamp":5300,"camera":"Front Door","event":"live_session_start","metadata":{"sessionId":"abc","width":1280,"height":720,"fps":30}}
+{"timestamp":5750,"camera":"Front Door","event":"live_session_first_frame","metadata":{"sessionId":"abc"}}
 ```
-**Good:** Motion→HomeKit=42ms, Motion→Warmed=220ms, User tapped at 5.3s
+**Good:** Motion→HomeKit=42ms, Motion→Warmed=220ms, User tapped at 5.3s, First frame 450ms later
 
 ### HKSV Recording
 ```json

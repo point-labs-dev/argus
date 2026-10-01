@@ -136,19 +136,28 @@ export async function startArgusServer(config: ArgusConfig, configDir = process.
       process.stdout.write(`[argus ${cameraName}] motion ${detected ? "DETECTED" : "cleared"}\n`);
       
       // Pre-warm streams on motion detection: immediately refresh both main and sub
-      // snapshots so go2rtc has fresh frames ready when a live session opens. This
-      // reduces cold-start latency (the first keyframe wait) by ensuring the producer
-      // is active and buffered before the viewer taps the tile.
+      // snapshots WITH RETRIES so go2rtc's producers are actually ready when a live
+      // session opens. Retries handle transient go2rtc 500s (stream briefly cold,
+      // camera slow to respond). Both profiles warm in parallel; telemetry waits for
+      // the sub (live source for tiles/<720p) to confirm readiness.
       if (detected) {
-        void cache.refresh(cameraName, "main").catch((error: unknown) => {
-          const message = error instanceof Error ? error.message : String(error);
-          process.stderr.write(`[argus ${cameraName}] stream pre-warm (main) failed: ${message}\n`);
+        void cache.warmStream(cameraName, "main", 3, 150).then((result) => {
+          if (!result.success) {
+            const message = result.error?.message ?? "unknown error";
+            process.stderr.write(
+              `[argus ${cameraName}] stream pre-warm (main) failed after ${result.attempts} attempts: ${message}\n`,
+            );
+          }
         });
-        void cache.refresh(cameraName, "sub").then(() => {
-          emitTelemetry(cameraName, "go2rtc_stream_warmed");
-        }).catch((error: unknown) => {
-          const message = error instanceof Error ? error.message : String(error);
-          process.stderr.write(`[argus ${cameraName}] stream pre-warm (sub) failed: ${message}\n`);
+        void cache.warmStream(cameraName, "sub", 3, 150).then((result) => {
+          if (result.success) {
+            emitTelemetry(cameraName, "go2rtc_stream_warmed");
+          } else {
+            const message = result.error?.message ?? "unknown error";
+            process.stderr.write(
+              `[argus ${cameraName}] stream pre-warm (sub) failed after ${result.attempts} attempts: ${message}\n`,
+            );
+          }
         });
       }
     },

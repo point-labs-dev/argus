@@ -146,6 +146,71 @@ export class SnapshotCache {
     return snapshot;
   }
 
+  /**
+   * Pre-warm a stream with retries: used on motion detection to ensure go2rtc's
+   * producer is actually ready before a viewer opens live. Retries up to maxAttempts
+   * on failure (5xx, timeout) with exponential backoff.
+   */
+  public async warmStream(
+    cameraName: string,
+    profile: SnapshotProfile = this.defaultProfile,
+    maxAttempts = 3,
+    baseDelayMs = 100,
+  ): Promise<{ success: boolean; attempts: number; error?: Error }> {
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        await this.refresh(cameraName, profile);
+        // Also verify the stream's producer is listed and healthy in go2rtc's API
+        const streamName = this.resolveStreamName(cameraName, profile);
+        await this.verifyStreamProducer(streamName);
+        return { success: true, attempts: attempt };
+      } catch (error) {
+        const isLast = attempt === maxAttempts;
+        if (isLast) {
+          return {
+            success: false,
+            attempts: attempt,
+            error: error instanceof Error ? error : new Error(String(error)),
+          };
+        }
+        // Exponential backoff: 100ms, 200ms, 400ms...
+        await delay(baseDelayMs * Math.pow(2, attempt - 1), new AbortController().signal);
+      }
+    }
+    return { success: false, attempts: maxAttempts };
+  }
+
+  /**
+   * Verify that a stream's producer is registered and active in go2rtc.
+   * Queries /api/streams and checks that the named stream has at least one
+   * producer listed (go2rtc connected to the camera). Throws if the stream
+   * is missing or has no producers.
+   */
+  private async verifyStreamProducer(streamName: string): Promise<void> {
+    const url = `http://127.0.0.1:${this.config.go2rtc.api_port}/api/streams`;
+    const response = await this.fetchFn(url);
+
+    if (!response.ok) {
+      throw new SnapshotCacheError(`go2rtc streams API returned HTTP ${response.status}`);
+    }
+
+    const streams: unknown = await response.json();
+    if (typeof streams !== "object" || streams === null) {
+      throw new SnapshotCacheError("go2rtc streams API returned non-object");
+    }
+
+    const streamData = (streams as Record<string, unknown>)[streamName];
+    if (!streamData || typeof streamData !== "object") {
+      throw new SnapshotCacheError(`Stream "${streamName}" not found in go2rtc`);
+    }
+
+    // Check for "producers" array (go2rtc lists active producers here)
+    const producers = (streamData as { producers?: unknown }).producers;
+    if (!Array.isArray(producers) || producers.length === 0) {
+      throw new SnapshotCacheError(`Stream "${streamName}" has no active producers`);
+    }
+  }
+
   public startPolling(intervalMs = this.pollIntervalMs, profiles: readonly SnapshotProfile[] = [this.defaultProfile]): void {
     if (this.pollingPromise) {
       return;

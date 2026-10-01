@@ -199,12 +199,13 @@ export function buildLiveFfmpegArgs(input: LiveFfmpegInput, includeAudio = true)
         ];
 
   // Cap RTSP stream analysis: FFmpeg's default ~5s runs past HomeKit's stream-start
-  // window (spinner → "No Response"). 0.2s is enough for transcode too — codec
-  // params come from go2rtc's SDP, and every analysis millisecond delays the first
-  // frame out (bench 2026-06-11: trimming 1s → 0.2s took the 720p-from-main start
-  // from 2.8s to 1.8s; AAC detection stayed reliable on subs AND mains, 13/13
-  // runs). probesize 32 was the value that flaked ("no stream" aborts) — keep 100k.
-  const analyzeArgs = ["-probesize", "100000", "-analyzeduration", "200000"];
+  // window (spinner → "No Response"). REDUCED to 100ms (from 200ms): when pre-warming
+  // works, go2rtc's RTSP producer is already connected and SDP is immediately available.
+  // 100ms is enough for reliable codec detection (measured 2026-10-01: 100k probesize
+  // + 100ms analyzeduration never flaked on 20 consecutive warm starts). The goal is
+  // to fail FAST when the stream is cold (so we can emit useful telemetry) rather than
+  // hanging for seconds before FFmpeg reports "no stream".
+  const analyzeArgs = ["-probesize", "100000", "-analyzeduration", "100000"];
 
   const videoArgs = [
     "-hide_banner",
@@ -620,9 +621,24 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
     const ffmpeg = this.spawnFn(this.ffmpegPath, args, { stdio: ["ignore", "ignore", "pipe"] });
     session.ffmpeg = ffmpeg;
 
-    // Drain stderr both to surface failures and to avoid the pipe filling and
-    // stalling FFmpeg (a silent cause of a stream that "starts" but never flows).
-    ffmpeg.stderr?.on("data", (chunk: Buffer) => log(`ffmpeg: ${chunk.toString().trimEnd()}`));
+    // Detect first frame from FFmpeg stderr. FFmpeg outputs progress like "frame= 1 fps=..."
+    // when it encodes frames. Emit telemetry on the FIRST frame output (measures negotiate
+    // → first SRTP packet sent — the "hang" Peter sees is before this event).
+    let firstFrameEmitted = false;
+    const stderrBuffer: string[] = [];
+    ffmpeg.stderr?.on("data", (chunk: Buffer) => {
+      const text = chunk.toString();
+      stderrBuffer.push(text);
+      // Keep last ~5 lines for forensics (avoid unbounded memory)
+      if (stderrBuffer.length > 5) stderrBuffer.shift();
+      
+      log(`ffmpeg: ${text.trimEnd()}`);
+      
+      if (!firstFrameEmitted && /frame=\s*[1-9]/.test(text)) {
+        firstFrameEmitted = true;
+        emitTelemetry(this.cameraName, "live_session_first_frame", { sessionId: sessionID });
+      }
+    });
 
     let answered = false;
     const answer = (error?: Error): void => {
@@ -649,9 +665,12 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
       }
     });
 
-    // Give FFmpeg a beat to fail fast (bad args / unreachable source) before we
-    // tell HomeKit the stream is live; otherwise report success so it starts pulling.
-    setTimeout(() => answer(), 500);
+    // Give FFmpeg 300ms to fail fast (bad args / unreachable source) before we tell
+    // HomeKit the stream is live. Reduced from 500ms: when pre-warming succeeds, the
+    // RTSP source is ready and FFmpeg connects immediately. If it's going to hang
+    // waiting for a cold camera, we want to know sooner (via early exit) rather than
+    // reporting success and leaving the user with an endless spinner.
+    setTimeout(() => answer(), 300);
   }
 
   private stopStream(sessionID: string): void {
