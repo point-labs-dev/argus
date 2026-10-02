@@ -453,6 +453,6 @@ describe("ArgusStreamingDelegate", () => {
   });
 
   it("advertises firmware version 1.2.0 for iOS cache invalidation", () => {
-    expect(ARGUS_FIRMWARE_REVISION).toBe("1.2.0");
+    expect(ARGUS_FIRMWARE_REVISION).toBe("1.3.0");
   });
 });

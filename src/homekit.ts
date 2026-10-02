@@ -595,13 +595,19 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
       request.video.max_bit_rate,
       session.prepared.controllerAddress,
     );
-    // Derive actual encoder from codec for accurate logging
-    const audioEncoder = request.audio.codec === AudioStreamingCodecType.AAC_ELD ? "libfdk_aac/aac_eld" : "libopus";
+    // Log negotiation details
+    const audioLog = this.includeAudio
+      ? (() => {
+          const audioEncoder = request.audio.codec === AudioStreamingCodecType.AAC_ELD ? "libfdk_aac/aac_eld" : "libopus";
+          return `audio: codec=${request.audio.codec} ${request.audio.sample_rate}kHz ptype=${request.audio.pt} (encoding ${audioEncoder})`;
+        })()
+      : "audio: none (video-only)";
+    
     this.logLine(
       `HomeKit negotiated video: ${request.video.width}x${request.video.height}@${request.video.fps} ` +
         `profile=${profile} level=${level} ptype=${request.video.pt} asked=${request.video.max_bit_rate}k serving=${bitrate}k mtu=${request.video.mtu} ` +
         `mode=${this.videoMode} source=${this.pickInputUrl(request.video.width, request.video.height)}; ` +
-        `audio: codec=${request.audio.codec} ${request.audio.sample_rate}kHz ptype=${request.audio.pt} (encoding ${audioEncoder})`,
+        audioLog,
     );
 
     const liveInput: LiveFfmpegInput = {
@@ -808,11 +814,13 @@ export function buildCameraControllerOptions(
  * lastFirmwareVersion in AccessoryInfo for exactly that). BUMP THIS whenever
  * the advertised streaming configuration changes.
  * 
- * 2026-10-02: Bumped to 1.2.0 for pad/bitrate/audio fixes. Field evidence:
- * ARGUS_AUDIO=0 test showed Home still negotiated audio (cached old advertisement)
- * despite empty codecs array → spinner. Firmware bump forces iOS to re-read.
+ * 2026-10-02: Bumped to 1.3.0 for video-only interim path. Stream-side A/V
+ * sync attempts failed Mini's 2/2 gate (async filters: 4 attempts, all 0/2 or
+ * 1/2 unstable). Video-only unlocks picture as shippable interim. Firmware bump
+ * required: ARGUS_AUDIO=0 test without bump showed iOS still negotiated audio
+ * (cached). Empty codecs + firmware bump → iOS re-reads, honors video-only.
  */
-export const ARGUS_FIRMWARE_REVISION = "1.2.0";
+export const ARGUS_FIRMWARE_REVISION = "1.3.0";
 
 export interface CameraAccessoryHandle {
   accessory: Accessory;
