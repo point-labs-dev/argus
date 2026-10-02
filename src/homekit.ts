@@ -229,8 +229,11 @@ export function buildLiveFfmpegArgs(input: LiveFfmpegInput, includeAudio = true)
     // (2026-10-01): "Error submitting packet to decoder: Invalid data" floods during
     // live sessions — go2rtc RTSP sends bad h264 mid-stream. These flags let FFmpeg
     // discard corrupt packets and regenerate timestamps rather than aborting.
-    "-fflags", "+discardcorrupt+genpts+nobuffer",
+    // +flush_packets ensures immediate transmission (critical for HomeKit real-time).
+    "-fflags", "+discardcorrupt+genpts+nobuffer+flush_packets",
     "-flags", "low_delay",
+    // Zero muxing delay for real-time RTP streaming (no buffering).
+    "-max_delay", "0",
     ...analyzeArgs,
     // SOFTWARE decode only. -hwaccel videotoolbox was tried 2026-06-12 and
     // killed the first real ≥720p phone session: VideoToolbox decode sessions
@@ -488,23 +491,28 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
   ): Promise<void> {
     try {
       const videoSsrc = randomBytes(4).readUInt32BE(0) >>> 1;
-      const audioSsrc = randomBytes(4).readUInt32BE(0) >>> 1;
       const videoRtcp = await reserveUdpPort();
-      const audioRtcp = await reserveUdpPort();
-      // Encrypt outbound with the controller's own key material (from the request),
-      // and echo it back in the response. Generating fresh keys here is the classic
-      // "stream sends but the device shows a forever-spinner" bug.
       const videoSrtpParams = srtpParamsFromRequest(request.video.srtp_key, request.video.srtp_salt);
-      const audioSrtpParams = srtpParamsFromRequest(request.audio.srtp_key, request.audio.srtp_salt);
 
-      this.sessions.set(request.sessionID, {
-        prepared: {
-          targetAddress: resolveSrtpTargetAddress(request.targetAddress),
-          controllerAddress: request.targetAddress,
-          video: { port: request.video.port, localRtcpPort: videoRtcp, ssrc: videoSsrc, srtpParams: videoSrtpParams },
-          audio: { port: request.audio.port, localRtcpPort: audioRtcp, ssrc: audioSsrc, srtpParams: audioSrtpParams },
-        },
-      });
+      // In video-only mode (includeAudio=false), we advertise empty audio codecs.
+      // HomeKit may still send audio parameters in the request, but we should NOT
+      // include audio in our response - doing so tells Home we'll send audio packets,
+      // which we won't. Home then waits forever for audio that never arrives.
+      const preparedSession: ActiveSession["prepared"] = {
+        targetAddress: resolveSrtpTargetAddress(request.targetAddress),
+        controllerAddress: request.targetAddress,
+        video: { port: request.video.port, localRtcpPort: videoRtcp, ssrc: videoSsrc, srtpParams: videoSrtpParams },
+        audio: this.includeAudio
+          ? {
+              port: request.audio.port,
+              localRtcpPort: await reserveUdpPort(),
+              ssrc: randomBytes(4).readUInt32BE(0) >>> 1,
+              srtpParams: srtpParamsFromRequest(request.audio.srtp_key, request.audio.srtp_salt),
+            }
+          : { port: 0, localRtcpPort: 0, ssrc: 0, srtpParams: "" }, // Dummy values for video-only
+      };
+
+      this.sessions.set(request.sessionID, { prepared: preparedSession });
 
       const response: PrepareStreamResponse = {
         video: {
@@ -513,12 +521,18 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
           srtp_key: request.video.srtp_key,
           srtp_salt: request.video.srtp_salt,
         },
-        audio: {
-          port: audioRtcp,
-          ssrc: audioSsrc,
-          srtp_key: request.audio.srtp_key,
-          srtp_salt: request.audio.srtp_salt,
-        },
+        // Only include audio in response if we're actually going to send audio.
+        // In video-only mode, omitting audio tells Home not to wait for audio packets.
+        ...(this.includeAudio
+          ? {
+              audio: {
+                port: preparedSession.audio.localRtcpPort,
+                ssrc: preparedSession.audio.ssrc,
+                srtp_key: request.audio.srtp_key,
+                srtp_salt: request.audio.srtp_salt,
+              },
+            }
+          : {}),
       };
       callback(undefined, response);
     } catch (error) {
@@ -841,8 +855,13 @@ export function buildCameraControllerOptions(
  * from [BASELINE, MAIN, HIGH] to [BASELINE] only. Field evidence: High with
  * dump_extra → "No Response"; forcing Baseline as Home-friendly unlock path.
  * Firmware bump required: iOS caches profile list, won't re-read without it.
+ * 
+ * 2026-10-02 (1.3.2): Fix video-only prepareStream response. In video-only mode,
+ * omit audio from prepareStream response so Home doesn't wait for audio packets
+ * that will never arrive. This was causing "No Response" despite healthy video.
+ * Also add flush_packets and max_delay for immediate RTP transmission.
  */
-export const ARGUS_FIRMWARE_REVISION = "1.3.1";
+export const ARGUS_FIRMWARE_REVISION = "1.3.2";
 
 export interface CameraAccessoryHandle {
   accessory: Accessory;

@@ -491,7 +491,33 @@ describe("ArgusStreamingDelegate", () => {
     expect(calls[1]![1].join(" ")).toContain("-i rtsp://127.0.0.1:8554/backyard-left-sub");
   });
 
-  it("advertises firmware version 1.3.1 for Baseline profile cache invalidation", () => {
-    expect(ARGUS_FIRMWARE_REVISION).toBe("1.3.1");
+  it("advertises firmware version 1.3.2 for video-only prepareStream fix", () => {
+    expect(ARGUS_FIRMWARE_REVISION).toBe("1.3.2");
+  });
+
+  it("omits audio from prepareStream response in video-only mode", async () => {
+    const delegate = new ArgusStreamingDelegate(
+      "Garage Door",
+      "rtsp://127.0.0.1:8554/garage-door-sub",
+      cacheWith(Buffer.from([0xff, 0xd8])),
+      { includeAudio: false }, // Video-only mode
+    );
+
+    const response = await new Promise<{ video: unknown; audio?: unknown }>((resolve, reject) => {
+      delegate.prepareStream(
+        {
+          sessionID: "video-only-test",
+          targetAddress: "192.168.1.50",
+          video: { port: 50000, srtp_key: Buffer.alloc(16, 1), srtp_salt: Buffer.alloc(14, 2) },
+          audio: { port: 50002, srtp_key: Buffer.alloc(16, 3), srtp_salt: Buffer.alloc(14, 4) },
+        } as PrepareStreamRequest,
+        (error, res) => (error ? reject(error) : resolve(res!)),
+      );
+    });
+
+    // Video-only mode: response should NOT include audio
+    // This tells Home not to wait for audio packets that will never arrive
+    expect(response.video).toBeDefined();
+    expect(response.audio).toBeUndefined();
   });
 });
