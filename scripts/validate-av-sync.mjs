@@ -45,6 +45,7 @@ const sendArgs = buildLiveFfmpegArgs({
   },
   audio: {
     port: audioPort, localRtcpPort: await freePort(), ssrc: 222, payloadType: 110,
+    codec: 3, // AudioStreamingCodecType.OPUS
     sampleRateKhz: 24, maxBitrateKbps: 24, srtpParams: audioKey,
   },
 });
