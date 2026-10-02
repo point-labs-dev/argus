@@ -9,6 +9,15 @@ const streamProfilesSchema = z.object({
   sub: z.string().trim().min(1, "cameras[].streams.sub is required"),
 });
 
+const resolutionSpecSchema = z
+  .string()
+  .trim()
+  .regex(/^[1-9]\d*x[1-9]\d*$/i, "must match WxH, for example 854x480")
+  .transform((value) => {
+    const [width, height] = value.toLowerCase().split("x").map(Number) as [number, number];
+    return { width, height };
+  });
+
 const cameraSchema = z.object({
   name: z.string().trim().min(1, "cameras[].name is required"),
   host: z.string().trim().min(1, "cameras[].host is required"),
@@ -24,6 +33,8 @@ const cameraSchema = z.object({
   password: z.string().min(1, "cameras[].password is required"),
   transport: transportSchema,
   streams: streamProfilesSchema,
+  liveContentResolution: resolutionSpecSchema.optional(),
+  liveExactFrame: z.boolean().optional(),
 });
 
 const retentionSchema = z.object({

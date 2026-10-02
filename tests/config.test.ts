@@ -47,6 +47,17 @@ describe("parseArgusConfig", () => {
     expect(config.cameras[0]?.transport).toBe("auto");
   });
 
+  it("parses an optional per-camera live content resolution", () => {
+    const raw = createValidConfig();
+    (raw.cameras[0] as typeof raw.cameras[0] & { liveContentResolution?: string }).liveContentResolution = "854x480";
+    (raw.cameras[0] as typeof raw.cameras[0] & { liveExactFrame?: boolean }).liveExactFrame = false;
+
+    const config = parseArgusConfig(raw);
+
+    expect(config.cameras[0]?.liveContentResolution).toEqual({ width: 854, height: 480 });
+    expect(config.cameras[0]?.liveExactFrame).toBe(false);
+  });
+
   it("rejects a negative zero-based camera channel", () => {
     const invalidConfig = createValidConfig();
     invalidConfig.cameras[0]!.channel = -1;
@@ -61,5 +72,13 @@ describe("parseArgusConfig", () => {
 
     expect(() => parseArgusConfig(invalidConfig)).toThrowError(ConfigError);
     expect(() => parseArgusConfig(invalidConfig)).toThrow(/homekit/i);
+  });
+
+  it("rejects an invalid live content resolution", () => {
+    const invalidConfig = createValidConfig();
+    (invalidConfig.cameras[0] as typeof invalidConfig.cameras[0] & { liveContentResolution?: string }).liveContentResolution = "wide";
+
+    expect(() => parseArgusConfig(invalidConfig)).toThrowError(ConfigError);
+    expect(() => parseArgusConfig(invalidConfig)).toThrow(/liveContentResolution/i);
   });
 });
