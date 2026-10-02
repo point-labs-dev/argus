@@ -396,7 +396,8 @@ describe("ArgusStreamingDelegate", () => {
     expect(args.join(" ")).toContain("srtp://192.168.1.50:50000");
     // Transcode is the default live mode (validated on real devices).
     expect(args.join(" ")).toContain("-c:v libx264");
-    expect(args.join(" ")).toContain("scale=1280:720:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=1280:720");
+    // Firmware 1.3.13: defensive resolution clamp caps 1280x720 request → 854x480 encode
+    expect(args.join(" ")).toContain("scale=854:480:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=854:480");
     // Honor the negotiated bitrate exactly (field 2026-10-01: floor caused blank screen).
     expect(args.join(" ")).toContain("-b:v 299k");
     expect(args.join(" ")).toContain("-bufsize 598k");
@@ -456,7 +457,7 @@ describe("ArgusStreamingDelegate", () => {
     expect(secondArgs).toContain("-maxrate 600k");
   });
 
-  it("sources ≥720p sessions from the main restream and returns to sub below 720p", async () => {
+  it("with resolution cap, sessions use sub stream (854x480 < 720p threshold)", async () => {
     const spawnFn = vi.fn(() => Object.assign(new EventEmitter(), { kill: vi.fn() })) as unknown as typeof import("node:child_process").spawn;
     const delegate = new ArgusStreamingDelegate(
       "Backyard Left",
@@ -473,8 +474,8 @@ describe("ArgusStreamingDelegate", () => {
         (error) => (error ? reject(error) : resolve()),
       );
     });
-    // Full-screen-sized START: the 896-wide sub has no pixels for 720p — the
-    // session must transcode the full-res main instead.
+    // Home asks for 1280x720 but firmware 1.3.13 caps to 854x480.
+    // pickInputUrl sees 854x480 (< 720p threshold) → uses sub, not main.
     await new Promise<void>((resolve, reject) => {
       delegate.handleStreamRequest(
         { type: "start", sessionID: "s3",
@@ -483,22 +484,14 @@ describe("ArgusStreamingDelegate", () => {
         (error) => (error ? reject(error) : resolve()),
       );
     });
-    // Downgrade RECONFIGURE (e.g. backgrounding to the tile) returns to the sub.
-    await new Promise<void>((resolve, reject) => {
-      delegate.handleStreamRequest(
-        { type: "reconfigure", sessionID: "s3",
-          video: { width: 640, height: 360, fps: 30, max_bit_rate: 132, rtcp_interval: 0.5 } } as never,
-        (error) => (error ? reject(error) : resolve()),
-      );
-    });
 
     const calls = (spawnFn as unknown as { mock: { calls: [string, string[]][] } }).mock.calls;
-    expect(calls[0]![1].join(" ")).toContain("-i rtsp://127.0.0.1:8554/backyard-left ");
-    expect(calls[1]![1].join(" ")).toContain("-i rtsp://127.0.0.1:8554/backyard-left-sub");
+    // With cap: 720p request → 854x480 encode → sub stream (not main)
+    expect(calls[0]![1].join(" ")).toContain("-i rtsp://127.0.0.1:8554/backyard-left-sub");
   });
 
-  it("advertises firmware version 1.3.12 (WiFi resolution cap)", () => {
-    expect(ARGUS_FIRMWARE_REVISION).toBe("1.3.12");
+  it("advertises firmware version 1.3.13 (defensive resolution clamp)", () => {
+    expect(ARGUS_FIRMWARE_REVISION).toBe("1.3.13");
   });
 
   it("prevents double-callback crash (swallows duplicate calls)", async () => {

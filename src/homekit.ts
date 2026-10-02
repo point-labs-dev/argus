@@ -690,9 +690,18 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
     // dump_extra still caused "No Response"; Baseline is the Home-friendly path.
     const profile = "baseline";
     const level = H264_LEVEL_TO_X264[request.video.level] ?? "4.0";
+    
+    // Defensive resolution clamp: June WiFi working pattern (c5b368c, Garage Door 854x480).
+    // Field 1.3.12: changing wifiSet default ladder was INSUFFICIENT — MacBook Home still
+    // negotiated 1280x720 despite code change + configVersion bump (cached stream configs?).
+    // Force cap here even if Home asks 720p. ARGUS_LIVE_CAP env var overrides (default 854).
+    const maxWidth = process.env.ARGUS_LIVE_CAP ? parseInt(process.env.ARGUS_LIVE_CAP, 10) : 854;
+    const capWidth = Math.min(request.video.width, maxWidth);
+    const capHeight = Math.min(request.video.height, Math.round((maxWidth / 16) * 9));  // Maintain 16:9
+    
     const bitrate = this.liveBitrateKbps(
-      request.video.width,
-      request.video.height,
+      capWidth,
+      capHeight,
       request.video.max_bit_rate,
       session.prepared.targetAddress,
     );
@@ -704,16 +713,20 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
         })()
       : "audio: none (video-only)";
     
+    const negotiatedLog = request.video.width !== capWidth || request.video.height !== capHeight
+      ? `asked=${request.video.width}x${request.video.height} CAPPED→`
+      : "";
+    
     this.logLine(
-      `HomeKit negotiated video: ${request.video.width}x${request.video.height}@${request.video.fps} ` +
+      `HomeKit negotiated video: ${negotiatedLog}${capWidth}x${capHeight}@${request.video.fps} ` +
         `profile=${profile} level=${level} ptype=${request.video.pt} ssrc=${session.prepared.video.ssrc} ` +
         `suite=AES_CM_128_HMAC_SHA1_80 asked=${request.video.max_bit_rate}k serving=${bitrate}k mtu=${request.video.mtu} ` +
-        `mode=${this.videoMode} source=${this.pickInputUrl(request.video.width, request.video.height)}; ` +
+        `mode=${this.videoMode} source=${this.pickInputUrl(capWidth, capHeight)}; ` +
         audioLog,
     );
 
     const liveInputBase = {
-      inputUrl: this.pickInputUrl(request.video.width, request.video.height),
+      inputUrl: this.pickInputUrl(capWidth, capHeight),
       targetAddress: session.prepared.targetAddress,
       videoMode: this.videoMode,
       video: {
@@ -723,8 +736,8 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
         payloadType: request.video.pt,
         maxBitrateKbps: bitrate,
         fps: request.video.fps,
-        width: request.video.width,
-        height: request.video.height,
+        width: capWidth,
+        height: capHeight,
         mtu: request.video.mtu,
         profile,
         level,
@@ -1109,8 +1122,20 @@ export function buildCameraControllerOptions(
  * buildCameraControllerOptions now defaults to "wifi" ladder [854x480, 640x480, 640x360] instead
  * of "hires" [1920x1080, 1280x720]. ARGUS_LIVE_LADDER env var overrides: "hires" (pre-Oct behavior),
  * "wifi" (default Oct+), "compat" (full ladder down to 320x240). Preserves once-safe + iface→IP.
+ * FIELD TEST RESULT (2026-10-02 ~12:30 ET): wifi ladder default was INSUFFICIENT. Despite code
+ * change + FirmwareRevision bump + configVersion bump (Garage 21→23), MacBook Backyard STILL
+ * negotiated 1280x720@30 (three sessions all 720p). Home cached stream configs ignore new ladder.
+ * Sessions aborted faster (+2.3s / +1.3s / +0.4s SIGKILL vs 1.3.11 ~30s). WiFi ladder not effective.
+ * 
+ * 2026-10-02 (1.3.13): Force resolution clamp in startStream (defensive cap). Root cause: changing
+ * buildCameraControllerOptions wifiSet default insufficient — Home's cached stream configs still
+ * advertise hires, ignore new ladder. MacBook continues negotiating 1280x720 despite code changes.
+ * Defensive fix: cap resolution in handleStreamRequest START even when Home asks 720p. Force
+ * maxWidth=854 (June Garage Door working pattern) regardless of negotiation. ARGUS_LIVE_CAP env
+ * var overrides (default 854). Logs show "asked=1280x720 CAPPED→854x480" when clamping. Ensures
+ * encode never exceeds WiFi accept threshold even if Home cached stale high-res capabilities.
  */
-export const ARGUS_FIRMWARE_REVISION = "1.3.12";
+export const ARGUS_FIRMWARE_REVISION = "1.3.13";
 
 export interface CameraAccessoryHandle {
   accessory: Accessory;
@@ -1136,7 +1161,7 @@ export function createCameraAccessory(
   accessory
     .getService(Service.AccessoryInformation)!
     .setCharacteristic(Characteristic.Manufacturer, "Point Labs")
-    .setCharacteristic(Characteristic.Model, "Argus 1.3.12")
+    .setCharacteristic(Characteristic.Model, "Argus 1.3.13")
     .setCharacteristic(Characteristic.SerialNumber, `argus-${camera.host}-${camera.channel}`)
     .setCharacteristic(Characteristic.FirmwareRevision, ARGUS_FIRMWARE_REVISION);
 
