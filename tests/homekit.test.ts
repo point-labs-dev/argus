@@ -248,13 +248,13 @@ describe("buildLiveFfmpegArgs", () => {
 });
 
 describe("effectiveBitrateKbps", () => {
-  it("honors the negotiated bitrate exactly (no floors)", () => {
-    // Field 2026-10-01: asked=299k serving=2000k (6.7x over) → Home blank despite
-    // healthy encode. Home ENFORCES its budget; we must honor the negotiation.
-    expect(effectiveBitrateKbps(1920, 1080, 802)).toBe(802);
-    expect(effectiveBitrateKbps(1280, 720, 299)).toBe(299);
-    expect(effectiveBitrateKbps(640, 360, 132)).toBe(132);
-    expect(effectiveBitrateKbps(320, 240, 100)).toBe(100);
+  it("floors Apple's conservative asks per resolution tier (1.3.14 restored d094a53)", () => {
+    // 1.3.14 RESTORES LAN floors after Oct passthrough regression (1.3.13 mush)
+    expect(effectiveBitrateKbps(1920, 1080, 802)).toBe(3000); // 1080p floor
+    expect(effectiveBitrateKbps(1280, 720, 299)).toBe(2000);  // 720p floor
+    expect(effectiveBitrateKbps(640, 360, 132)).toBe(600);    // tile floor
+    expect(effectiveBitrateKbps(320, 240, 100)).toBe(300);    // tiny floor
+    expect(effectiveBitrateKbps(854, 480, 299)).toBe(600);    // 854×480 floor (sharpness delta)
   });
 
   it("still honors higher negotiated bitrates when Home allows them", () => {
@@ -398,10 +398,10 @@ describe("ArgusStreamingDelegate", () => {
     expect(args.join(" ")).toContain("-c:v libx264");
     // Firmware 1.3.13: defensive resolution clamp caps 1280x720 request → 854x480 encode
     expect(args.join(" ")).toContain("scale=854:480:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=854:480");
-    // Honor the negotiated bitrate exactly (field 2026-10-01: floor caused blank screen).
-    expect(args.join(" ")).toContain("-b:v 299k");
-    expect(args.join(" ")).toContain("-bufsize 598k");
-    expect(args.join(" ")).toContain("-maxrate 299k");
+    // 1.3.14: LAN floors restored (PRIMARY QUALITY FIX) — 299k ask → 600k serving at 854×480
+    expect(args.join(" ")).toContain("-b:v 600k");
+    expect(args.join(" ")).toContain("-bufsize 1200k");
+    expect(args.join(" ")).toContain("-maxrate 600k");
     // FFmpeg must encrypt with the CONTROLLER's key from the request (not a
     // generated one), or the device can't decrypt — the forever-spinner bug.
     const expectedVideoSrtp = Buffer.concat([Buffer.alloc(16, 1), Buffer.alloc(14, 2)]).toString("base64");
@@ -490,8 +490,8 @@ describe("ArgusStreamingDelegate", () => {
     expect(calls[0]![1].join(" ")).toContain("-i rtsp://127.0.0.1:8554/backyard-left-sub");
   });
 
-  it("advertises firmware version 1.3.13 (defensive resolution clamp)", () => {
-    expect(ARGUS_FIRMWARE_REVISION).toBe("1.3.13");
+  it("advertises firmware version 1.3.14 (restored LAN floors + preserved 1.3.13 unlocks)", () => {
+    expect(ARGUS_FIRMWARE_REVISION).toBe("1.3.14");
   });
 
   it("prevents double-callback crash (swallows duplicate calls)", async () => {

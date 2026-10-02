@@ -152,19 +152,25 @@ export interface LiveFfmpegInput {
 }
 
 /**
- * What we actually encode at, given HomeKit's ask. Apple clients negotiate
- * conservative bitrates (299k for 1280x720, 802k for 1920x1080 on LAN) but
- * field evidence (2026-10-01) shows HONORING the ask is critical: serving
- * 2000k when Home negotiated 299k (6.7x over-budget) caused blank screen
- * despite healthy encode. Home enforces its budget and rejects over-rate streams.
- * Floors removed — the negotiation IS the contract.
+ * What we actually encode at, given HomeKit's ask. 1.3.14 RESTORES LAN bitrate
+ * floors (d094a53 community-proven rates) after Oct passthrough regression.
+ * 
+ * Oct 2026 field showed 299k passthrough caused soft video + choppy audio at
+ * 854×480 (mush). Research confirms: floors are the QUALITY fix, localaddr+RTCP
+ * are the LONGEVITY fix. Hub escape (ARGUS_HUB_ADDRESSES) preserves spec-obedience
+ * for remote viewers whose uplink we can't see.
+ * 
+ * Restored floors: 720p→2000k, 1080p→3000k, tiles→600k. Sharpness delta:
+ * 600k@854×480 >> 299k@854×480 (1.3.13 mush).
  */
 export function effectiveBitrateKbps(width: number, height: number, negotiatedKbps: number): number {
-  // Honor the negotiated bitrate exactly. The old floor logic (2000k@720p,
-  // 3000k@1080p) was causing blank screens when Home enforced its budget.
-  // If users need higher quality on fast networks, they should increase the
-  // ADVERTISED max bitrate in controller options, not override the negotiation.
-  return negotiatedKbps;
+  // Community-proven LAN floors (Scrypted-class) — d094a53 after 3500k WiFi hang
+  const pixels = width * height;
+  const floor =
+    pixels >= 1920 * 1080 ? 3000 :
+    pixels >= 1280 * 720 ? 2000 :
+    pixels >= 640 * 360 ? 600 : 300;
+  return Math.max(negotiatedKbps, floor);
 }
 
 /**
@@ -1134,8 +1140,15 @@ export function buildCameraControllerOptions(
  * maxWidth=854 (June Garage Door working pattern) regardless of negotiation. ARGUS_LIVE_CAP env
  * var overrides (default 854). Logs show "asked=1280x720 CAPPED→854x480" when clamping. Ensures
  * encode never exceeds WiFi accept threshold even if Home cached stale high-res capabilities.
+ * 
+ * 2026-10-02 (1.3.14): Restore LAN bitrate floors + preserve 1.3.13 unlocks (PRIMARY QUALITY FIX).
+ * - Restored d094a53 LAN floors: 720p→2000k, 1080p→3000k, tiles→600k (vs 1.3.13's 299k mush)
+ * - Preserves 1.3.13 unlocks: AAC-ELD, once-safe prepareStream, getHapBindAddress, wifi ladder, localaddr RTCP
+ * - Sharpness delta: 600k@854×480 >> 299k@854×480 (1.3.13 soft video + choppy audio)
+ * - Requires ARGUS_LIVE_MAIN_SOURCE=1 in Mini plist (standalone ≥720p from main stream)
+ * - CAP=854 is temporary safety; target stage: hires ladder + raise/remove CAP (not clamp-as-product)
  */
-export const ARGUS_FIRMWARE_REVISION = "1.3.13";
+export const ARGUS_FIRMWARE_REVISION = "1.3.14";
 
 export interface CameraAccessoryHandle {
   accessory: Accessory;
@@ -1161,7 +1174,7 @@ export function createCameraAccessory(
   accessory
     .getService(Service.AccessoryInformation)!
     .setCharacteristic(Characteristic.Manufacturer, "Point Labs")
-    .setCharacteristic(Characteristic.Model, "Argus 1.3.13")
+    .setCharacteristic(Characteristic.Model, "Argus 1.3.14")
     .setCharacteristic(Characteristic.SerialNumber, `argus-${camera.host}-${camera.channel}`)
     .setCharacteristic(Characteristic.FirmwareRevision, ARGUS_FIRMWARE_REVISION);
 
