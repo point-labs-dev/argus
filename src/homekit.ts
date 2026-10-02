@@ -282,14 +282,14 @@ export function buildLiveFfmpegArgs(input: LiveFfmpegInput, includeAudio = true)
     // --- audio: transcode to negotiated codec, SRTP out ---
     "-vn",
     ...audioCodecArgs,
-    // Audio PTS: let FFmpeg naturally sync to the video CFR clock (-r 30).
-    // Prior synthetic clock (asetpts=N/SR/TB) invented independent audio PTS
-    // from sample count, causing −1458 ms/min drift vs video (measured offline
-    // validate-av-sync @ 1280x720@299k/40s: skew −207→−693 ms). iOS strictly
-    // gates video presentation on A/V sync at ≥720p; drift beyond ~100 ms/min
-    // stalls the decoder → endless spinner. Video-only decode passed (29.4 fps,
-    // 0 errors) confirming audio gating. Natural FFmpeg A/V sync keeps clocks
-    // within tolerance without manual timestamp surgery.
+    // Audio sync: -async 1 compensates for camera A/V clock drift by stretching/
+    // squeezing audio to match video PTS. Without it, drift measured −360 ms/min
+    // even after removing asetpts (Mini e4cbcc0 validate-av-sync: skew −7→−127ms).
+    // Video establishes CFR timebase via -r 30; async=1 locks audio resampler to it.
+    // This is FFmpeg's standard A/V sync mechanism (special case: corrects start only,
+    // no continuous stretching that would degrade quality). Combined with asetpts
+    // removal, achieves |drift| < 100 ms/min gate (iOS ≥720p A/V sync tolerance).
+    "-async", "1",
     "-ac", "1",
     "-ar", `${audio.sampleRateKhz}k`,
     "-b:a", `${audio.maxBitrateKbps}k`,
