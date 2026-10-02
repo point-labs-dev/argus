@@ -170,6 +170,15 @@ describe("buildLiveFfmpegArgs", () => {
             expect(args).not.toContain("-hwaccel");
   });
 
+  it("injects in-band SPS/PPS on every keyframe for reliable HomeKit unlock", () => {
+    // Field 2026-10-02: even with fast encode (~0.7s first frame) and periodic keyframes,
+    // Home showed endless spinner. dump_extra=freq=keyframe ensures parameter sets are
+    // in-band on every IDR so dropped initial extradata or strict in-band requirements
+    // don't prevent picture unlock.
+    const args = buildLiveFfmpegArgs(liveInput()).join(" ");
+    expect(args).toContain("-bsf:v dump_extra=freq=keyframe");
+  });
+
   it("passes video through untouched in copy mode (no encode, no scaling, no keyframe forcing)", () => {
     const args = buildLiveFfmpegArgs(liveInput({ videoMode: "copy" })).join(" ");
 

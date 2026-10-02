@@ -176,6 +176,9 @@ export function buildLiveFfmpegArgs(input: LiveFfmpegInput, includeAudio = true)
   //   negotiated dimensions — oversize is what controllers kill sessions over.
   // - HomeKit needs periodic IDRs and no B-frames, or the iOS client waits
   //   forever for a decodable keyframe (the "spinner that never resolves" symptom).
+  // - HomeKit also needs in-band SPS/PPS on every keyframe for reliable decode/unlock.
+  //   dump_extra=freq=keyframe injects parameter sets before each IDR so dropped initial
+  //   packets or strict in-band requirements don't prevent picture unlock.
   const videoCodecArgs =
     videoMode === "copy"
       ? ["-c:v", "copy"]
@@ -202,6 +205,10 @@ export function buildLiveFfmpegArgs(input: LiveFfmpegInput, includeAudio = true)
           // 1x VBV: momentary bursts toward 2x maxrate were part of what WiFi
           // delivery choked on; a tight buffer keeps the wire rate honest.
           "-bufsize", `${video.maxBitrateKbps}k`,
+          // Inject SPS/PPS before every keyframe (in-band parameter sets). HomeKit may
+          // need this to unlock picture: if initial extradata packets drop or device
+          // requires in-band params per IDR, out-of-band-only SPS/PPS → forever spinner.
+          "-bsf:v", "dump_extra=freq=keyframe",
         ];
 
   // Cap RTSP stream analysis: FFmpeg's default ~5s runs past HomeKit's stream-start
