@@ -992,8 +992,16 @@ export function buildCameraControllerOptions(
  * lookup + UDP probe → en0 (dual-NIC weakened); still no picture. Switch encoder
  * from CRF+maxrate to CBR (-b:v) matching camera-ffmpeg/HA stacks. Belt-and-suspenders:
  * localaddr pins ffmpeg egress to HAP-advertised IP; prepareStream addressOverride.
+ * FIELD TEST RESULT (2026-10-02 ~10:51 ET): iOS Home shows "No Response" but logs
+ * from BEFORE restart (10:33) show old pkt_size=564 + video-only. Suspected: iOS
+ * cached accessory as video-only from earlier firmware; needs cache refresh.
+ * 
+ * 2026-10-02 (1.3.6): Force iOS cache refresh for audio advertisement. Firmware bump
+ * triggers iOS to re-query accessory capabilities. Previous deploys set ARGUS_AUDIO=1
+ * but iOS negotiated video-only (cached metadata from video-only test builds). This
+ * bump + accessory info change forces re-read of audio codec advertisement.
  */
-export const ARGUS_FIRMWARE_REVISION = "1.3.5";
+export const ARGUS_FIRMWARE_REVISION = "1.3.6";
 
 export interface CameraAccessoryHandle {
   accessory: Accessory;
@@ -1019,7 +1027,7 @@ export function createCameraAccessory(
   accessory
     .getService(Service.AccessoryInformation)!
     .setCharacteristic(Characteristic.Manufacturer, "Point Labs")
-    .setCharacteristic(Characteristic.Model, "Argus")
+    .setCharacteristic(Characteristic.Model, "Argus 1.3.6")
     .setCharacteristic(Characteristic.SerialNumber, `argus-${camera.host}-${camera.channel}`)
     .setCharacteristic(Characteristic.FirmwareRevision, ARGUS_FIRMWARE_REVISION);
 
