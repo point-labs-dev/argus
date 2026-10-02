@@ -483,7 +483,7 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
     this.includeAudio = options.includeAudio ?? true;
     this.videoMode = options.videoMode ?? "transcode";
     if (options.mainStreamUrl !== undefined) this.mainStreamUrl = options.mainStreamUrl;
-    this.bindAddress = options.bindAddress;
+    if (options.bindAddress !== undefined) this.bindAddress = options.bindAddress;
     this.spawnFn = options.spawnFn ?? spawn;
   }
 
@@ -690,10 +690,9 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
         audioLog,
     );
 
-    const liveInput: LiveFfmpegInput = {
+    const liveInputBase = {
       inputUrl: this.pickInputUrl(request.video.width, request.video.height),
       targetAddress: session.prepared.targetAddress,
-      localAddress: this.bindAddress,
       videoMode: this.videoMode,
       video: {
         port: session.prepared.video.port,
@@ -720,6 +719,10 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
         srtpParams: session.prepared.audio.srtpParams,
       },
     };
+    
+    const liveInput: LiveFfmpegInput = this.bindAddress
+      ? { ...liveInputBase, localAddress: this.bindAddress }
+      : liveInputBase;
 
     this.spawnLive(request.sessionID, session, liveInput, callback);
   }
