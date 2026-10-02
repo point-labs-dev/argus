@@ -17,6 +17,7 @@ function liveInput(overrides: Partial<LiveFfmpegInput> = {}): LiveFfmpegInput {
   return {
     inputUrl: "rtsp://127.0.0.1:8554/backyard-left-sub",
     targetAddress: "192.168.1.50",
+    localAddress: undefined,
     videoMode: "transcode",
     video: {
       port: 50000,
@@ -93,10 +94,7 @@ describe("buildLiveFfmpegArgs", () => {
     expect(joined).not.toContain("-profile:a aac_eld");
   });
 
-  it("encodes ≥720p sessions with capped-CRF libx264 and intra-refresh", () => {
-    // 3500k = the post-floor bitrate a LAN 720p session actually arrives with
-    // (the delegate floors before building args; sub-800k here means a
-    // relay-obeyed session and triggers the starved downscale instead).
+  it("encodes ≥720p sessions with CBR libx264 at negotiated bitrate", () => {
     const args = buildLiveFfmpegArgs(
       liveInput({ video: { ...liveInput().video, maxBitrateKbps: 2000 } }),
     ).join(" ");
@@ -106,12 +104,13 @@ describe("buildLiveFfmpegArgs", () => {
     expect(args).toContain("-c:a libopus");
     // Pad to exact negotiated dimensions (field 2026-10-01: 4:3 source → 960×720 != 1280×720)
     expect(args).toContain("scale=1280:720:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=1280:720:(ow-iw)/2:(oh-ih)/2");
-    // Capped-CRF: easy scenes undershoot the cap, motion gets the full budget.
-    // Hi-res sessions get the extra encoder effort and quality target.
+    // CBR-style encoding (camera-ffmpeg pattern): -b:v sets target bitrate.
+    // Firmware 1.3.5 switches from CRF+maxrate to match working HomeKit stacks.
     expect(args).toContain("-preset faster");
-    expect(args).toContain("-crf 18");
+    expect(args).toContain("-b:v 2000k");
+    expect(args).toContain("-bufsize 4000k");
     expect(args).toContain("-maxrate 2000k");
-    expect(args).not.toContain("-b:v");
+    expect(args).not.toContain("-crf");
     expect(args).toContain("-bf 0");
     // Periodic IDRs (2s at hi-res): intra-refresh was reverted — its single
     // start-of-session IDR made re-entry hang whenever those packets dropped.
@@ -127,6 +126,8 @@ describe("buildLiveFfmpegArgs", () => {
     ).join(" ");
 
     expect(args).toContain("scale=1280:720:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=1280:720");
+    expect(args).toContain("-b:v 132k");
+    expect(args).toContain("-bufsize 264k");
     expect(args).toContain("-maxrate 132k");
   });
 
@@ -163,7 +164,8 @@ describe("buildLiveFfmpegArgs", () => {
 
     expect(args).toContain("-c:v libx264");
     expect(args).toContain("-tune zerolatency");
-    expect(args).toContain("-crf 20");
+    expect(args).toContain("-b:v 600k");
+    expect(args).toContain("-bufsize 1200k");
     expect(args).toContain("-maxrate 600k");
     expect(args).toContain("-force_key_frames expr:eq(t,0)+gte(t,n_forced*1)");
     expect(args).toContain("scale=640:360:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=640:360");
@@ -211,9 +213,8 @@ describe("buildLiveFfmpegArgs", () => {
     // Audio is still transcoded to Opus, and SRTP targeting is unchanged.
     expect(args).toContain("-c:a libopus");
     expect(args).toContain("-srtp_out_params VIDEOKEY==");
-    // hi-res sessions (copy included) ship small packets for WiFi resilience
-    // No localrtpport: let ffmpeg choose source port (homebridge pattern)
-    expect(args).toContain("srtp://192.168.1.50:50000?rtcpport=50000&pkt_size=564");
+    // camera-ffmpeg uses 1316; firmware 1.3.5 matches ecosystem default
+    expect(args).toContain("srtp://192.168.1.50:50000?rtcpport=50000&pkt_size=1316");
     expect(args).toContain("-payload_type 99");
   });
 
@@ -236,12 +237,11 @@ describe("buildLiveFfmpegArgs", () => {
     const args = buildLiveFfmpegArgs(liveInput());
     const joined = args.join(" ");
 
-    // video SRTP out (no localrtpport: homebridge pattern)
+    // Clean SRTP URL (camera-ffmpeg pattern): no localrtpport/localrtcpport
     expect(joined).toContain("-srtp_out_params VIDEOKEY==");
-    expect(joined).toContain("srtp://192.168.1.50:50000?rtcpport=50000&pkt_size=564");
-    // audio SRTP out (no localrtpport: homebridge pattern)
+    expect(joined).toContain("srtp://192.168.1.50:50000?rtcpport=50000&pkt_size=1316");
     expect(joined).toContain("-srtp_out_params AUDIOKEY==");
-    expect(joined).toContain("srtp://192.168.1.50:50002?rtcpport=50002");
+    expect(joined).toContain("srtp://192.168.1.50:50002?rtcpport=50002&pkt_size=1316");
     expect(joined).toContain("-ssrc 1");
     expect(joined).toContain("-ssrc 2");
   });
@@ -397,6 +397,8 @@ describe("ArgusStreamingDelegate", () => {
     expect(args.join(" ")).toContain("-c:v libx264");
     expect(args.join(" ")).toContain("scale=1280:720:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=1280:720");
     // Honor the negotiated bitrate exactly (field 2026-10-01: floor caused blank screen).
+    expect(args.join(" ")).toContain("-b:v 299k");
+    expect(args.join(" ")).toContain("-bufsize 598k");
     expect(args.join(" ")).toContain("-maxrate 299k");
     // FFmpeg must encrypt with the CONTROLLER's key from the request (not a
     // generated one), or the device can't decrypt — the forever-spinner bug.
@@ -448,6 +450,8 @@ describe("ArgusStreamingDelegate", () => {
     expect(procs[0]!.kill).toHaveBeenCalledWith("SIGKILL");
     const secondArgs = (spawnFn as unknown as { mock: { calls: [string, string[]][] } }).mock.calls[1]![1].join(" ");
     expect(secondArgs).toContain("scale=896:672:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=896:672");
+    expect(secondArgs).toContain("-b:v 600k");
+    expect(secondArgs).toContain("-bufsize 1200k");
     expect(secondArgs).toContain("-maxrate 600k");
   });
 
@@ -492,8 +496,8 @@ describe("ArgusStreamingDelegate", () => {
     expect(calls[1]![1].join(" ")).toContain("-i rtsp://127.0.0.1:8554/backyard-left-sub");
   });
 
-  it("advertises firmware version 1.3.4 for bidirectional RTCP fix", () => {
-    expect(ARGUS_FIRMWARE_REVISION).toBe("1.3.4");
+  it("advertises firmware version 1.3.5 for camera-ffmpeg return-port + CBR fix", () => {
+    expect(ARGUS_FIRMWARE_REVISION).toBe("1.3.5");
   });
 
   it("omits audio from prepareStream response in video-only mode", async () => {

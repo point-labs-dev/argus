@@ -3,6 +3,28 @@ import { randomBytes } from "node:crypto";
 import { createSocket } from "node:dgram";
 import { networkInterfaces } from "node:os";
 
+/**
+ * Get the primary LAN IPv4 address for HAP advertising and RTP source binding.
+ * Prefers ARGUS_HAP_BIND env var, else first non-internal IPv4 (typically en0 on Mac).
+ * Scrypted/homebridge pattern: HAP advertise + ffmpeg localaddr + RTCP bind must match
+ * to prevent iOS "Drop RTP from unknown source" on dual-NIC systems.
+ */
+export function getHapBindAddress(): string | undefined {
+  if (process.env.ARGUS_HAP_BIND) {
+    return process.env.ARGUS_HAP_BIND;
+  }
+  
+  const ifaces = networkInterfaces();
+  for (const addresses of Object.values(ifaces)) {
+    for (const addr of addresses ?? []) {
+      if (addr.family === "IPv4" && !addr.internal) {
+        return addr.address;
+      }
+    }
+  }
+  return undefined;
+}
+
 import {
   Accessory,
   AudioCodecTypes,
@@ -67,6 +89,12 @@ export interface LiveFfmpegInput {
   inputUrl: string;
   targetAddress: string;
   /**
+   * Local IP address for ffmpeg SRTP egress (localaddr=). On dual-NIC systems,
+   * must match HAP advertised address so iOS doesn't drop RTP from unknown source.
+   * Scrypted/homebridge pattern: HAP bind + ffmpeg localaddr + RTCP bind = same IP.
+   */
+  localAddress?: string;
+  /**
    * "transcode" (default) re-encodes to the negotiated envelope — the validated
    * path on real devices. "copy" passes the camera's H.264 sub stream through
    * untouched (no encode latency, native quality, ~zero CPU) but EXPERIMENTAL:
@@ -125,7 +153,7 @@ export function effectiveBitrateKbps(width: number, height: number, negotiatedKb
  * Kept side-effect free so it can be unit-tested without spawning anything.
  */
 export function buildLiveFfmpegArgs(input: LiveFfmpegInput, includeAudio = true): string[] {
-  const { inputUrl, targetAddress, videoMode, video, audio } = input;
+  const { inputUrl, targetAddress, localAddress, videoMode, video, audio } = input;
 
   const hiResSession = video.width >= 1280 || video.height >= 720;
 
@@ -203,11 +231,13 @@ export function buildLiveFfmpegArgs(input: LiveFfmpegInput, includeAudio = true)
           "-vf", `scale=${boxWidth}:${boxHeight}:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=${boxWidth}:${boxHeight}:(ow-iw)/2:(oh-ih)/2`,
           "-bf", "0",
           ...keyframeArgs,
-          "-crf", hiResSession ? "18" : "20",
+          // CBR-style encoding (camera-ffmpeg pattern): -b:v sets target bitrate.
+          // Firmware 1.3.5 switches from CRF+maxrate to match working HomeKit stacks.
+          // CRF+cap can produce burstier NAL timing at 299k/720p than CBR recipes
+          // HomeKit ecosystems validate against. Field evidence: CRF failed unlock.
+          "-b:v", `${video.maxBitrateKbps}k`,
+          "-bufsize", `${video.maxBitrateKbps * 2}k`,
           "-maxrate", `${video.maxBitrateKbps}k`,
-          // 1x VBV: momentary bursts toward 2x maxrate were part of what WiFi
-          // delivery choked on; a tight buffer keeps the wire rate honest.
-          "-bufsize", `${video.maxBitrateKbps}k`,
           // Inject SPS/PPS before every keyframe (in-band parameter sets). HomeKit may
           // need this to unlock picture: if initial extradata packets drop or device
           // requires in-band params per IDR, out-of-band-only SPS/PPS → forever spinner.
@@ -261,11 +291,12 @@ export function buildLiveFfmpegArgs(input: LiveFfmpegInput, includeAudio = true)
     // smaller datagrams lose less per WiFi drop and aggregate better. The
     // documented mitigation rung from the goal prompt's WiFi ladder.
     //
-    // HomeKit uses RTP/RTCP multiplexing (same port for both). Do NOT use
-    // localrtpport: it binds the port we told HomeKit we're listening on
-    // (in prepareStream response), preventing bidirectional RTCP. Let ffmpeg
-    // choose a random source port. Standard pattern from homebridge-camera-ffmpeg.
-    `srtp://${targetAddress}:${video.port}?rtcpport=${video.port}&pkt_size=${hiResSession ? Math.min(564, video.mtu) : video.mtu}`,
+    // HomeKit uses RTP/RTCP multiplexing (same port for both). Clean SRTP URL
+    // matches camera-ffmpeg: NO localrtpport/localrtcpport (ffmpeg picks source).
+    // PRIMARY: Node dgram binds video.localRtcpPort for return RTCP (spawnLive).
+    // Belt-and-suspenders: localaddr pins egress to HAP-advertised IP (dual-NIC safety).
+    // pkt_size: camera-ffmpeg default 1316; firmware 1.3.5 matches ecosystem.
+    `srtp://${targetAddress}:${video.port}?rtcpport=${video.port}&pkt_size=1316${localAddress ? `&localaddr=${localAddress}` : ""}`,
   ];
 
   if (!includeAudio) {
@@ -316,8 +347,8 @@ export function buildLiveFfmpegArgs(input: LiveFfmpegInput, includeAudio = true)
     "-f", "rtp",
     "-srtp_out_suite", "AES_CM_128_HMAC_SHA1_80",
     "-srtp_out_params", audio.srtpParams,
-    // Same multiplexed RTP/RTCP pattern as video (no localrtpport)
-    `srtp://${targetAddress}:${audio.port}?rtcpport=${audio.port}&pkt_size=188`,
+    // Same SRTP pattern as video (clean URL + localaddr + Node return-bind)
+    `srtp://${targetAddress}:${audio.port}?rtcpport=${audio.port}&pkt_size=1316${localAddress ? `&localaddr=${localAddress}` : ""}`,
   ];
 }
 
@@ -371,6 +402,11 @@ interface ActiveSession {
   ffmpeg?: ChildProcess;
   /** The input used for the running FFmpeg — kept so RECONFIGURE can respawn with new video params. */
   liveInput?: LiveFfmpegInput;
+  /** UDP socket bound to videoReturnPort to receive RTCP from Home (camera-ffmpeg pattern). */
+  videoReturnSocket?: ReturnType<typeof createSocket>;
+  audioReturnSocket?: ReturnType<typeof createSocket>;
+  /** Watchdog cleared when RTCP arrives; fires on stale stream. */
+  rtcpWatchdog?: NodeJS.Timeout;
   prepared: {
     targetAddress: string;
     /** The controller's requested address BEFORE any loopback rewrite — identity, not routing. */
@@ -407,6 +443,12 @@ export interface StreamingDelegateOptions {
    * (measured 2026-06-11 — non-standard sizes are dead weight).
    */
   liveResolution?: { width: number; height: number };
+  /**
+   * Local IP address for HAP advertising, prepareStream addressOverride, ffmpeg
+   * localaddr, and RTCP return socket binding. On dual-NIC systems, must be the
+   * LAN IP Home can reach (typically en0 on Mac). Scrypted/homebridge pattern.
+   */
+  bindAddress?: string;
   /** Injectable spawn for tests. */
   spawnFn?: typeof spawn;
 }
@@ -425,6 +467,7 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
   private readonly includeAudio: boolean;
   private readonly videoMode: "copy" | "transcode";
   private readonly mainStreamUrl?: string;
+  private readonly bindAddress?: string;
   private readonly spawnFn: typeof spawn;
 
   public constructor(
@@ -440,6 +483,7 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
     this.includeAudio = options.includeAudio ?? true;
     this.videoMode = options.videoMode ?? "transcode";
     if (options.mainStreamUrl !== undefined) this.mainStreamUrl = options.mainStreamUrl;
+    this.bindAddress = options.bindAddress;
     this.spawnFn = options.spawnFn ?? spawn;
   }
 
@@ -521,6 +565,7 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
       this.sessions.set(request.sessionID, { prepared: preparedSession });
 
       const response: PrepareStreamResponse = {
+        ...(this.bindAddress ? { addressOverride: this.bindAddress } : {}),
         video: {
           port: videoRtcp,
           ssrc: videoSsrc,
@@ -639,7 +684,8 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
     
     this.logLine(
       `HomeKit negotiated video: ${request.video.width}x${request.video.height}@${request.video.fps} ` +
-        `profile=${profile} level=${level} ptype=${request.video.pt} asked=${request.video.max_bit_rate}k serving=${bitrate}k mtu=${request.video.mtu} ` +
+        `profile=${profile} level=${level} ptype=${request.video.pt} ssrc=${session.prepared.video.ssrc} ` +
+        `suite=AES_CM_128_HMAC_SHA1_80 asked=${request.video.max_bit_rate}k serving=${bitrate}k mtu=${request.video.mtu} ` +
         `mode=${this.videoMode} source=${this.pickInputUrl(request.video.width, request.video.height)}; ` +
         audioLog,
     );
@@ -647,6 +693,7 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
     const liveInput: LiveFfmpegInput = {
       inputUrl: this.pickInputUrl(request.video.width, request.video.height),
       targetAddress: session.prepared.targetAddress,
+      localAddress: this.bindAddress,
       videoMode: this.videoMode,
       video: {
         port: session.prepared.video.port,
@@ -692,6 +739,54 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
 
     const ffmpeg = this.spawnFn(this.ffmpegPath, args, { stdio: ["ignore", "ignore", "pipe"] });
     session.ffmpeg = ffmpeg;
+
+    // PRIMARY: Bind UDP return socket for RTCP (camera-ffmpeg pattern). Home sends
+    // RTCP RR/NACKs to the port we advertised in prepareStream. Without a listener,
+    // Home may refuse to unlock video. Firmware 1.3.5 adds this missing half.
+    try {
+      const videoSocket = createSocket("udp4");
+      if (this.bindAddress) {
+        videoSocket.bind(liveInput.video.localRtcpPort, this.bindAddress);
+      } else {
+        videoSocket.bind(liveInput.video.localRtcpPort);
+      }
+      videoSocket.on("message", (msg) => {
+        // Home sent RTCP (Receiver Report / NACK). Log first arrival.
+        if (!session.rtcpWatchdog) {
+          log(`RTCP arrived on video return port (${msg.length} bytes)`);
+        }
+        // Reset watchdog (30s idle → forceStop, camera-ffmpeg pattern)
+        if (session.rtcpWatchdog) clearTimeout(session.rtcpWatchdog);
+        session.rtcpWatchdog = setTimeout(() => {
+          log("RTCP watchdog fired (30s idle) — forcing stop");
+          this.controller?.forceStopStreamingSession(sessionID);
+        }, 30_000);
+      });
+      session.videoReturnSocket = videoSocket;
+      log(`Bound video return RTCP: port ${liveInput.video.localRtcpPort}${this.bindAddress ? ` addr ${this.bindAddress}` : ""}`);
+
+      if (this.includeAudio) {
+        const audioSocket = createSocket("udp4");
+        if (this.bindAddress) {
+          audioSocket.bind(liveInput.audio.localRtcpPort, this.bindAddress);
+        } else {
+          audioSocket.bind(liveInput.audio.localRtcpPort);
+        }
+        audioSocket.on("message", () => {
+          // Audio RTCP keepalive (same watchdog as video)
+          if (session.rtcpWatchdog) clearTimeout(session.rtcpWatchdog);
+          session.rtcpWatchdog = setTimeout(() => {
+            log("RTCP watchdog fired (30s idle) — forcing stop");
+            this.controller?.forceStopStreamingSession(sessionID);
+          }, 30_000);
+        });
+        session.audioReturnSocket = audioSocket;
+        log(`Bound audio return RTCP: port ${liveInput.audio.localRtcpPort}${this.bindAddress ? ` addr ${this.bindAddress}` : ""}`);
+      }
+    } catch (error) {
+      log(`RTCP socket bind failed: ${error instanceof Error ? error.message : String(error)}`);
+      // Non-fatal: continue without return RTCP (may still work if Home doesn't require it)
+    }
 
     // Detect first frame from FFmpeg progress output (pipe:2 → stderr). Progress format:
     // "frame=N\nfps=...\n..." with frame=0 first, then frame=1 when first encode completes.
@@ -754,6 +849,10 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
   private stopStream(sessionID: string): void {
     const session = this.sessions.get(sessionID);
     session?.ffmpeg?.kill("SIGKILL");
+    // Clean up RTCP return sockets and watchdog
+    if (session?.rtcpWatchdog) clearTimeout(session.rtcpWatchdog);
+    session?.videoReturnSocket?.close();
+    session?.audioReturnSocket?.close();
     this.sessions.delete(sessionID);
   }
 }
@@ -881,8 +980,17 @@ export function buildCameraControllerOptions(
  * following homebridge-camera-ffmpeg pattern (let ffmpeg choose random source ports).
  * This allows proper bidirectional RTCP communication. Field hypothesis: HomeKit
  * expects to send Receiver Reports / NACKs back and kills streams when it can't.
+ * FIELD TEST RESULT (2026-10-02 ~05:35 ET): Fix did NOT unlock picture.
+ * 
+ * 2026-10-02 (1.3.5): Complete camera-ffmpeg return-port pattern + CBR encoding.
+ * PRIMARY: Node dgram binds advertised prepareStream video/audio return ports and
+ * handles incoming RTCP from Home (Receiver Reports, NACKs). 1.3.4 had clean SRTP
+ * URL but no socket owner → Home's RTCP targeted dead port. Field evidence: route
+ * lookup + UDP probe → en0 (dual-NIC weakened); still no picture. Switch encoder
+ * from CRF+maxrate to CBR (-b:v) matching camera-ffmpeg/HA stacks. Belt-and-suspenders:
+ * localaddr pins ffmpeg egress to HAP-advertised IP; prepareStream addressOverride.
  */
-export const ARGUS_FIRMWARE_REVISION = "1.3.4";
+export const ARGUS_FIRMWARE_REVISION = "1.3.5";
 
 export interface CameraAccessoryHandle {
   accessory: Accessory;

@@ -10,7 +10,7 @@ import { Categories, HAPStorage } from "hap-nodejs";
 import { loadArgusConfig, type ArgusConfig } from "./config.js";
 import { buildGo2RtcStreamNames } from "./go2rtc.js";
 import { startGo2Rtc, type Go2RtcSupervisor } from "./go2rtc-supervisor.js";
-import { createCameraAccessory } from "./homekit.js";
+import { createCameraAccessory, getHapBindAddress } from "./homekit.js";
 import { MotionMonitor } from "./motion.js";
 import { parseJpegDimensions, SnapshotCache } from "./snapshot-cache.js";
 import { emitTelemetry } from "./telemetry.js";
@@ -79,6 +79,14 @@ export async function startArgusServer(config: ArgusConfig, configDir = process.
 
   const streamNames = buildGo2RtcStreamNames(config.cameras);
   const setMotionByCamera = new Map<string, (detected: boolean) => void>();
+  
+  // Get HAP bind address for interface pinning (dual-NIC safety + prepareStream addressOverride).
+  // camera-ffmpeg pattern: HAP advertise + ffmpeg localaddr + RTCP bind = same IP.
+  const bindAddress = getHapBindAddress();
+  if (bindAddress) {
+    process.stdout.write(`[argus] HAP bind address: ${bindAddress}\n`);
+  }
+  
   const published = config.cameras.map((camera, index) => {
     const names = streamNames[index]!;
     const liveUrl = `${RTSP_RESTREAM_BASE}/${names.sub}`; // live view = light sub stream
@@ -105,6 +113,7 @@ export async function startArgusServer(config: ArgusConfig, configDir = process.
       includeAudio,
       videoMode,
       ...(process.env.ARGUS_FFMPEG ? { ffmpegPath: process.env.ARGUS_FFMPEG } : {}),
+      ...(bindAddress ? { bindAddress } : {}),
       // HomeKit snapshot requests serve the full-res main-stream stills the
       // cache polls — the 640-wide sub stills read as "pixelated" on the grid.
       snapshotProfile: "main",
