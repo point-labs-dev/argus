@@ -179,6 +179,23 @@ describe("buildLiveFfmpegArgs", () => {
     expect(args).toContain("-bsf:v dump_extra=freq=keyframe");
   });
 
+  it("encodes with Baseline H.264 profile for Apple Home compatibility", () => {
+    // Field 2026-10-01: High profile with dump_extra still caused "No Response"
+    // on video-only live. Force Baseline encoding as the Home-friendly path.
+    const argsHigh = buildLiveFfmpegArgs(liveInput({ video: { ...liveInput().video, profile: "high" } })).join(" ");
+    const argsMain = buildLiveFfmpegArgs(liveInput({ video: { ...liveInput().video, profile: "main" } })).join(" ");
+    const argsBaseline = buildLiveFfmpegArgs(liveInput({ video: { ...liveInput().video, profile: "baseline" } })).join(" ");
+    
+    // All should encode with baseline regardless of input profile
+    expect(argsHigh).toContain("-profile:v baseline");
+    expect(argsMain).toContain("-profile:v baseline");
+    expect(argsBaseline).toContain("-profile:v baseline");
+    
+    // Should NOT encode with high or main
+    expect(argsHigh).not.toContain("-profile:v high");
+    expect(argsMain).not.toContain("-profile:v main");
+  });
+
   it("passes video through untouched in copy mode (no encode, no scaling, no keyframe forcing)", () => {
     const args = buildLiveFfmpegArgs(liveInput({ videoMode: "copy" })).join(" ");
 
@@ -275,6 +292,19 @@ describe("buildCameraControllerOptions", () => {
     expect(opts.streamingOptions.audio?.codecs).toHaveLength(2);
     expect(opts.streamingOptions.audio?.codecs?.[0]?.type).toBe("AAC-eld");
     expect(opts.streamingOptions.audio?.codecs?.[1]?.type).toBe("OPUS");
+  });
+
+  it("advertises ONLY Baseline H.264 profile for Apple Home compatibility", () => {
+    // Field 2026-10-01: High profile with dump_extra → "No Response". Force
+    // Baseline advertisement so Home negotiates it (iOS caches profile list).
+    const delegate = new ArgusStreamingDelegate("Backyard Left", "rtsp://x", cacheWith(Buffer.from([0xff, 0xd8])));
+    const opts = buildCameraControllerOptions(delegate);
+
+    const profiles = opts.streamingOptions.video.codec.profiles;
+    expect(profiles).toHaveLength(1);
+    expect(profiles).toContain(0); // H264Profile.BASELINE
+    expect(profiles).not.toContain(1); // H264Profile.MAIN
+    expect(profiles).not.toContain(2); // H264Profile.HIGH
   });
 
   it("advertises ONLY the native resolution in copy mode (mismatch kills the session)", () => {
@@ -461,7 +491,7 @@ describe("ArgusStreamingDelegate", () => {
     expect(calls[1]![1].join(" ")).toContain("-i rtsp://127.0.0.1:8554/backyard-left-sub");
   });
 
-  it("advertises firmware version 1.2.0 for iOS cache invalidation", () => {
-    expect(ARGUS_FIRMWARE_REVISION).toBe("1.3.0");
+  it("advertises firmware version 1.3.1 for Baseline profile cache invalidation", () => {
+    expect(ARGUS_FIRMWARE_REVISION).toBe("1.3.1");
   });
 });

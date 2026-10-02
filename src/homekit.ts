@@ -189,7 +189,10 @@ export function buildLiveFfmpegArgs(input: LiveFfmpegInput, includeAudio = true)
           // over veryfast and an M-series core does 1080p30 several times over.
           "-preset", hiResSession ? "faster" : "veryfast",
           "-tune", "zerolatency",
-          "-profile:v", video.profile,
+          // Force Baseline profile for Apple Home compatibility. Field evidence
+          // (2026-10-01): High with dump_extra → "No Response". Baseline is the
+          // Home-friendly unlock path. We advertise only Baseline in HAP.
+          "-profile:v", "baseline",
           "-level", video.level,
           "-pix_fmt", "yuv420p",
           "-color_range", "tv",
@@ -594,7 +597,11 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
       return;
     }
 
-    const profile = H264_PROFILE_TO_X264[request.video.profile] ?? "high";
+    // Force Baseline encoding for Apple Home compatibility. We advertise only
+    // Baseline (streamingOptions), so Home should negotiate it, but we enforce
+    // it here defensively. Field evidence (2026-10-01): High profile with
+    // dump_extra still caused "No Response"; Baseline is the Home-friendly path.
+    const profile = "baseline";
     const level = H264_LEVEL_TO_X264[request.video.level] ?? "4.0";
     const bitrate = this.liveBitrateKbps(
       request.video.width,
@@ -790,7 +797,12 @@ export function buildCameraControllerOptions(
       supportedCryptoSuites: [SRTPCryptoSuites.AES_CM_128_HMAC_SHA1_80],
       video: {
         codec: {
-          profiles: [H264Profile.BASELINE, H264Profile.MAIN, H264Profile.HIGH],
+          // Advertise ONLY Baseline to force Home to negotiate it. Field evidence
+          // (2026-10-01): Home negotiated High, we encoded High with dump_extra,
+          // picture still locked ("No Response"). Hypothesis: Home may refuse
+          // High streams from this accessory even with in-band SPS/PPS. Forcing
+          // Baseline both sides (advertise + encode) as the Home-friendly path.
+          profiles: [H264Profile.BASELINE],
           levels: [H264Level.LEVEL3_1, H264Level.LEVEL3_2, H264Level.LEVEL4_0],
         },
         resolutions,
@@ -821,13 +833,16 @@ export function buildCameraControllerOptions(
  * lastFirmwareVersion in AccessoryInfo for exactly that). BUMP THIS whenever
  * the advertised streaming configuration changes.
  * 
- * 2026-10-02: Bumped to 1.3.0 for video-only interim path. Stream-side A/V
- * sync attempts failed Mini's 2/2 gate (async filters: 4 attempts, all 0/2 or
- * 1/2 unstable). Video-only unlocks picture as shippable interim. Firmware bump
- * required: ARGUS_AUDIO=0 test without bump showed iOS still negotiated audio
- * (cached). Empty codecs + firmware bump → iOS re-reads, honors video-only.
+ * 2026-10-02 (1.3.0): Video-only interim path. A/V sync attempts failed.
+ * Video-only unlocks picture. ARGUS_AUDIO=0 needs firmware bump for iOS
+ * to honor video-only (empty codecs).
+ * 
+ * 2026-10-02 (1.3.1): Force Baseline H.264 profile. Changed advertised profiles
+ * from [BASELINE, MAIN, HIGH] to [BASELINE] only. Field evidence: High with
+ * dump_extra → "No Response"; forcing Baseline as Home-friendly unlock path.
+ * Firmware bump required: iOS caches profile list, won't re-read without it.
  */
-export const ARGUS_FIRMWARE_REVISION = "1.3.0";
+export const ARGUS_FIRMWARE_REVISION = "1.3.1";
 
 export interface CameraAccessoryHandle {
   accessory: Accessory;
