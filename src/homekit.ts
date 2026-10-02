@@ -380,18 +380,9 @@ async function reserveUdpPort(): Promise<number> {
   return new Promise((resolve, reject) => {
     const socket = createSocket("udp4");
     socket.once("error", reject);
-    
-    const timeout = setTimeout(() => {
-      socket.close();
-      reject(new Error("reserveUdpPort timeout after 2s"));
-    }, 2000);
-    
     socket.bind(0, () => {
       const port = socket.address() as { port: number };
-      socket.close(() => {
-        clearTimeout(timeout);
-        resolve(port.port);
-      });
+      socket.close(() => resolve(port.port));
     });
   });
 }
@@ -548,20 +539,6 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
     request: PrepareStreamRequest,
     callback: PrepareStreamCallback,
   ): Promise<void> {
-    let answered = false;
-    const answer = (error?: Error, response?: PrepareStreamResponse): void => {
-      if (answered) return;
-      answered = true;
-      if (error) {
-        callback(error);
-      } else if (response) {
-        callback(undefined, response);
-      } else {
-        // Neither error nor response provided - this is a bug in our code
-        callback(new Error("prepareStreamAsync: answer called with no error or response"));
-      }
-    };
-
     try {
       const videoSsrc = randomBytes(4).readUInt32BE(0) >>> 1;
       const videoRtcp = await reserveUdpPort();
@@ -608,9 +585,9 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
             }
           : {}),
       };
-      answer(undefined, response);
+      callback(undefined, response);
     } catch (error) {
-      answer(error instanceof Error ? error : new Error(String(error)));
+      callback(error instanceof Error ? error : new Error(String(error)));
     }
   }
 
@@ -1046,8 +1023,20 @@ export function buildCameraControllerOptions(
  * path: if called with (undefined, undefined), neither if branch fires → callback never
  * called. Fix: else clause invokes callback(error) explaining the logic bug. Together
  * these ensure HAP callback ALWAYS fires (success, error, or timeout) within 2s.
+ * FIELD TEST RESULT (2026-10-02 ~11:37 ET): 1.3.8 timeout/guard did NOT fix hang.
+ * "Setup Endpoints didn't respond" still appears. Critically: timeout NEVER logged in
+ * field → reserveUdpPort completes within 2s → hang is elsewhere. Root cause clarified:
+ * Setup Endpoints hang is NEW (Oct 1.3.7-1.3.8 only) — zero prior OpenClaw docs before
+ * this line. June working path had NO callback guard. Theory: guard/wrapper itself blocks.
+ * 
+ * 2026-10-02 (1.3.9): Revert to pre-1.3.7 direct callback pattern. Root cause: 1.3.7-1.3.8
+ * callback guard/timeout introduced the Setup Endpoints hang (NEW bug, not in June working
+ * code or firmware 1.3.6). Reverting to firmware 1.3.6 prepareStreamAsync pattern: direct
+ * callback invocation in try/catch, NO answered flag guard, NO reserveUdpPort timeout.
+ * June 2026 (917bc8e) had this simple pattern + Garage Door confirmed working. Matches
+ * historical proven HAP live path: controller SRTP key/salt echoed, simple callback semantics.
  */
-export const ARGUS_FIRMWARE_REVISION = "1.3.8";
+export const ARGUS_FIRMWARE_REVISION = "1.3.9";
 
 export interface CameraAccessoryHandle {
   accessory: Accessory;
@@ -1073,7 +1062,7 @@ export function createCameraAccessory(
   accessory
     .getService(Service.AccessoryInformation)!
     .setCharacteristic(Characteristic.Manufacturer, "Point Labs")
-    .setCharacteristic(Characteristic.Model, "Argus 1.3.8")
+    .setCharacteristic(Characteristic.Model, "Argus 1.3.9")
     .setCharacteristic(Characteristic.SerialNumber, `argus-${camera.host}-${camera.channel}`)
     .setCharacteristic(Characteristic.FirmwareRevision, ARGUS_FIRMWARE_REVISION);
 

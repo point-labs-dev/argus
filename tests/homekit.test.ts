@@ -496,8 +496,8 @@ describe("ArgusStreamingDelegate", () => {
     expect(calls[1]![1].join(" ")).toContain("-i rtsp://127.0.0.1:8554/backyard-left-sub");
   });
 
-  it("advertises firmware version 1.3.8 with Setup Endpoints callback guarantee", () => {
-    expect(ARGUS_FIRMWARE_REVISION).toBe("1.3.8");
+  it("advertises firmware version 1.3.9 (revert to pre-1.3.7 direct callback pattern)", () => {
+    expect(ARGUS_FIRMWARE_REVISION).toBe("1.3.9");
   });
 
   it("omits audio from prepareStream response in video-only mode", async () => {
