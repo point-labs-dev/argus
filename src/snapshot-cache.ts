@@ -146,6 +146,44 @@ export class SnapshotCache {
     return snapshot;
   }
 
+  /**
+   * Pre-warm a stream with retries: used on motion detection to ensure go2rtc's
+   * snapshot endpoint (and by extension, its prebuffer) is ready before a viewer
+   * opens live. Retries up to maxAttempts on failure (HTTP 5xx, timeout) with
+   * exponential backoff.
+   *
+   * A successful snapshot fetch means go2rtc has decoded recent frames into its
+   * prebuffer — the same buffer that feeds RTSP consumers (FFmpeg). This reduces
+   * cold-start latency: when a user taps the live tile, FFmpeg connects to an
+   * already-warm RTSP restream instead of waiting for go2rtc to connect to the
+   * camera + buffer the first keyframe.
+   */
+  public async warmStream(
+    cameraName: string,
+    profile: SnapshotProfile = this.defaultProfile,
+    maxAttempts = 3,
+    baseDelayMs = 100,
+  ): Promise<{ success: boolean; attempts: number; error?: Error }> {
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        await this.refresh(cameraName, profile);
+        return { success: true, attempts: attempt };
+      } catch (error) {
+        const isLast = attempt === maxAttempts;
+        if (isLast) {
+          return {
+            success: false,
+            attempts: attempt,
+            error: error instanceof Error ? error : new Error(String(error)),
+          };
+        }
+        // Exponential backoff: 100ms, 200ms, 400ms...
+        await delay(baseDelayMs * Math.pow(2, attempt - 1), new AbortController().signal);
+      }
+    }
+    return { success: false, attempts: maxAttempts };
+  }
+
   public startPolling(intervalMs = this.pollIntervalMs, profiles: readonly SnapshotProfile[] = [this.defaultProfile]): void {
     if (this.pollingPromise) {
       return;

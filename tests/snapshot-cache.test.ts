@@ -166,4 +166,94 @@ describe("SnapshotCache", () => {
 
     expect(fetchMock).toHaveBeenCalledTimes(callsAfterStop);
   });
+
+  it("warmStream succeeds on first attempt when snapshot fetch succeeds", async () => {
+    const fetchMock = vi.fn(async () => okResponse());
+    const cache = new SnapshotCache(createConfig(), {
+      fetch: fetchMock as unknown as typeof fetch,
+    });
+
+    const result = await cache.warmStream("Front Door", "sub", 3, 100);
+
+    expect(result).toEqual({ success: true, attempts: 1 });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(cache.get("Front Door", "sub")).toBeDefined();
+  });
+
+  it("warmStream retries on HTTP 500 and succeeds on second attempt", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(new Response("Internal Server Error", { status: 500 }))
+      .mockResolvedValueOnce(okResponse());
+    const cache = new SnapshotCache(createConfig(), {
+      fetch: fetchMock as unknown as typeof fetch,
+    });
+
+    const startTime = Date.now();
+    const result = await cache.warmStream("Front Door", "sub", 3, 50);
+    const elapsed = Date.now() - startTime;
+
+    expect(result).toEqual({ success: true, attempts: 2 });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    // Exponential backoff: first retry after 50ms * 2^0 = 50ms
+    expect(elapsed).toBeGreaterThanOrEqual(50);
+    expect(elapsed).toBeLessThan(200);
+  });
+
+  it("warmStream retries on network error and succeeds on third attempt", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("Network timeout"))
+      .mockRejectedValueOnce(new Error("Connection refused"))
+      .mockResolvedValueOnce(okResponse());
+    const cache = new SnapshotCache(createConfig(), {
+      fetch: fetchMock as unknown as typeof fetch,
+    });
+
+    const startTime = Date.now();
+    const result = await cache.warmStream("Front Door", "sub", 3, 50);
+    const elapsed = Date.now() - startTime;
+
+    expect(result).toEqual({ success: true, attempts: 3 });
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    // Exponential backoff: 50ms + 100ms = 150ms minimum
+    expect(elapsed).toBeGreaterThanOrEqual(150);
+    expect(elapsed).toBeLessThan(300);
+  });
+
+  it("warmStream fails after max attempts and returns error", async () => {
+    const testError = new Error("Snapshot request failed for \"Front Door\" (sub): HTTP 500.");
+    const fetchMock = vi.fn(async () => new Response("Internal Server Error", { status: 500 }));
+    const cache = new SnapshotCache(createConfig(), {
+      fetch: fetchMock as unknown as typeof fetch,
+    });
+
+    const result = await cache.warmStream("Front Door", "sub", 3, 50);
+
+    expect(result.success).toBe(false);
+    expect(result.attempts).toBe(3);
+    expect(result.error?.message).toContain("HTTP 500");
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(cache.get("Front Door", "sub")).toBeUndefined();
+  });
+
+  it("warmStream uses exponential backoff between retry attempts", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("fail 1"))
+      .mockRejectedValueOnce(new Error("fail 2"))
+      .mockRejectedValueOnce(new Error("fail 3"));
+    const cache = new SnapshotCache(createConfig(), {
+      fetch: fetchMock as unknown as typeof fetch,
+    });
+
+    const startTime = Date.now();
+    await cache.warmStream("Front Door", "sub", 3, 100);
+    const elapsed = Date.now() - startTime;
+
+    // Backoff: 100ms * 2^0 + 100ms * 2^1 = 100ms + 200ms = 300ms minimum
+    expect(elapsed).toBeGreaterThanOrEqual(300);
+    // Add 200ms buffer for execution time
+    expect(elapsed).toBeLessThan(600);
+  });
 });

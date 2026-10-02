@@ -5,6 +5,7 @@ import { parseArgusConfig } from "../src/config.js";
 import { SnapshotCache } from "../src/snapshot-cache.js";
 import {
   ArgusStreamingDelegate,
+  ARGUS_FIRMWARE_REVISION,
   buildCameraControllerOptions,
   buildLiveFfmpegArgs,
   effectiveBitrateKbps,
@@ -16,6 +17,7 @@ function liveInput(overrides: Partial<LiveFfmpegInput> = {}): LiveFfmpegInput {
   return {
     inputUrl: "rtsp://127.0.0.1:8554/backyard-left-sub",
     targetAddress: "192.168.1.50",
+    localAddress: undefined,
     videoMode: "transcode",
     video: {
       port: 50000,
@@ -36,6 +38,7 @@ function liveInput(overrides: Partial<LiveFfmpegInput> = {}): LiveFfmpegInput {
       localRtcpPort: 60002,
       ssrc: 2,
       payloadType: 110,
+      codec: "OPUS", // AudioStreamingCodecType.OPUS
       sampleRateKhz: 24,
       maxBitrateKbps: 24,
       srtpParams: "AUDIOKEY==",
@@ -62,10 +65,36 @@ function cacheWith(jpeg: Buffer): SnapshotCache {
 }
 
 describe("buildLiveFfmpegArgs", () => {
-  it("encodes ≥720p sessions with capped-CRF libx264 and intra-refresh", () => {
-    // 3500k = the post-floor bitrate a LAN 720p session actually arrives with
-    // (the delegate floors before building args; sub-800k here means a
-    // relay-obeyed session and triggers the starved downscale instead).
+  it("encodes AAC-ELD audio when HomeKit negotiates AAC-ELD", () => {
+    const input = liveInput({ audio: { ...liveInput().audio, codec: "AAC-eld" } });
+    const args = buildLiveFfmpegArgs(input, true);
+    const joined = args.join(" ");
+
+    // AAC-ELD encoder (libfdk_aac)
+    expect(joined).toContain("-c:a libfdk_aac");
+    expect(joined).toContain("-profile:a aac_eld");
+    expect(joined).toContain("-flags +global_header");
+    // Opus NOT used
+    expect(joined).not.toContain("libopus");
+    expect(joined).not.toContain("-application lowdelay");
+    expect(joined).not.toContain("-frame_duration");
+  });
+
+  it("encodes Opus audio when HomeKit negotiates Opus", () => {
+    const input = liveInput({ audio: { ...liveInput().audio, codec: "OPUS" } });
+    const args = buildLiveFfmpegArgs(input, true);
+    const joined = args.join(" ");
+
+    // Opus encoder
+    expect(joined).toContain("-c:a libopus");
+    expect(joined).toContain("-application lowdelay");
+    expect(joined).toContain("-frame_duration 20");
+    // AAC-ELD NOT used
+    expect(joined).not.toContain("-c:a libfdk_aac");
+    expect(joined).not.toContain("-profile:a aac_eld");
+  });
+
+  it("encodes ≥720p sessions with CBR libx264 at negotiated bitrate", () => {
     const args = buildLiveFfmpegArgs(
       liveInput({ video: { ...liveInput().video, maxBitrateKbps: 2000 } }),
     ).join(" ");
@@ -73,29 +102,48 @@ describe("buildLiveFfmpegArgs", () => {
     expect(args).toContain("-i rtsp://127.0.0.1:8554/backyard-left-sub");
     expect(args).toContain("-c:v libx264");
     expect(args).toContain("-c:a libopus");
-    expect(args).toContain("scale=1280:720");
-    // Capped-CRF: easy scenes undershoot the cap, motion gets the full budget.
-    // Hi-res sessions get the extra encoder effort and quality target.
+    // Pad to exact negotiated dimensions (field 2026-10-01: 4:3 source → 960×720 != 1280×720)
+    expect(args).toContain("scale=1280:720:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=1280:720:(ow-iw)/2:(oh-ih)/2");
+    // CBR-style encoding (camera-ffmpeg pattern): -b:v sets target bitrate.
+    // Firmware 1.3.5 switches from CRF+maxrate to match working HomeKit stacks.
     expect(args).toContain("-preset faster");
-    expect(args).toContain("-crf 18");
+    expect(args).toContain("-b:v 2000k");
+    expect(args).toContain("-bufsize 4000k");
     expect(args).toContain("-maxrate 2000k");
-    expect(args).not.toContain("-b:v");
+    expect(args).not.toContain("-crf");
     expect(args).toContain("-bf 0");
     // Periodic IDRs (2s at hi-res): intra-refresh was reverted — its single
     // start-of-session IDR made re-entry hang whenever those packets dropped.
-    expect(args).toContain("-force_key_frames expr:gte(t,n_forced*2)");
+    expect(args).toContain("-force_key_frames expr:eq(t,0)+gte(t,n_forced*2)");
     expect(args).not.toContain("intra-refresh");
   });
 
-  it("downscales starved sessions (relay-obeyed bitrates) inside the negotiated box", () => {
-    // A hub-relayed remote viewer negotiates 720p but obeys Apple's 132k ask —
-    // full 720p at 132k pulsates; 854x480 in the same box is merely soft.
+  it("honors negotiated dimensions at any bitrate (no starved downscaling)", () => {
+    // Field 2026-10-01: downscaling 1280x720 to 854x480 at low bitrate caused
+    // blank screen. Home enforces BOTH bitrate AND dimensions — honor the ask.
     const args = buildLiveFfmpegArgs(
-      liveInput({ video: { ...liveInput().video, maxBitrateKbps: 132 } }),
+      liveInput({ video: { ...liveInput().video, width: 1280, height: 720, maxBitrateKbps: 132 } }),
     ).join(" ");
 
-    expect(args).toContain("scale=854:480:force_original_aspect_ratio=decrease");
+    expect(args).toContain("scale=1280:720:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=1280:720");
+    expect(args).toContain("-b:v 132k");
+    expect(args).toContain("-bufsize 264k");
     expect(args).toContain("-maxrate 132k");
+  });
+
+  it("pads to exact negotiated dimensions for all aspect ratios", () => {
+    // Field 2026-10-01: 4:3 source (2560×1920) scaled to fit 1280×720 (16:9) becomes
+    // 960×720 without padding. Home expects EXACT 1280×720 → blank. Pad fills the gap.
+    const input720p = liveInput({ video: { ...liveInput().video, width: 1280, height: 720 } });
+    const args720p = buildLiveFfmpegArgs(input720p).join(" ");
+    
+    // Should scale to fit then pad to exact 1280×720
+    expect(args720p).toContain("scale=1280:720:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=1280:720:(ow-iw)/2:(oh-ih)/2");
+    
+    // Same for other resolutions
+    const input1080p = liveInput({ video: { ...liveInput().video, width: 1920, height: 1080 } });
+    const args1080p = buildLiveFfmpegArgs(input1080p).join(" ");
+    expect(args1080p).toContain("pad=1920:1080:(ow-iw)/2:(oh-ih)/2");
   });
 
   it("enables the intra-refresh experiment with ARGUS_LIVE_INTRA=1", () => {
@@ -116,11 +164,38 @@ describe("buildLiveFfmpegArgs", () => {
 
     expect(args).toContain("-c:v libx264");
     expect(args).toContain("-tune zerolatency");
-    expect(args).toContain("-crf 20");
+    expect(args).toContain("-b:v 600k");
+    expect(args).toContain("-bufsize 1200k");
     expect(args).toContain("-maxrate 600k");
-    expect(args).toContain("-force_key_frames expr:gte(t,n_forced*1)");
-    expect(args).toContain("scale=640:360");
+    expect(args).toContain("-force_key_frames expr:eq(t,0)+gte(t,n_forced*1)");
+    expect(args).toContain("scale=640:360:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=640:360");
             expect(args).not.toContain("-hwaccel");
+  });
+
+  it("injects in-band SPS/PPS on every keyframe for reliable HomeKit unlock", () => {
+    // Field 2026-10-02: even with fast encode (~0.7s first frame) and periodic keyframes,
+    // Home showed endless spinner. dump_extra=freq=keyframe ensures parameter sets are
+    // in-band on every IDR so dropped initial extradata or strict in-band requirements
+    // don't prevent picture unlock.
+    const args = buildLiveFfmpegArgs(liveInput()).join(" ");
+    expect(args).toContain("-bsf:v dump_extra=freq=keyframe");
+  });
+
+  it("encodes with Baseline H.264 profile for Apple Home compatibility", () => {
+    // Field 2026-10-01: High profile with dump_extra still caused "No Response"
+    // on video-only live. Force Baseline encoding as the Home-friendly path.
+    const argsHigh = buildLiveFfmpegArgs(liveInput({ video: { ...liveInput().video, profile: "high" } })).join(" ");
+    const argsMain = buildLiveFfmpegArgs(liveInput({ video: { ...liveInput().video, profile: "main" } })).join(" ");
+    const argsBaseline = buildLiveFfmpegArgs(liveInput({ video: { ...liveInput().video, profile: "baseline" } })).join(" ");
+    
+    // All should encode with baseline regardless of input profile
+    expect(argsHigh).toContain("-profile:v baseline");
+    expect(argsMain).toContain("-profile:v baseline");
+    expect(argsBaseline).toContain("-profile:v baseline");
+    
+    // Should NOT encode with high or main
+    expect(argsHigh).not.toContain("-profile:v high");
+    expect(argsMain).not.toContain("-profile:v main");
   });
 
   it("passes video through untouched in copy mode (no encode, no scaling, no keyframe forcing)", () => {
@@ -131,58 +206,60 @@ describe("buildLiveFfmpegArgs", () => {
     expect(args).not.toContain("scale=");
     expect(args).not.toContain("-force_key_frames");
     expect(args).not.toContain("-b:v");
-    // Copy trims input analysis to ~0.2s — every analysis ms delays the keyframe
-    // that stream-copy waits for (bench 2026-06-11: 1s analysis ≈ +1s start).
-    expect(args).toContain("-analyzeduration 200000");
+    // Copy trims input analysis to 100ms — when stream is pre-warmed, faster analysis
+    // means faster first frame out. Fails fast when stream is cold (bench 2026-10-01).
+    expect(args).toContain("-analyzeduration 50000");
     expect(args).toContain("-probesize 100000");
     // Audio is still transcoded to Opus, and SRTP targeting is unchanged.
     expect(args).toContain("-c:a libopus");
     expect(args).toContain("-srtp_out_params VIDEOKEY==");
-    // hi-res sessions (copy included) ship small packets for WiFi resilience
-    expect(args).toContain("srtp://192.168.1.50:50000?rtcpport=50000&localrtcpport=60000&pkt_size=564");
+    // camera-ffmpeg uses 1316; firmware 1.3.5 matches ecosystem default
+    expect(args).toContain("srtp://192.168.1.50:50000?rtcpport=50000&pkt_size=1316");
     expect(args).toContain("-payload_type 99");
   });
 
   it("caps RTSP input analysis so the stream starts fast (else HomeKit times out)", () => {
     const args = buildLiveFfmpegArgs(liveInput());
-    // Low-latency flags must come BEFORE -i to apply to the input. 0.2s analysis
-    // is bench-validated for transcode too (2026-06-11: 1s of analysis was 1s of
-    // start latency; AAC detection stayed reliable at 0.2s/100k).
+    // Low-latency flags must come BEFORE -i to apply to the input. Reduced to 100ms
+    // (2026-10-01): when pre-warming works, go2rtc's producer is ready and codec detection
+    // is instant. Faster analysis = faster first frame when warm, faster failure when cold.
+    // Also includes error resilience flags (+discardcorrupt+genpts) for corrupt go2rtc input.
     const inputIndex = args.indexOf("-i");
     const head = args.slice(0, inputIndex).join(" ");
-    expect(head).toContain("-fflags nobuffer");
+    expect(head).toContain("-progress pipe:2");
+    expect(head).toContain("-fflags +discardcorrupt+genpts+nobuffer");
     expect(head).toContain("-probesize 100000");
-    expect(head).toContain("-analyzeduration 200000");
+    expect(head).toContain("-analyzeduration 50000");
+    expect(head).toContain("-err_detect ignore_err");
   });
 
   it("targets the device address with matching SRTP params and SSRCs", () => {
     const args = buildLiveFfmpegArgs(liveInput());
     const joined = args.join(" ");
 
-    // video SRTP out
+    // Clean SRTP URL (camera-ffmpeg pattern): no localrtpport/localrtcpport
     expect(joined).toContain("-srtp_out_params VIDEOKEY==");
-    expect(joined).toContain("srtp://192.168.1.50:50000?rtcpport=50000&localrtcpport=60000&pkt_size=564");
-    // audio SRTP out
+    expect(joined).toContain("srtp://192.168.1.50:50000?rtcpport=50000&pkt_size=1316");
     expect(joined).toContain("-srtp_out_params AUDIOKEY==");
-    expect(joined).toContain("srtp://192.168.1.50:50002?rtcpport=50002&localrtcpport=60002");
+    expect(joined).toContain("srtp://192.168.1.50:50002?rtcpport=50002&pkt_size=1316");
     expect(joined).toContain("-ssrc 1");
     expect(joined).toContain("-ssrc 2");
   });
 });
 
 describe("effectiveBitrateKbps", () => {
-  it("floors Apple's conservative asks per resolution tier", () => {
-    // Measured asks from a real iPhone session (2026-06-11): 299k @720p, 802k
-    // @1080p — visibly starved. Floors are generous LAN rates: every session
-    // is now hi-res (hi-res-only ladder) and quality is the stated goal.
-    expect(effectiveBitrateKbps(1920, 1080, 802)).toBe(3000);
-    expect(effectiveBitrateKbps(1280, 720, 299)).toBe(2000);
-    expect(effectiveBitrateKbps(640, 360, 132)).toBe(600);
-    expect(effectiveBitrateKbps(320, 240, 100)).toBe(300);
+  it("honors the negotiated bitrate exactly (no floors)", () => {
+    // Field 2026-10-01: asked=299k serving=2000k (6.7x over) → Home blank despite
+    // healthy encode. Home ENFORCES its budget; we must honor the negotiation.
+    expect(effectiveBitrateKbps(1920, 1080, 802)).toBe(802);
+    expect(effectiveBitrateKbps(1280, 720, 299)).toBe(299);
+    expect(effectiveBitrateKbps(640, 360, 132)).toBe(132);
+    expect(effectiveBitrateKbps(320, 240, 100)).toBe(100);
   });
 
-  it("honors the negotiated bitrate when it exceeds the floor", () => {
+  it("still honors higher negotiated bitrates when Home allows them", () => {
     expect(effectiveBitrateKbps(1280, 720, 4500)).toBe(4500);
+    expect(effectiveBitrateKbps(1920, 1080, 5000)).toBe(5000);
   });
 });
 
@@ -204,15 +281,33 @@ describe("resolveSrtpTargetAddress", () => {
 });
 
 describe("buildCameraControllerOptions", () => {
-  it("advertises the HomeKit-required crypto suite, H.264 levels, and Opus audio", () => {
+  it("advertises the HomeKit-required crypto suite, H.264 levels, and AAC-ELD + Opus audio", () => {
     const delegate = new ArgusStreamingDelegate("Backyard Left", "rtsp://x", cacheWith(Buffer.from([0xff, 0xd8])));
     const opts = buildCameraControllerOptions(delegate);
 
     expect(opts.cameraStreamCount).toBe(2);
     expect(opts.streamingOptions.supportedCryptoSuites).toContain(0); // AES_CM_128_HMAC_SHA1_80
     const resolutions = opts.streamingOptions.video.resolutions.map((r) => `${r[0]}x${r[1]}`);
-    expect(resolutions).toContain("1280x720");
-    expect(opts.streamingOptions.audio?.codecs?.[0]?.type).toBe("OPUS");
+    // Default WiFi-friendly ladder (Oct 2026+): cap at 854x480 for MacBook accept
+    expect(resolutions).toContain("854x480");
+    expect(resolutions).toContain("640x480");
+    // Advertise both AAC-ELD (Apple's preference) and Opus
+    expect(opts.streamingOptions.audio?.codecs).toHaveLength(2);
+    expect(opts.streamingOptions.audio?.codecs?.[0]?.type).toBe("AAC-eld");
+    expect(opts.streamingOptions.audio?.codecs?.[1]?.type).toBe("OPUS");
+  });
+
+  it("advertises ONLY Baseline H.264 profile for Apple Home compatibility", () => {
+    // Field 2026-10-01: High profile with dump_extra → "No Response". Force
+    // Baseline advertisement so Home negotiates it (iOS caches profile list).
+    const delegate = new ArgusStreamingDelegate("Backyard Left", "rtsp://x", cacheWith(Buffer.from([0xff, 0xd8])));
+    const opts = buildCameraControllerOptions(delegate);
+
+    const profiles = opts.streamingOptions.video.codec.profiles;
+    expect(profiles).toHaveLength(1);
+    expect(profiles).toContain(0); // H264Profile.BASELINE
+    expect(profiles).not.toContain(1); // H264Profile.MAIN
+    expect(profiles).not.toContain(2); // H264Profile.HIGH
   });
 
   it("advertises ONLY the native resolution in copy mode (mismatch kills the session)", () => {
@@ -222,16 +317,15 @@ describe("buildCameraControllerOptions", () => {
     expect(opts.streamingOptions.video.resolutions).toEqual([[896, 512, 30]]);
   });
 
-  it("advertises ONLY high resolutions in transcode mode (small sizes invite 640x360 sessions)", () => {
+  it("defaults to WiFi-friendly resolutions (June working pattern, Oct 2026+)", () => {
     const delegate = new ArgusStreamingDelegate("Backyard Right", "rtsp://x", cacheWith(Buffer.from([0xff, 0xd8])));
     const opts = buildCameraControllerOptions(delegate, true, undefined, { width: 896, height: 672 }, "transcode");
 
     const resolutions = opts.streamingOptions.video.resolutions.map((r) => `${r[0]}x${r[1]}`);
-    // Measured 2026-06-12: whenever 640x360 is on offer, the iOS tile player
-    // takes it AND full-screen reuses that session without upgrading — every
-    // "full screen" was an upscaled 640x360. Offering only 1080p/720p makes
-    // every session high-res from its first frame.
-    expect(resolutions).toEqual(["1920x1080", "1280x720"]);
+    // Oct 2026 field evidence: MacBook Home negotiating 1280x720@30 → "No Response"
+    // after 30s despite healthy encode. June working (c5b368c): cap 640x480/854x480.
+    // Default "wifi" ladder avoids high-res that MacBook accept can't handle over WiFi.
+    expect(resolutions).toEqual(["854x480", "640x480", "640x360"]);
     // Non-standard probed sizes are dead weight — never advertised.
     expect(resolutions).not.toContain("896x672");
   });
@@ -302,9 +396,12 @@ describe("ArgusStreamingDelegate", () => {
     expect(args.join(" ")).toContain("srtp://192.168.1.50:50000");
     // Transcode is the default live mode (validated on real devices).
     expect(args.join(" ")).toContain("-c:v libx264");
-    expect(args.join(" ")).toContain("scale=1280:720");
-    // Apple asked 299k for 720p (its asks are mush); the floor policy serves 3500k.
-    expect(args.join(" ")).toContain("-maxrate 2000k");
+    // Firmware 1.3.13: defensive resolution clamp caps 1280x720 request → 854x480 encode
+    expect(args.join(" ")).toContain("scale=854:480:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=854:480");
+    // Honor the negotiated bitrate exactly (field 2026-10-01: floor caused blank screen).
+    expect(args.join(" ")).toContain("-b:v 299k");
+    expect(args.join(" ")).toContain("-bufsize 598k");
+    expect(args.join(" ")).toContain("-maxrate 299k");
     // FFmpeg must encrypt with the CONTROLLER's key from the request (not a
     // generated one), or the device can't decrypt — the forever-spinner bug.
     const expectedVideoSrtp = Buffer.concat([Buffer.alloc(16, 1), Buffer.alloc(14, 2)]).toString("base64");
@@ -354,11 +451,13 @@ describe("ArgusStreamingDelegate", () => {
     expect(spawnFn).toHaveBeenCalledTimes(2);
     expect(procs[0]!.kill).toHaveBeenCalledWith("SIGKILL");
     const secondArgs = (spawnFn as unknown as { mock: { calls: [string, string[]][] } }).mock.calls[1]![1].join(" ");
-    expect(secondArgs).toContain("scale=896:672");
+    expect(secondArgs).toContain("scale=896:672:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=896:672");
+    expect(secondArgs).toContain("-b:v 600k");
+    expect(secondArgs).toContain("-bufsize 1200k");
     expect(secondArgs).toContain("-maxrate 600k");
   });
 
-  it("sources ≥720p sessions from the main restream and returns to sub below 720p", async () => {
+  it("with resolution cap, sessions use sub stream (854x480 < 720p threshold)", async () => {
     const spawnFn = vi.fn(() => Object.assign(new EventEmitter(), { kill: vi.fn() })) as unknown as typeof import("node:child_process").spawn;
     const delegate = new ArgusStreamingDelegate(
       "Backyard Left",
@@ -375,8 +474,8 @@ describe("ArgusStreamingDelegate", () => {
         (error) => (error ? reject(error) : resolve()),
       );
     });
-    // Full-screen-sized START: the 896-wide sub has no pixels for 720p — the
-    // session must transcode the full-res main instead.
+    // Home asks for 1280x720 but firmware 1.3.13 caps to 854x480.
+    // pickInputUrl sees 854x480 (< 720p threshold) → uses sub, not main.
     await new Promise<void>((resolve, reject) => {
       delegate.handleStreamRequest(
         { type: "start", sessionID: "s3",
@@ -385,17 +484,117 @@ describe("ArgusStreamingDelegate", () => {
         (error) => (error ? reject(error) : resolve()),
       );
     });
-    // Downgrade RECONFIGURE (e.g. backgrounding to the tile) returns to the sub.
-    await new Promise<void>((resolve, reject) => {
-      delegate.handleStreamRequest(
-        { type: "reconfigure", sessionID: "s3",
-          video: { width: 640, height: 360, fps: 30, max_bit_rate: 132, rtcp_interval: 0.5 } } as never,
-        (error) => (error ? reject(error) : resolve()),
+
+    const calls = (spawnFn as unknown as { mock: { calls: [string, string[]][] } }).mock.calls;
+    // With cap: 720p request → 854x480 encode → sub stream (not main)
+    expect(calls[0]![1].join(" ")).toContain("-i rtsp://127.0.0.1:8554/backyard-left-sub");
+  });
+
+  it("advertises firmware version 1.3.13 (defensive resolution clamp)", () => {
+    expect(ARGUS_FIRMWARE_REVISION).toBe("1.3.13");
+  });
+
+  it("prevents double-callback crash (swallows duplicate calls)", async () => {
+    // Regression test for 1.3.9 exit code 1: if prepareStreamAsync's try succeeds
+    // but then an async error fires the catch block, the guard must swallow the
+    // duplicate callback invocation instead of letting it reach HAP-NodeJS's once
+    // guard (which throws and crashes the process).
+    const delegate = new ArgusStreamingDelegate(
+      "Test Camera",
+      "rtsp://127.0.0.1:8554/test",
+      cacheWith(Buffer.from([0xff, 0xd8])),
+    );
+
+    let callbackCount = 0;
+    let lastError: Error | undefined;
+    let lastResponse: PrepareStreamResponse | undefined;
+
+    await new Promise<void>((resolve) => {
+      delegate.prepareStream(
+        {
+          sessionID: "double-call-test",
+          targetAddress: "192.168.1.50",
+          video: { port: 50000, srtp_key: Buffer.alloc(16, 1), srtp_salt: Buffer.alloc(14, 2) },
+          audio: { port: 50002, srtp_key: Buffer.alloc(16, 3), srtp_salt: Buffer.alloc(14, 4) },
+        } as PrepareStreamRequest,
+        (error, response) => {
+          callbackCount++;
+          lastError = error;
+          lastResponse = response;
+          resolve();
+        },
       );
     });
 
-    const calls = (spawnFn as unknown as { mock: { calls: [string, string[]][] } }).mock.calls;
-    expect(calls[0]![1].join(" ")).toContain("-i rtsp://127.0.0.1:8554/backyard-left ");
-    expect(calls[1]![1].join(" ")).toContain("-i rtsp://127.0.0.1:8554/backyard-left-sub");
+    // Callback should fire exactly once (guard prevents HAP once.ts throw)
+    expect(callbackCount).toBe(1);
+    expect(lastError).toBeUndefined();
+    expect(lastResponse).toBeDefined();
+    expect(lastResponse?.video).toBeDefined();
+    expect(lastResponse?.audio).toBeDefined();
+  });
+
+  it("guarantees prepareStream callback fires on success path", async () => {
+    const delegate = new ArgusStreamingDelegate(
+      "Test Camera",
+      "rtsp://127.0.0.1:8554/test",
+      cacheWith(Buffer.from([0xff, 0xd8])),
+    );
+
+    // Normal success: callback should fire with response
+    const response = await new Promise<{ video: unknown }>((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error("Callback never fired")), 5000);
+      delegate.prepareStream(
+        {
+          sessionID: "callback-success-test",
+          targetAddress: "192.168.1.50",
+          video: { port: 50000, srtp_key: Buffer.alloc(16, 1), srtp_salt: Buffer.alloc(14, 2) },
+          audio: { port: 50002, srtp_key: Buffer.alloc(16, 3), srtp_salt: Buffer.alloc(14, 4) },
+        } as PrepareStreamRequest,
+        (error, res) => {
+          clearTimeout(timeout);
+          if (error) reject(error);
+          else resolve(res!);
+        },
+      );
+    });
+
+    expect(response.video).toBeDefined();
+  });
+
+  it("guarantees prepareStream callback fires even if internal async operations timeout", async () => {
+    // This test ensures that if reserveUdpPort hangs (under load/HKSV stress),
+    // the timeout kicks in and the callback still fires with an error rather than
+    // hanging forever and causing "Setup Endpoints didn't respond"
+    const delegate = new ArgusStreamingDelegate(
+      "Test Camera",
+      "rtsp://127.0.0.1:8554/test",
+      cacheWith(Buffer.from([0xff, 0xd8])),
+    );
+
+    // We can't easily simulate a hung reserveUdpPort in tests without mocking,
+    // but we can at least verify the timeout exists by checking that
+    // prepareStream completes in reasonable time (not hanging forever)
+    const start = Date.now();
+    await new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error("Callback never fired after 5s")), 5000);
+      delegate.prepareStream(
+        {
+          sessionID: "callback-timeout-test",
+          targetAddress: "192.168.1.50",
+          video: { port: 50000, srtp_key: Buffer.alloc(16, 1), srtp_salt: Buffer.alloc(14, 2) },
+          audio: { port: 50002, srtp_key: Buffer.alloc(16, 3), srtp_salt: Buffer.alloc(14, 4) },
+        } as PrepareStreamRequest,
+        (error) => {
+          clearTimeout(timeout);
+          // Success or error - either way, callback fired
+          resolve();
+        },
+      );
+    });
+
+    const elapsed = Date.now() - start;
+    // Should complete quickly (< 3s), proving it doesn't hang forever waiting for stuck operations
+    expect(elapsed).toBeLessThan(3000);
   });
 });

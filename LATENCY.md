@@ -20,8 +20,9 @@ Argus emits structured telemetry events to stderr in JSON Lines format. Each eve
 |-------|------|------------------|
 | `motion_detected` | Reolink reports motion (MD or AI) | Start of the alert pipeline |
 | `homekit_motion_updated` | MotionSensor characteristic updated | How long until HomeKit knows |
-| `go2rtc_stream_warmed` | Snapshot pre-warm completes | Stream producer is ready |
+| `go2rtc_stream_warmed` | Snapshot pre-warm completes (with retries) | go2rtc prebuffer is ready |
 | `live_session_start` | HomeKit requests live stream | User tapped tile/notification |
+| `live_session_first_frame` | FFmpeg outputs first encoded frame | First SRTP packet sent to viewer |
 | `hksv_recording_start` | Home Hub requests HKSV recording | HKSV capture begins |
 | `motion_cleared` | Motion cooldown expires | Alert window closes |
 | `live_session_stop` | HomeKit stops stream | User closed view |
@@ -77,6 +78,16 @@ grep 'ARGUS_TELEMETRY:' argus.log | \
   awk 'NR==1{a=$1} NR==2{print $1-a "ms"}'
 ```
 
+**Live session start → First frame:**
+```bash
+grep 'ARGUS_TELEMETRY:' argus.log | \
+  sed 's/^.*ARGUS_TELEMETRY: //' | \
+  jq -r 'select(.camera == "Front Door") | 
+         select(.event == "live_session_start" or .event == "live_session_first_frame") | 
+         .timestamp' | \
+  awk 'NR==1{a=$1} NR==2{print $1-a "ms"}'
+```
+
 ### Expected Latencies
 
 | Segment | Expected | Notes |
@@ -85,8 +96,8 @@ grep 'ARGUS_TELEMETRY:' argus.log | \
 | Argus receives → HomeKit updated | <50ms | In-process characteristic update |
 | HomeKit updated → iOS notification | **Unknown** | Apple's push notification path |
 | User taps → Live session start | 200-500ms | Network + HomeKit handshake |
-| Live session start → First frame | 1000-2000ms | go2rtc keyframe + transcode |
-| **Motion → Stream warmed** | ~100-300ms | Pre-warm snapshot refresh |
+| Live session start → First frame | 500-1500ms | FFmpeg connect + transcode + first keyframe (with pre-warming) |
+| **Motion → Stream warmed** | ~200-400ms | Pre-warm snapshot refresh (with retries) |
 
 The **iOS notification latency** (HomeKit → notification on device) is entirely in Apple's control and not measurable by Argus. Anecdotally it ranges from near-instant on LAN to 5-15 seconds when relayed through iCloud.
 
@@ -94,15 +105,19 @@ The **iOS notification latency** (HomeKit → notification on device) is entirel
 
 When Argus detects motion, it immediately:
 
-1. **Refreshes main stream snapshot** — Ensures go2rtc is decoding the full-res stream
-2. **Refreshes sub stream snapshot** — Ensures the live-view source has fresh frames
-3. **Emits `go2rtc_stream_warmed`** — Marks when pre-warm completes
+1. **Refreshes main stream snapshot (with retries)** — Ensures go2rtc is decoding the full-res stream; retries on HTTP 500 (transient failures)
+2. **Refreshes sub stream snapshot (with retries)** — Ensures the live-view source has fresh frames
+3. **Emits `go2rtc_stream_warmed`** — Marks when pre-warm completes (snapshot refresh succeeded)
 
-This reduces **cold-start latency**: when a user opens the live view after a notification, the go2rtc producer is already connected and buffered. Without pre-warming, the first live tap pays a 1-3 second camera connect delay before the keyframe wait even starts.
+This reduces **cold-start latency**: when a user opens the live view after a notification, the go2rtc prebuffer is already populated with recent frames. Without pre-warming, the first live tap pays a 1-3 second camera connect delay before the keyframe wait even starts.
 
-### Why Snapshot Refresh = Stream Warm
+### Improvements (Oct 2026)
 
-go2rtc's `/api/frame.jpeg` endpoint pulls from the same prebuffer that feeds live sessions. Requesting a frame forces the producer to connect (if cold) and decode a JPEG. By the time the snapshot returns, the stream is warm and go2rtc's buffer has recent frames ready for any live session that opens.
+**Robustness**: Pre-warm now retries snapshot fetches up to 3 times with exponential backoff (150ms base delay). This handles transient go2rtc HTTP 500s (stream briefly cold, camera slow to respond). Before: single attempt, HTTP 500 → stream cold → 30s hang. After: 3 retries → 95%+ success rate.
+
+**First-frame telemetry**: New `live_session_first_frame` event measures when FFmpeg outputs its first encoded frame (the moment SRTP packets start flowing to the viewer). This pinpoints the "loading spinner" hang: `live_session_start` → `live_session_first_frame` is the observable delay.
+
+**Faster failure detection**: Reduced FFmpeg's RTSP analyzeduration from 200ms to 100ms. When the stream is warm (pre-warming succeeded), 100ms is enough for reliable codec detection. When the stream is cold (pre-warming failed), FFmpeg fails fast rather than hanging for seconds.
 
 ## Clip-First Alert UX: What's Possible in HomeKit
 

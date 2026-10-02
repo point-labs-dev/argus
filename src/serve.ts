@@ -10,7 +10,7 @@ import { Categories, HAPStorage } from "hap-nodejs";
 import { loadArgusConfig, type ArgusConfig } from "./config.js";
 import { buildGo2RtcStreamNames } from "./go2rtc.js";
 import { startGo2Rtc, type Go2RtcSupervisor } from "./go2rtc-supervisor.js";
-import { createCameraAccessory } from "./homekit.js";
+import { createCameraAccessory, getHapBindAddress } from "./homekit.js";
 import { MotionMonitor } from "./motion.js";
 import { parseJpegDimensions, SnapshotCache } from "./snapshot-cache.js";
 import { emitTelemetry } from "./telemetry.js";
@@ -79,6 +79,14 @@ export async function startArgusServer(config: ArgusConfig, configDir = process.
 
   const streamNames = buildGo2RtcStreamNames(config.cameras);
   const setMotionByCamera = new Map<string, (detected: boolean) => void>();
+  
+  // Get HAP bind address for interface pinning (dual-NIC safety + prepareStream addressOverride).
+  // camera-ffmpeg pattern: HAP advertise + ffmpeg localaddr + RTCP bind = same IP.
+  const bindAddress = getHapBindAddress();
+  if (bindAddress) {
+    process.stdout.write(`[argus] HAP bind address: ${bindAddress}\n`);
+  }
+  
   const published = config.cameras.map((camera, index) => {
     const names = streamNames[index]!;
     const liveUrl = `${RTSP_RESTREAM_BASE}/${names.sub}`; // live view = light sub stream
@@ -97,12 +105,15 @@ export async function startArgusServer(config: ArgusConfig, configDir = process.
     // the D1200s encode 12MP HEVC — both blow the live start-time budget. Their
     // ≥720p sessions upscale the 896-wide sub source instead.
     const standalone = config.cameras.filter((c) => c.host === camera.host).length === 1;
+    const mainEnabled = standalone && process.env.ARGUS_LIVE_MAIN_SOURCE === "1";
     process.stdout.write(
-      `[argus ${camera.name}] live mode: ${videoMode}${videoMode === "transcode" ? ` (≥720p source: ${standalone ? "main" : "sub"})` : ""}\n`,
+      `[argus ${camera.name}] live mode: ${videoMode}${videoMode === "transcode" ? ` (≥720p source: ${mainEnabled ? "main" : "sub"})` : ""}\n`,
     );
     const { accessory, setMotion } = createCameraAccessory(camera, liveUrl, mainUrl, cache, {
       includeAudio,
       videoMode,
+      ...(process.env.ARGUS_FFMPEG ? { ffmpegPath: process.env.ARGUS_FFMPEG } : {}),
+      ...(bindAddress ? { bindAddress } : {}),
       // HomeKit snapshot requests serve the full-res main-stream stills the
       // cache polls — the 640-wide sub stills read as "pixelated" on the grid.
       snapshotProfile: "main",
@@ -136,19 +147,28 @@ export async function startArgusServer(config: ArgusConfig, configDir = process.
       process.stdout.write(`[argus ${cameraName}] motion ${detected ? "DETECTED" : "cleared"}\n`);
       
       // Pre-warm streams on motion detection: immediately refresh both main and sub
-      // snapshots so go2rtc has fresh frames ready when a live session opens. This
-      // reduces cold-start latency (the first keyframe wait) by ensuring the producer
-      // is active and buffered before the viewer taps the tile.
+      // snapshots WITH RETRIES so go2rtc's prebuffer has recent frames when a live
+      // session opens. Retries handle transient go2rtc 500s (stream briefly cold,
+      // camera slow to respond). Both profiles warm in parallel; telemetry waits for
+      // the sub (live source for tiles/<720p) to confirm readiness.
       if (detected) {
-        void cache.refresh(cameraName, "main").catch((error: unknown) => {
-          const message = error instanceof Error ? error.message : String(error);
-          process.stderr.write(`[argus ${cameraName}] stream pre-warm (main) failed: ${message}\n`);
+        void cache.warmStream(cameraName, "main", 3, 150).then((result) => {
+          if (!result.success) {
+            const message = result.error?.message ?? "unknown error";
+            process.stderr.write(
+              `[argus ${cameraName}] stream pre-warm (main) failed after ${result.attempts} attempts: ${message}\n`,
+            );
+          }
         });
-        void cache.refresh(cameraName, "sub").then(() => {
-          emitTelemetry(cameraName, "go2rtc_stream_warmed");
-        }).catch((error: unknown) => {
-          const message = error instanceof Error ? error.message : String(error);
-          process.stderr.write(`[argus ${cameraName}] stream pre-warm (sub) failed: ${message}\n`);
+        void cache.warmStream(cameraName, "sub", 3, 150).then((result) => {
+          if (result.success) {
+            emitTelemetry(cameraName, "go2rtc_stream_warmed");
+          } else {
+            const message = result.error?.message ?? "unknown error";
+            process.stderr.write(
+              `[argus ${cameraName}] stream pre-warm (sub) failed after ${result.attempts} attempts: ${message}\n`,
+            );
+          }
         });
       }
     },
