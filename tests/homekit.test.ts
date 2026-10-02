@@ -496,8 +496,8 @@ describe("ArgusStreamingDelegate", () => {
     expect(calls[1]![1].join(" ")).toContain("-i rtsp://127.0.0.1:8554/backyard-left-sub");
   });
 
-  it("advertises firmware version 1.3.10 (guard + June simple pattern)", () => {
-    expect(ARGUS_FIRMWARE_REVISION).toBe("1.3.10");
+  it("advertises firmware version 1.3.11 (resolve interface names to IPs)", () => {
+    expect(ARGUS_FIRMWARE_REVISION).toBe("1.3.11");
   });
 
   it("prevents double-callback crash (swallows duplicate calls)", async () => {

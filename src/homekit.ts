@@ -8,10 +8,29 @@ import { networkInterfaces } from "node:os";
  * Prefers ARGUS_HAP_BIND env var, else first non-internal IPv4 (typically en0 on Mac).
  * Scrypted/homebridge pattern: HAP advertise + ffmpeg localaddr + RTCP bind must match
  * to prevent iOS "Drop RTP from unknown source" on dual-NIC systems.
+ * 
+ * CRITICAL: Returns IP ADDRESS (e.g. "10.0.0.46"), NEVER interface name (e.g. "en0").
+ * Interface names cause DNS getaddrinfo ENOTFOUND errors when passed to socket.bind().
  */
 export function getHapBindAddress(): string | undefined {
   if (process.env.ARGUS_HAP_BIND) {
-    return process.env.ARGUS_HAP_BIND;
+    const envValue = process.env.ARGUS_HAP_BIND;
+    // If env var looks like an interface name (not dotted-decimal IP), resolve it
+    if (!/^\d+\.\d+\.\d+\.\d+$/.test(envValue)) {
+      const ifaces = networkInterfaces();
+      const ifaceAddrs = ifaces[envValue];
+      if (ifaceAddrs) {
+        for (const addr of ifaceAddrs) {
+          if (addr.family === "IPv4" && !addr.internal) {
+            return addr.address;
+          }
+        }
+      }
+      // If interface name not found or no IPv4, log warning and fall through
+      console.warn(`[argus] ARGUS_HAP_BIND="${envValue}" is not a valid IP and interface not found; using auto-detect`);
+    } else {
+      return envValue;
+    }
   }
   
   const ifaces = networkInterfaces();
@@ -1049,8 +1068,19 @@ export function buildCameraControllerOptions(
  * Setup Endpoints silent. 1.3.9 had simple logic but no guard → double-callback crash. Fix:
  * restore guard (answered flag with logging) + keep June 917bc8e simple pattern (always audio,
  * plain targetAddress, no spreads). Theory: simple code reaches callback; guard prevents crash.
+ * FIELD TEST RESULT (2026-10-02 ~12:04 ET): prepareStream/once-safe WORKS! live_session_start,
+ * AAC-eld 24kHz negotiated, pkt_size=1316, RTCP bound. Then crash: getaddrinfo ENOTFOUND en0.
+ * Root cause: socket.bind(port, "en0") tries DNS lookup on interface name → ENOTFOUND.
+ * 
+ * 2026-10-02 (1.3.11): Resolve interface names to IP addresses. Root cause: socket.bind() second
+ * parameter must be IP address (e.g. "10.0.0.46"), NOT interface name (e.g. "en0"). Node.js
+ * dgram.bind(port, address) treats address as hostname and does DNS getaddrinfo → ENOTFOUND if
+ * given interface name. Fix: getHapBindAddress() now validates ARGUS_HAP_BIND; if it looks like
+ * interface name (not dotted-decimal IP), resolves to IP via networkInterfaces()[name]. Field
+ * evidence: "addr en0" in logs → socket.bind(port, "en0") → DNS lookup → ENOTFOUND → exit 1.
+ * Preserves 1.3.10 once-safe guard + June simple pattern that proved AAC-eld/1316/live_session_start.
  */
-export const ARGUS_FIRMWARE_REVISION = "1.3.10";
+export const ARGUS_FIRMWARE_REVISION = "1.3.11";
 
 export interface CameraAccessoryHandle {
   accessory: Accessory;
@@ -1076,7 +1106,7 @@ export function createCameraAccessory(
   accessory
     .getService(Service.AccessoryInformation)!
     .setCharacteristic(Characteristic.Manufacturer, "Point Labs")
-    .setCharacteristic(Characteristic.Model, "Argus 1.3.10")
+    .setCharacteristic(Characteristic.Model, "Argus 1.3.11")
     .setCharacteristic(Characteristic.SerialNumber, `argus-${camera.host}-${camera.channel}`)
     .setCharacteristic(Characteristic.FirmwareRevision, ARGUS_FIRMWARE_REVISION);
 
