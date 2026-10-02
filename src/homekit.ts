@@ -807,8 +807,12 @@ export function buildCameraControllerOptions(
  * and HAP-NodeJS auto-bumps c# when this increases (it tracks
  * lastFirmwareVersion in AccessoryInfo for exactly that). BUMP THIS whenever
  * the advertised streaming configuration changes.
+ * 
+ * 2026-10-02: Bumped to 1.2.0 for pad/bitrate/audio fixes. Field evidence:
+ * ARGUS_AUDIO=0 test showed Home still negotiated audio (cached old advertisement)
+ * despite empty codecs array → spinner. Firmware bump forces iOS to re-read.
  */
-export const ARGUS_FIRMWARE_REVISION = "1.1.0";
+export const ARGUS_FIRMWARE_REVISION = "1.2.0";
 
 export interface CameraAccessoryHandle {
   accessory: Accessory;

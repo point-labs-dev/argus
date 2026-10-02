@@ -5,6 +5,7 @@ import { parseArgusConfig } from "../src/config.js";
 import { SnapshotCache } from "../src/snapshot-cache.js";
 import {
   ArgusStreamingDelegate,
+  ARGUS_FIRMWARE_REVISION,
   buildCameraControllerOptions,
   buildLiveFfmpegArgs,
   effectiveBitrateKbps,
@@ -449,5 +450,9 @@ describe("ArgusStreamingDelegate", () => {
     const calls = (spawnFn as unknown as { mock: { calls: [string, string[]][] } }).mock.calls;
     expect(calls[0]![1].join(" ")).toContain("-i rtsp://127.0.0.1:8554/backyard-left ");
     expect(calls[1]![1].join(" ")).toContain("-i rtsp://127.0.0.1:8554/backyard-left-sub");
+  });
+
+  it("advertises firmware version 1.2.0 for iOS cache invalidation", () => {
+    expect(ARGUS_FIRMWARE_REVISION).toBe("1.2.0");
   });
 });
