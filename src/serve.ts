@@ -97,8 +97,9 @@ export async function startArgusServer(config: ArgusConfig, configDir = process.
     // the D1200s encode 12MP HEVC — both blow the live start-time budget. Their
     // ≥720p sessions upscale the 896-wide sub source instead.
     const standalone = config.cameras.filter((c) => c.host === camera.host).length === 1;
+    const mainEnabled = standalone && process.env.ARGUS_LIVE_MAIN_SOURCE === "1";
     process.stdout.write(
-      `[argus ${camera.name}] live mode: ${videoMode}${videoMode === "transcode" ? ` (≥720p source: ${standalone ? "main" : "sub"})` : ""}\n`,
+      `[argus ${camera.name}] live mode: ${videoMode}${videoMode === "transcode" ? ` (≥720p source: ${mainEnabled ? "main" : "sub"})` : ""}\n`,
     );
     const { accessory, setMotion } = createCameraAccessory(camera, liveUrl, mainUrl, cache, {
       includeAudio,

@@ -282,16 +282,14 @@ export function buildLiveFfmpegArgs(input: LiveFfmpegInput, includeAudio = true)
     // --- audio: transcode to negotiated codec, SRTP out ---
     "-vn",
     ...audioCodecArgs,
-    // SYNTHETIC audio clock: regenerate pts from the cumulative sample count,
-    // discarding the camera's wobbly timestamps entirely. The video leg
-    // already gets a steady clock from the -r CFR grid; audio passing the
-    // Reolink wobble (±600ms bursts, measured by validate-av-sync) through
-    // was what tripped iOS's STRICT ≥720p A/V sync pipeline — 640x360 uses a
-    // lenient path and tolerated it all day, video-only sessions rendered,
-    // and every "fluke" 720p render matched a clean stretch between wobble
-    // bursts. Trade-off: lip-sync accuracy to reality can drift if the
-    // camera truly gaps samples — irrelevant for ambient security audio.
-    "-af", "asetpts=N/SR/TB",
+    // Audio PTS: let FFmpeg naturally sync to the video CFR clock (-r 30).
+    // Prior synthetic clock (asetpts=N/SR/TB) invented independent audio PTS
+    // from sample count, causing −1458 ms/min drift vs video (measured offline
+    // validate-av-sync @ 1280x720@299k/40s: skew −207→−693 ms). iOS strictly
+    // gates video presentation on A/V sync at ≥720p; drift beyond ~100 ms/min
+    // stalls the decoder → endless spinner. Video-only decode passed (29.4 fps,
+    // 0 errors) confirming audio gating. Natural FFmpeg A/V sync keeps clocks
+    // within tolerance without manual timestamp surgery.
     "-ac", "1",
     "-ar", `${audio.sampleRateKhz}k`,
     "-b:a", `${audio.maxBitrateKbps}k`,

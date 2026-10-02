@@ -1,7 +1,7 @@
-# Field Deployment Notes — Firmware Cache Fix
+# Field Deployment Notes — A/V Sync Fix
 
 **Date**: 2026-10-02  
-**Commit**: 35a4316  
+**Commit**: [latest]  
 **Target**: Princeton Mac Mini  
 **PR**: https://github.com/point-labs-dev/argus/pull/3
 
@@ -9,7 +9,20 @@
 
 ## Root Cause Summary
 
-**iOS cached old audio advertisement despite configuration change.**
+**Synthetic audio clock drifted −1458 ms/min from CFR video, tripping iOS A/V sync gate.**
+
+**Offline validation proved**:
+- With `asetpts=N/SR/TB`: skew −207→−693 ms over 40s, drift −1458 ms/min
+- Video-only decode: PASS (29.4 fps, 0 errors) on both sub and main
+- iOS gates video on audio sync at ≥720p; drift beyond ~100 ms/min stalls decoder
+
+**Fix**: Remove synthetic audio clock, let FFmpeg naturally sync audio to video CFR grid.
+
+---
+
+## ~~Firmware Cache Theory~~ (Ruled Out)
+
+Initial hypothesis was iOS cached old audio advertisement despite ARGUS_AUDIO=0 test. Firmware bump to 1.2.0 was attempted but offline validation revealed the actual root cause before field test. Keeping firmware at 1.2.0 for cache hygiene but **A/V clock drift was the blocker.**
 
 When Mini was set to `ARGUS_AUDIO=0` (video-only diagnostic mode), the code correctly advertised empty audio codecs `[]`, but iOS Home retained the cached advertisement from before (`[AAC-ELD, Opus]`). This caused:
 
