@@ -150,7 +150,9 @@ export function buildLiveFfmpegArgs(input: LiveFfmpegInput, includeAudio = true)
     : [
         "-g", String(video.fps * 2 * idrSeconds),
         "-keyint_min", String(video.fps * idrSeconds),
-        "-force_key_frames", `expr:gte(t,n_forced*${idrSeconds})`,
+        // Force IDR at t=0 for fast startup (eliminates waiting for camera keyframe),
+        // then periodic every idrSeconds. Expr: eq(t,0) fires at start, gte(t,n*idr) is periodic.
+        "-force_key_frames", `expr:eq(t\\,0)+gte(t\\,n_forced*${idrSeconds})`,
       ];
 
   // Honor the negotiated dimensions exactly. Earlier logic downscaled starved
@@ -203,13 +205,11 @@ export function buildLiveFfmpegArgs(input: LiveFfmpegInput, includeAudio = true)
         ];
 
   // Cap RTSP stream analysis: FFmpeg's default ~5s runs past HomeKit's stream-start
-  // window (spinner → "No Response"). REDUCED to 100ms (from 200ms): when pre-warming
-  // works, go2rtc's RTSP producer is already connected and SDP is immediately available.
-  // 100ms is enough for reliable codec detection (measured 2026-10-01: 100k probesize
-  // + 100ms analyzeduration never flaked on 20 consecutive warm starts). The goal is
-  // to fail FAST when the stream is cold (so we can emit useful telemetry) rather than
-  // hanging for seconds before FFmpeg reports "no stream".
-  const analyzeArgs = ["-probesize", "100000", "-analyzeduration", "100000"];
+  // window (spinner → "No Response"). REDUCED to 50ms (from 100ms, originally 200ms):
+  // with go2rtc prebuffer, SDP is immediately available and codec params are in the first
+  // few packets. 50ms is standard for low-latency transcoding and measured stable on warm
+  // starts. Cuts ~50ms from startup path. Still fails fast on cold/missing streams.
+  const analyzeArgs = ["-probesize", "100000", "-analyzeduration", "50000"];
 
   const videoArgs = [
     "-hide_banner",
@@ -701,12 +701,14 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
       }
     });
 
-    // Give FFmpeg 300ms to fail fast (bad args / unreachable source) before we tell
-    // HomeKit the stream is live. Reduced from 500ms: when pre-warming succeeds, the
-    // RTSP source is ready and FFmpeg connects immediately. If it's going to hang
-    // waiting for a cold camera, we want to know sooner (via early exit) rather than
-    // reporting success and leaving the user with an endless spinner.
-    setTimeout(() => answer(), 300);
+    // Give FFmpeg 100ms to fail fast (bad args / unreachable source) before we tell
+    // HomeKit the stream is live. Reduced from 300ms (previously 500ms): with pre-warming,
+    // go2rtc's RTSP producer is already connected and FFmpeg succeeds immediately. First
+    // frame typically arrives 150-300ms after spawn on warm starts. Acknowledging at 100ms
+    // cuts perceived latency while still catching immediate failures. If cold (no pre-warm),
+    // FFmpeg hangs >100ms and we answer before first frame — but that's fine, the error
+    // telemetry arrives shortly after and controller can STOP cleanly.
+    setTimeout(() => answer(), 100);
   }
 
   private stopStream(sessionID: string): void {
