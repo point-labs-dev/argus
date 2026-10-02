@@ -288,7 +288,9 @@ describe("buildCameraControllerOptions", () => {
     expect(opts.cameraStreamCount).toBe(2);
     expect(opts.streamingOptions.supportedCryptoSuites).toContain(0); // AES_CM_128_HMAC_SHA1_80
     const resolutions = opts.streamingOptions.video.resolutions.map((r) => `${r[0]}x${r[1]}`);
-    expect(resolutions).toContain("1280x720");
+    // Default WiFi-friendly ladder (Oct 2026+): cap at 854x480 for MacBook accept
+    expect(resolutions).toContain("854x480");
+    expect(resolutions).toContain("640x480");
     // Advertise both AAC-ELD (Apple's preference) and Opus
     expect(opts.streamingOptions.audio?.codecs).toHaveLength(2);
     expect(opts.streamingOptions.audio?.codecs?.[0]?.type).toBe("AAC-eld");
@@ -315,16 +317,15 @@ describe("buildCameraControllerOptions", () => {
     expect(opts.streamingOptions.video.resolutions).toEqual([[896, 512, 30]]);
   });
 
-  it("advertises ONLY high resolutions in transcode mode (small sizes invite 640x360 sessions)", () => {
+  it("defaults to WiFi-friendly resolutions (June working pattern, Oct 2026+)", () => {
     const delegate = new ArgusStreamingDelegate("Backyard Right", "rtsp://x", cacheWith(Buffer.from([0xff, 0xd8])));
     const opts = buildCameraControllerOptions(delegate, true, undefined, { width: 896, height: 672 }, "transcode");
 
     const resolutions = opts.streamingOptions.video.resolutions.map((r) => `${r[0]}x${r[1]}`);
-    // Measured 2026-06-12: whenever 640x360 is on offer, the iOS tile player
-    // takes it AND full-screen reuses that session without upgrading — every
-    // "full screen" was an upscaled 640x360. Offering only 1080p/720p makes
-    // every session high-res from its first frame.
-    expect(resolutions).toEqual(["1920x1080", "1280x720"]);
+    // Oct 2026 field evidence: MacBook Home negotiating 1280x720@30 → "No Response"
+    // after 30s despite healthy encode. June working (c5b368c): cap 640x480/854x480.
+    // Default "wifi" ladder avoids high-res that MacBook accept can't handle over WiFi.
+    expect(resolutions).toEqual(["854x480", "640x480", "640x360"]);
     // Non-standard probed sizes are dead weight — never advertised.
     expect(resolutions).not.toContain("896x672");
   });
@@ -496,8 +497,8 @@ describe("ArgusStreamingDelegate", () => {
     expect(calls[1]![1].join(" ")).toContain("-i rtsp://127.0.0.1:8554/backyard-left-sub");
   });
 
-  it("advertises firmware version 1.3.11 (resolve interface names to IPs)", () => {
-    expect(ARGUS_FIRMWARE_REVISION).toBe("1.3.11");
+  it("advertises firmware version 1.3.12 (WiFi resolution cap)", () => {
+    expect(ARGUS_FIRMWARE_REVISION).toBe("1.3.12");
   });
 
   it("prevents double-callback crash (swallows duplicate calls)", async () => {

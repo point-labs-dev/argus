@@ -905,26 +905,40 @@ export function buildCameraControllerOptions(
   //   from the camera main, with no upgrade moment at all.
   // - The probed non-standard sizes (896-wide) were advertised for a day and
   //   never once negotiated — only Apple-ladder entries matter.
-  // ARGUS_LIVE_LADDER=compat restores the small tiers (rollback if some client
-  // — Apple Watch, CarPlay, remote relay — refuses hi-res-only; needs a
-  // configVersion bump to be seen, see the controller-cache trap).
+  // 
+  // UPDATE 2026-10-02: Field evidence shows MacBook Home negotiating 1280x720@30
+  // leads to "No Response" after ~30s spinner even with healthy encode/first_frame.
+  // June working path (c5b368c) capped at 640x480 for WiFi, then Garage Door 854x480.
+  // RTCP starvation observed: one video pkt, no audio, nothing after first_frame.
+  // Theory: 720p over WiFi to MacBook exceeds accept threshold; Home kills session.
+  // 
+  // ARGUS_LIVE_LADDER:
+  // - "hires" (default pre-Oct): [1920x1080, 1280x720] only
+  // - "wifi" (default Oct+): [854x480, 640x480, 640x360] WiFi-friendly June pattern
+  // - "compat": full ladder [1920x1080 down to 320x240]
   const hiResSet: [number, number, number][] = [
     [1920, 1080, 30],
     [1280, 720, 30],
   ];
+  const wifiSet: [number, number, number][] = [
+    [854, 480, 30],   // June Garage Door working resolution
+    [640, 480, 30],   // June WiFi unlock ceiling (c5b368c)
+    [640, 360, 30],
+  ];
   const compatSet: [number, number, number][] = [
     ...hiResSet,
-    [640, 480, 30],
-    [640, 360, 30],
+    ...wifiSet,
     [480, 270, 30],
     [320, 240, 15],
   ];
   const resolutions: [number, number, number][] =
     videoMode === "copy" && liveResolution
       ? [[liveResolution.width, liveResolution.height, 30]]
-      : process.env.ARGUS_LIVE_LADDER === "compat"
-        ? compatSet
-        : hiResSet;
+      : process.env.ARGUS_LIVE_LADDER === "hires"
+        ? hiResSet
+        : process.env.ARGUS_LIVE_LADDER === "compat"
+          ? compatSet
+          : wifiSet;  // Default to WiFi-friendly caps (Oct 2026+)
 
   return {
     cameraStreamCount: 2, // allow two concurrent viewers
@@ -1079,8 +1093,24 @@ export function buildCameraControllerOptions(
  * interface name (not dotted-decimal IP), resolves to IP via networkInterfaces()[name]. Field
  * evidence: "addr en0" in logs → socket.bind(port, "en0") → DNS lookup → ENOTFOUND → exit 1.
  * Preserves 1.3.10 once-safe guard + June simple pattern that proved AAC-eld/1316/live_session_start.
+ * FIELD TEST RESULT (2026-10-02 ~12:13 ET): Crash/ENOTFOUND FIXED! PID stable, Bound RTCP with IP,
+ * live_session_start, first_frame +1.3s, AAC-eld, pkt_size=1316, clean encode on Mini. BUT MacBook
+ * Home still "No Response" after 16-20s spinner. Root cause: post-negotiate Mac accept failure —
+ * 1280x720@30 negotiated but Home never unlocks. RTCP bidirectional BROKEN: one video pkt at +0.5s,
+ * NO audio RTCP, nothing after first_frame. Home waits ~30s then kills session. This is the June
+ * WiFi spinner problem (c5b368c working: cap 640x480; then Garage Door 854x480).
+ * 
+ * 2026-10-02 (1.3.12): Cap live resolution for WiFi accept (June working pattern). Root cause:
+ * MacBook Home negotiates 1280x720@30 but never unlocks picture despite healthy encode/first_frame/
+ * AAC-eld. RTCP starvation observed: one video return pkt, no audio RTCP, nothing after first_frame
+ * → Home waits 30s → kills session → "No Response". June working path (c5b368c) capped resolution
+ * at 640x480 for WiFi reliability, then Garage Door at 854x480. Theory: 720p over WiFi to MacBook
+ * exceeds Home's accept threshold for RTCP/delivery; caps force lower bandwidth negotiation. Fix:
+ * buildCameraControllerOptions now defaults to "wifi" ladder [854x480, 640x480, 640x360] instead
+ * of "hires" [1920x1080, 1280x720]. ARGUS_LIVE_LADDER env var overrides: "hires" (pre-Oct behavior),
+ * "wifi" (default Oct+), "compat" (full ladder down to 320x240). Preserves once-safe + iface→IP.
  */
-export const ARGUS_FIRMWARE_REVISION = "1.3.11";
+export const ARGUS_FIRMWARE_REVISION = "1.3.12";
 
 export interface CameraAccessoryHandle {
   accessory: Accessory;
@@ -1106,7 +1136,7 @@ export function createCameraAccessory(
   accessory
     .getService(Service.AccessoryInformation)!
     .setCharacteristic(Characteristic.Manufacturer, "Point Labs")
-    .setCharacteristic(Characteristic.Model, "Argus 1.3.11")
+    .setCharacteristic(Characteristic.Model, "Argus 1.3.12")
     .setCharacteristic(Characteristic.SerialNumber, `argus-${camera.host}-${camera.channel}`)
     .setCharacteristic(Characteristic.FirmwareRevision, ARGUS_FIRMWARE_REVISION);
 
