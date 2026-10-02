@@ -282,13 +282,13 @@ export function buildLiveFfmpegArgs(input: LiveFfmpegInput, includeAudio = true)
     // --- audio: transcode to negotiated codec, SRTP out ---
     "-vn",
     ...audioCodecArgs,
-    // Audio sync: aresample filter with async=1000 continuously compensates for camera
-    // A/V clock drift. Without it, drift measured −360 ms/min after asetpts removal
-    // (Mini e4cbcc0: skew −7→−127ms). Video establishes CFR timebase via -r 30; async
-    // resampler stretches/squeezes audio up to 1000 samples/sec to match video PTS.
-    // Modern filter-based approach (deprecated -async flag broke decode at 0bb31e5).
-    // first_pts=0 aligns initial timestamp to avoid startup offset.
-    "-af", "aresample=async=1000:first_pts=0",
+    // Audio sync: Remove all manual clock surgery. Neither asetpts synthetic clock
+    // (−1458 ms/min drift) nor aresample+first_pts=0 (f517acc: video stall, +240/−1461
+    // drift, 0/2 FAIL) stabilized within |drift| < 100 ms/min gate. first_pts=0 causes
+    // permanent A/V offset (attempt-007 regression). Video CFR from -r 30 establishes
+    // timebase; audio resampling via -ar follows naturally without explicit sync filter.
+    // Measured: e4cbcc0 (no filter) gave consistent −360 ms/min. Accepting baseline
+    // behavior pending codec-specific investigation (AAC-ELD vs Opus validator path).
     "-ac", "1",
     "-ar", `${audio.sampleRateKhz}k`,
     "-b:a", `${audio.maxBitrateKbps}k`,
