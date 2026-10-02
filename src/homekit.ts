@@ -539,6 +539,17 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
     request: PrepareStreamRequest,
     callback: PrepareStreamCallback,
   ): Promise<void> {
+    let answered = false;
+    const answer = (error?: Error, response?: PrepareStreamResponse): void => {
+      if (answered) return;
+      answered = true;
+      if (error) {
+        callback(error);
+      } else if (response) {
+        callback(undefined, response);
+      }
+    };
+
     try {
       const videoSsrc = randomBytes(4).readUInt32BE(0) >>> 1;
       const videoRtcp = await reserveUdpPort();
@@ -585,9 +596,9 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
             }
           : {}),
       };
-      callback(undefined, response);
+      answer(undefined, response);
     } catch (error) {
-      callback(error instanceof Error ? error : new Error(String(error)));
+      answer(error instanceof Error ? error : new Error(String(error)));
     }
   }
 
@@ -1000,8 +1011,19 @@ export function buildCameraControllerOptions(
  * triggers iOS to re-query accessory capabilities. Previous deploys set ARGUS_AUDIO=1
  * but iOS negotiated video-only (cached metadata from video-only test builds). This
  * bump + accessory info change forces re-read of audio codec advertisement.
+ * FIELD TEST RESULT (2026-10-02 ~11:02 ET): Firmware bump alone did NOT unlock. Field
+ * logs show "This callback function has already been called" in prepareStreamAsync →
+ * no live_session_start → "No Response". Root cause: async error after callback.
+ * 
+ * 2026-10-02 (1.3.7): Fix prepareStreamAsync double-callback race. prepareStreamAsync
+ * called HAP callback on success (line 588), but if async error (e.g., delayed promise
+ * rejection from reserveUdpPort) occurred afterward, catch block called callback again
+ * → HAP-NodeJS "already called" guard → prepareStream fails → no session → "No Response".
+ * Fix: Guard callback with answered flag (pattern from spawnLive). Prevents double-call
+ * even if async errors fire after initial success. Field evidence: KeepAlive restart
+ * concurrent with Home open likely triggered the race.
  */
-export const ARGUS_FIRMWARE_REVISION = "1.3.6";
+export const ARGUS_FIRMWARE_REVISION = "1.3.7";
 
 export interface CameraAccessoryHandle {
   accessory: Accessory;
@@ -1027,7 +1049,7 @@ export function createCameraAccessory(
   accessory
     .getService(Service.AccessoryInformation)!
     .setCharacteristic(Characteristic.Manufacturer, "Point Labs")
-    .setCharacteristic(Characteristic.Model, "Argus 1.3.6")
+    .setCharacteristic(Characteristic.Model, "Argus 1.3.7")
     .setCharacteristic(Characteristic.SerialNumber, `argus-${camera.host}-${camera.channel}`)
     .setCharacteristic(Characteristic.FirmwareRevision, ARGUS_FIRMWARE_REVISION);
 

@@ -496,8 +496,8 @@ describe("ArgusStreamingDelegate", () => {
     expect(calls[1]![1].join(" ")).toContain("-i rtsp://127.0.0.1:8554/backyard-left-sub");
   });
 
-  it("advertises firmware version 1.3.6 to force iOS cache refresh", () => {
-    expect(ARGUS_FIRMWARE_REVISION).toBe("1.3.6");
+  it("advertises firmware version 1.3.7 with prepareStream callback guard", () => {
+    expect(ARGUS_FIRMWARE_REVISION).toBe("1.3.7");
   });
 
   it("omits audio from prepareStream response in video-only mode", async () => {
