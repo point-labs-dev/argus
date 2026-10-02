@@ -380,9 +380,18 @@ async function reserveUdpPort(): Promise<number> {
   return new Promise((resolve, reject) => {
     const socket = createSocket("udp4");
     socket.once("error", reject);
+    
+    const timeout = setTimeout(() => {
+      socket.close();
+      reject(new Error("reserveUdpPort timeout after 2s"));
+    }, 2000);
+    
     socket.bind(0, () => {
       const port = socket.address() as { port: number };
-      socket.close(() => resolve(port.port));
+      socket.close(() => {
+        clearTimeout(timeout);
+        resolve(port.port);
+      });
     });
   });
 }
@@ -547,6 +556,9 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
         callback(error);
       } else if (response) {
         callback(undefined, response);
+      } else {
+        // Neither error nor response provided - this is a bug in our code
+        callback(new Error("prepareStreamAsync: answer called with no error or response"));
       }
     };
 
@@ -1022,8 +1034,20 @@ export function buildCameraControllerOptions(
  * Fix: Guard callback with answered flag (pattern from spawnLive). Prevents double-call
  * even if async errors fire after initial success. Field evidence: KeepAlive restart
  * concurrent with Home open likely triggered the race.
+ * FIELD TEST RESULT (2026-10-02 ~11:18 ET): 1.3.7 fixed double-callback but NO
+ * live_session_start still. HAP warning: "Setup Endpoints didn't respond at all" +
+ * "was slow to respond". Root cause: answered flag correct but callback never invoked.
+ * 
+ * 2026-10-02 (1.3.8): Fix Setup Endpoints callback never-called paths. Two bugs:
+ * (1) reserveUdpPort() can hang forever if socket bind/close callbacks stall under
+ * load (HEVC/HKSV noise) → prepareStreamAsync awaits forever → HAP callback never
+ * invoked → "didn't respond at all". Fix: 2s timeout on reserveUdpPort rejects promise
+ * → catch block fires → callback(error) properly invoked. (2) answer() guard had silent
+ * path: if called with (undefined, undefined), neither if branch fires → callback never
+ * called. Fix: else clause invokes callback(error) explaining the logic bug. Together
+ * these ensure HAP callback ALWAYS fires (success, error, or timeout) within 2s.
  */
-export const ARGUS_FIRMWARE_REVISION = "1.3.7";
+export const ARGUS_FIRMWARE_REVISION = "1.3.8";
 
 export interface CameraAccessoryHandle {
   accessory: Accessory;
@@ -1049,7 +1073,7 @@ export function createCameraAccessory(
   accessory
     .getService(Service.AccessoryInformation)!
     .setCharacteristic(Characteristic.Manufacturer, "Point Labs")
-    .setCharacteristic(Characteristic.Model, "Argus 1.3.7")
+    .setCharacteristic(Characteristic.Model, "Argus 1.3.8")
     .setCharacteristic(Characteristic.SerialNumber, `argus-${camera.host}-${camera.channel}`)
     .setCharacteristic(Characteristic.FirmwareRevision, ARGUS_FIRMWARE_REVISION);
 
