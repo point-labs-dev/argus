@@ -212,7 +212,8 @@ describe("buildLiveFfmpegArgs", () => {
     expect(args).toContain("-c:a libopus");
     expect(args).toContain("-srtp_out_params VIDEOKEY==");
     // hi-res sessions (copy included) ship small packets for WiFi resilience
-    expect(args).toContain("srtp://192.168.1.50:50000?rtcpport=50000&localrtpport=60000&pkt_size=564");
+    // No localrtpport: let ffmpeg choose source port (homebridge pattern)
+    expect(args).toContain("srtp://192.168.1.50:50000?rtcpport=50000&pkt_size=564");
     expect(args).toContain("-payload_type 99");
   });
 
@@ -235,12 +236,12 @@ describe("buildLiveFfmpegArgs", () => {
     const args = buildLiveFfmpegArgs(liveInput());
     const joined = args.join(" ");
 
-    // video SRTP out
+    // video SRTP out (no localrtpport: homebridge pattern)
     expect(joined).toContain("-srtp_out_params VIDEOKEY==");
-    expect(joined).toContain("srtp://192.168.1.50:50000?rtcpport=50000&localrtpport=60000&pkt_size=564");
-    // audio SRTP out
+    expect(joined).toContain("srtp://192.168.1.50:50000?rtcpport=50000&pkt_size=564");
+    // audio SRTP out (no localrtpport: homebridge pattern)
     expect(joined).toContain("-srtp_out_params AUDIOKEY==");
-    expect(joined).toContain("srtp://192.168.1.50:50002?rtcpport=50002&localrtpport=60002");
+    expect(joined).toContain("srtp://192.168.1.50:50002?rtcpport=50002");
     expect(joined).toContain("-ssrc 1");
     expect(joined).toContain("-ssrc 2");
   });
@@ -491,8 +492,8 @@ describe("ArgusStreamingDelegate", () => {
     expect(calls[1]![1].join(" ")).toContain("-i rtsp://127.0.0.1:8554/backyard-left-sub");
   });
 
-  it("advertises firmware version 1.3.3 for RTCP keepalive fix", () => {
-    expect(ARGUS_FIRMWARE_REVISION).toBe("1.3.3");
+  it("advertises firmware version 1.3.4 for bidirectional RTCP fix", () => {
+    expect(ARGUS_FIRMWARE_REVISION).toBe("1.3.4");
   });
 
   it("omits audio from prepareStream response in video-only mode", async () => {
