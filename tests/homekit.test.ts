@@ -115,7 +115,7 @@ describe("buildLiveFfmpegArgs", () => {
     expect(args).toContain("-bf 0");
     // Periodic IDRs (2s at hi-res): intra-refresh was reverted — its single
     // start-of-session IDR made re-entry hang whenever those packets dropped.
-    expect(args).toContain("-force_key_frames expr:eq(t\\,0)+gte(t\\,n_forced*2)");
+    expect(args).toContain("-force_key_frames expr:eq(t,0)+gte(t,n_forced*2)");
     expect(args).not.toContain("intra-refresh");
   });
 
@@ -165,7 +165,7 @@ describe("buildLiveFfmpegArgs", () => {
     expect(args).toContain("-tune zerolatency");
     expect(args).toContain("-crf 20");
     expect(args).toContain("-maxrate 600k");
-    expect(args).toContain("-force_key_frames expr:eq(t\\,0)+gte(t\\,n_forced*1)");
+    expect(args).toContain("-force_key_frames expr:eq(t,0)+gte(t,n_forced*1)");
     expect(args).toContain("scale=640:360:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=640:360");
             expect(args).not.toContain("-hwaccel");
   });

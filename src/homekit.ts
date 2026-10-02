@@ -152,7 +152,7 @@ export function buildLiveFfmpegArgs(input: LiveFfmpegInput, includeAudio = true)
         "-keyint_min", String(video.fps * idrSeconds),
         // Force IDR at t=0 for fast startup (eliminates waiting for camera keyframe),
         // then periodic every idrSeconds. Expr: eq(t,0) fires at start, gte(t,n*idr) is periodic.
-        "-force_key_frames", `expr:eq(t\\,0)+gte(t\\,n_forced*${idrSeconds})`,
+        "-force_key_frames", `expr:eq(t,0)+gte(t,n_forced*${idrSeconds})`,
       ];
 
   // Honor the negotiated dimensions exactly. Earlier logic downscaled starved
