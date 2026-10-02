@@ -282,14 +282,13 @@ export function buildLiveFfmpegArgs(input: LiveFfmpegInput, includeAudio = true)
     // --- audio: transcode to negotiated codec, SRTP out ---
     "-vn",
     ...audioCodecArgs,
-    // Audio sync: -async 1 compensates for camera A/V clock drift by stretching/
-    // squeezing audio to match video PTS. Without it, drift measured −360 ms/min
-    // even after removing asetpts (Mini e4cbcc0 validate-av-sync: skew −7→−127ms).
-    // Video establishes CFR timebase via -r 30; async=1 locks audio resampler to it.
-    // This is FFmpeg's standard A/V sync mechanism (special case: corrects start only,
-    // no continuous stretching that would degrade quality). Combined with asetpts
-    // removal, achieves |drift| < 100 ms/min gate (iOS ≥720p A/V sync tolerance).
-    "-async", "1",
+    // Audio sync: aresample filter with async=1000 continuously compensates for camera
+    // A/V clock drift. Without it, drift measured −360 ms/min after asetpts removal
+    // (Mini e4cbcc0: skew −7→−127ms). Video establishes CFR timebase via -r 30; async
+    // resampler stretches/squeezes audio up to 1000 samples/sec to match video PTS.
+    // Modern filter-based approach (deprecated -async flag broke decode at 0bb31e5).
+    // first_pts=0 aligns initial timestamp to avoid startup offset.
+    "-af", "aresample=async=1000:first_pts=0",
     "-ac", "1",
     "-ar", `${audio.sampleRateKhz}k`,
     "-b:a", `${audio.maxBitrateKbps}k`,
