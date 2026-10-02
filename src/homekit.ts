@@ -260,7 +260,15 @@ export function buildLiveFfmpegArgs(input: LiveFfmpegInput, includeAudio = true)
     // (relay + tile sessions rendered; payload decode-validated locally) —
     // smaller datagrams lose less per WiFi drop and aggregate better. The
     // documented mitigation rung from the goal prompt's WiFi ladder.
-    `srtp://${targetAddress}:${video.port}?rtcpport=${video.port}&localrtcpport=${video.localRtcpPort}&pkt_size=${hiResSession ? Math.min(564, video.mtu) : video.mtu}`,
+    //
+    // CRITICAL: Use localrtpport (not localrtcpport) to fix HomeKit's 30-second
+    // RTCP timeout. HomeKit requires RTCP keepalive packets to keep the stream
+    // alive. localrtpport binds ffmpeg's RTP source port; RTCP defaults to RTP+1.
+    // localrtcpport alone leaves RTP on a random port, breaking RTCP correlation.
+    // Field evidence (2026-10-02): video-only stream ran 30s (~900 frames) then
+    // Home killed it with "No Response" — HomeKit's RTCP timeout. Same root cause
+    // as Home Assistant PR #99989 and Ring issue #479.
+    `srtp://${targetAddress}:${video.port}?rtcpport=${video.port}&localrtpport=${video.localRtcpPort}&pkt_size=${hiResSession ? Math.min(564, video.mtu) : video.mtu}`,
   ];
 
   if (!includeAudio) {
@@ -311,7 +319,8 @@ export function buildLiveFfmpegArgs(input: LiveFfmpegInput, includeAudio = true)
     "-f", "rtp",
     "-srtp_out_suite", "AES_CM_128_HMAC_SHA1_80",
     "-srtp_out_params", audio.srtpParams,
-    `srtp://${targetAddress}:${audio.port}?rtcpport=${audio.port}&localrtcpport=${audio.localRtcpPort}&pkt_size=188`,
+    // Use localrtpport (same RTCP fix as video above)
+    `srtp://${targetAddress}:${audio.port}?rtcpport=${audio.port}&localrtpport=${audio.localRtcpPort}&pkt_size=188`,
   ];
 }
 
@@ -860,8 +869,15 @@ export function buildCameraControllerOptions(
  * omit audio from prepareStream response so Home doesn't wait for audio packets
  * that will never arrive. This was causing "No Response" despite healthy video.
  * Also add flush_packets and max_delay for immediate RTP transmission.
+ * 
+ * 2026-10-02 (1.3.3): Fix RTCP keepalive for HomeKit stream liveness. Changed
+ * ffmpeg SRTP URL from localrtcpport to localrtpport. HomeKit requires RTCP
+ * packets to keep streams alive (30-second timeout). localrtcpport alone left
+ * RTP on a random port, breaking RTCP correlation. Field evidence: video-only
+ * streams ran exactly 30s (~900 frames) then "No Response" — HomeKit's RTCP
+ * timeout. Same root cause as Home Assistant PR #99989 and Ring issue #479.
  */
-export const ARGUS_FIRMWARE_REVISION = "1.3.2";
+export const ARGUS_FIRMWARE_REVISION = "1.3.3";
 
 export interface CameraAccessoryHandle {
   accessory: Accessory;
