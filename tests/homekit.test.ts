@@ -496,34 +496,48 @@ describe("ArgusStreamingDelegate", () => {
     expect(calls[1]![1].join(" ")).toContain("-i rtsp://127.0.0.1:8554/backyard-left-sub");
   });
 
-  it("advertises firmware version 1.3.9 (revert to pre-1.3.7 direct callback pattern)", () => {
-    expect(ARGUS_FIRMWARE_REVISION).toBe("1.3.9");
+  it("advertises firmware version 1.3.10 (guard + June simple pattern)", () => {
+    expect(ARGUS_FIRMWARE_REVISION).toBe("1.3.10");
   });
 
-  it("omits audio from prepareStream response in video-only mode", async () => {
+  it("prevents double-callback crash (swallows duplicate calls)", async () => {
+    // Regression test for 1.3.9 exit code 1: if prepareStreamAsync's try succeeds
+    // but then an async error fires the catch block, the guard must swallow the
+    // duplicate callback invocation instead of letting it reach HAP-NodeJS's once
+    // guard (which throws and crashes the process).
     const delegate = new ArgusStreamingDelegate(
-      "Garage Door",
-      "rtsp://127.0.0.1:8554/garage-door-sub",
+      "Test Camera",
+      "rtsp://127.0.0.1:8554/test",
       cacheWith(Buffer.from([0xff, 0xd8])),
-      { includeAudio: false }, // Video-only mode
     );
 
-    const response = await new Promise<{ video: unknown; audio?: unknown }>((resolve, reject) => {
+    let callbackCount = 0;
+    let lastError: Error | undefined;
+    let lastResponse: PrepareStreamResponse | undefined;
+
+    await new Promise<void>((resolve) => {
       delegate.prepareStream(
         {
-          sessionID: "video-only-test",
+          sessionID: "double-call-test",
           targetAddress: "192.168.1.50",
           video: { port: 50000, srtp_key: Buffer.alloc(16, 1), srtp_salt: Buffer.alloc(14, 2) },
           audio: { port: 50002, srtp_key: Buffer.alloc(16, 3), srtp_salt: Buffer.alloc(14, 4) },
         } as PrepareStreamRequest,
-        (error, res) => (error ? reject(error) : resolve(res!)),
+        (error, response) => {
+          callbackCount++;
+          lastError = error;
+          lastResponse = response;
+          resolve();
+        },
       );
     });
 
-    // Video-only mode: response should NOT include audio
-    // This tells Home not to wait for audio packets that will never arrive
-    expect(response.video).toBeDefined();
-    expect(response.audio).toBeUndefined();
+    // Callback should fire exactly once (guard prevents HAP once.ts throw)
+    expect(callbackCount).toBe(1);
+    expect(lastError).toBeUndefined();
+    expect(lastResponse).toBeDefined();
+    expect(lastResponse?.video).toBeDefined();
+    expect(lastResponse?.audio).toBeDefined();
   });
 
   it("guarantees prepareStream callback fires on success path", async () => {

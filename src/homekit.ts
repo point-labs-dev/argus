@@ -409,8 +409,6 @@ interface ActiveSession {
   rtcpWatchdog?: NodeJS.Timeout;
   prepared: {
     targetAddress: string;
-    /** The controller's requested address BEFORE any loopback rewrite — identity, not routing. */
-    controllerAddress: string;
     video: { port: number; localRtcpPort: number; ssrc: number; srtpParams: string };
     audio: { port: number; localRtcpPort: number; ssrc: number; srtpParams: string };
   };
@@ -539,55 +537,60 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
     request: PrepareStreamRequest,
     callback: PrepareStreamCallback,
   ): Promise<void> {
+    // Guard against double-calling (HAP-NodeJS throws if callback invoked twice).
+    // Field 1.3.9: removing guard caused double-callback → process crash exit 1.
+    let answered = false;
+    const answer = (error?: Error, response?: PrepareStreamResponse): void => {
+      if (answered) {
+        this.logLine(`prepareStream: callback already answered, ignoring duplicate call`);
+        return;
+      }
+      answered = true;
+      if (error) {
+        callback(error);
+      } else if (response) {
+        callback(undefined, response);
+      } else {
+        callback(new Error("prepareStreamAsync: answer called with no error or response"));
+      }
+    };
+
     try {
       const videoSsrc = randomBytes(4).readUInt32BE(0) >>> 1;
+      const audioSsrc = randomBytes(4).readUInt32BE(0) >>> 1;
       const videoRtcp = await reserveUdpPort();
+      const audioRtcp = await reserveUdpPort();
+      // Encrypt outbound with the controller's own key material (from the request),
+      // and echo it back in the response. Generating fresh keys here is the classic
+      // "stream sends but the device shows a forever-spinner" bug.
       const videoSrtpParams = srtpParamsFromRequest(request.video.srtp_key, request.video.srtp_salt);
+      const audioSrtpParams = srtpParamsFromRequest(request.audio.srtp_key, request.audio.srtp_salt);
 
-      // In video-only mode (includeAudio=false), we advertise empty audio codecs.
-      // HomeKit may still send audio parameters in the request, but we should NOT
-      // include audio in our response - doing so tells Home we'll send audio packets,
-      // which we won't. Home then waits forever for audio that never arrives.
-      const preparedSession: ActiveSession["prepared"] = {
-        targetAddress: resolveSrtpTargetAddress(request.targetAddress),
-        controllerAddress: request.targetAddress,
-        video: { port: request.video.port, localRtcpPort: videoRtcp, ssrc: videoSsrc, srtpParams: videoSrtpParams },
-        audio: this.includeAudio
-          ? {
-              port: request.audio.port,
-              localRtcpPort: await reserveUdpPort(),
-              ssrc: randomBytes(4).readUInt32BE(0) >>> 1,
-              srtpParams: srtpParamsFromRequest(request.audio.srtp_key, request.audio.srtp_salt),
-            }
-          : { port: 0, localRtcpPort: 0, ssrc: 0, srtpParams: "" }, // Dummy values for video-only
-      };
-
-      this.sessions.set(request.sessionID, { prepared: preparedSession });
+      this.sessions.set(request.sessionID, {
+        prepared: {
+          targetAddress: request.targetAddress,
+          video: { port: request.video.port, localRtcpPort: videoRtcp, ssrc: videoSsrc, srtpParams: videoSrtpParams },
+          audio: { port: request.audio.port, localRtcpPort: audioRtcp, ssrc: audioSsrc, srtpParams: audioSrtpParams },
+        },
+      });
 
       const response: PrepareStreamResponse = {
-        ...(this.bindAddress ? { addressOverride: this.bindAddress } : {}),
         video: {
           port: videoRtcp,
           ssrc: videoSsrc,
           srtp_key: request.video.srtp_key,
           srtp_salt: request.video.srtp_salt,
         },
-        // Only include audio in response if we're actually going to send audio.
-        // In video-only mode, omitting audio tells Home not to wait for audio packets.
-        ...(this.includeAudio
-          ? {
-              audio: {
-                port: preparedSession.audio.localRtcpPort,
-                ssrc: preparedSession.audio.ssrc,
-                srtp_key: request.audio.srtp_key,
-                srtp_salt: request.audio.srtp_salt,
-              },
-            }
-          : {}),
+        audio: {
+          port: audioRtcp,
+          ssrc: audioSsrc,
+          srtp_key: request.audio.srtp_key,
+          srtp_salt: request.audio.srtp_salt,
+        },
       };
-      callback(undefined, response);
+      answer(undefined, response);
     } catch (error) {
-      callback(error instanceof Error ? error : new Error(String(error)));
+      answer(error instanceof Error ? error : new Error(String(error)));
     }
   }
 
@@ -632,7 +635,7 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
       request.video.width,
       request.video.height,
       request.video.max_bit_rate,
-      session.prepared.controllerAddress,
+      session.prepared.targetAddress,
     );
     const next: LiveFfmpegInput = {
       ...session.liveInput,
@@ -672,7 +675,7 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
       request.video.width,
       request.video.height,
       request.video.max_bit_rate,
-      session.prepared.controllerAddress,
+      session.prepared.targetAddress,
     );
     // Log negotiation details
     const audioLog = this.includeAudio
@@ -1035,8 +1038,19 @@ export function buildCameraControllerOptions(
  * callback invocation in try/catch, NO answered flag guard, NO reserveUdpPort timeout.
  * June 2026 (917bc8e) had this simple pattern + Garage Door confirmed working. Matches
  * historical proven HAP live path: controller SRTP key/salt echoed, simple callback semantics.
+ * FIELD TEST RESULT (2026-10-02 ~11:54 ET): Process CRASHED exit 1. Double-callback error
+ * returned in HKSV path → HAP-NodeJS throws → process dies → MacBook click hit dead/restarting
+ * process → instant "No Response". Reverting guard brought back the race that 1.3.7 fixed.
+ * 
+ * 2026-10-02 (1.3.10): Guard + June simple pattern. Root cause: need BOTH (1) callback guard
+ * to prevent double-call crash AND (2) June simple logic without complex spreads/conditionals
+ * that might throw. 1.3.7-1.3.8 had guard but complex response building (addressOverride spread,
+ * conditional audio, resolveSrtpTargetAddress) that likely threw before reaching callback →
+ * Setup Endpoints silent. 1.3.9 had simple logic but no guard → double-callback crash. Fix:
+ * restore guard (answered flag with logging) + keep June 917bc8e simple pattern (always audio,
+ * plain targetAddress, no spreads). Theory: simple code reaches callback; guard prevents crash.
  */
-export const ARGUS_FIRMWARE_REVISION = "1.3.9";
+export const ARGUS_FIRMWARE_REVISION = "1.3.10";
 
 export interface CameraAccessoryHandle {
   accessory: Accessory;
@@ -1062,7 +1076,7 @@ export function createCameraAccessory(
   accessory
     .getService(Service.AccessoryInformation)!
     .setCharacteristic(Characteristic.Manufacturer, "Point Labs")
-    .setCharacteristic(Characteristic.Model, "Argus 1.3.9")
+    .setCharacteristic(Characteristic.Model, "Argus 1.3.10")
     .setCharacteristic(Characteristic.SerialNumber, `argus-${camera.host}-${camera.channel}`)
     .setCharacteristic(Characteristic.FirmwareRevision, ARGUS_FIRMWARE_REVISION);
 
