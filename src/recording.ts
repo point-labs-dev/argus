@@ -90,8 +90,12 @@ export function buildRecordingFfmpegArgs(mainUrl: string, config: CameraRecordin
     "-hide_banner",
     "-loglevel", "error",
     "-fflags", "nobuffer",
+    // 200ms analysis is the measured floor that still reliably catches the AAC
+    // audio stream (LEARNINGS 2026-06-11); the mains are preloaded in go2rtc so
+    // codec params are available immediately. The old 1s cap added up to ~800ms
+    // to every recording start for nothing.
     "-probesize", "500000",
-    "-analyzeduration", "1000000",
+    "-analyzeduration", "200000",
     "-rtsp_transport", "tcp",
     "-i", mainUrl,
 
@@ -183,20 +187,29 @@ export class ArgusRecordingDelegate implements CameraRecordingDelegate {
       if (this.verbose) process.stderr.write(`[argus ${this.cameraName}] hksv-ffmpeg: ${chunk.toString().trimEnd()}\n`);
     });
 
-    // Hold one segment back so the final one can be flagged isLast.
-    let pending: Buffer | undefined;
+    // Deliver each segment the moment it completes. The previous shape held one
+    // segment back so the final one could be flagged isLast, which delayed
+    // EVERY packet by one full 4s fragment — the Home Hub got the init segment
+    // at ~+4s and the first visible video at ~+8s (measured,
+    // scripts/verify-hksv-delivery.mjs). The hub ends recordings itself
+    // (closeRecordingStream / the abort signal), so the clean-EOF isLast case
+    // never occurs in practice; if ffmpeg's output ends on its own, HAP-NodeJS
+    // logs the missing endOfStream and frees the stream via its close timeout.
+    let mediaFragments = 0;
     try {
       for await (const segment of readFragmentedMp4(ffmpeg.stdout!)) {
         if (signal?.aborted) {
           break;
         }
-        if (pending !== undefined) {
-          yield { data: pending, isLast: false };
+        if (!segment.isInit) {
+          mediaFragments += 1;
+          if (mediaFragments === 1) {
+            // Field lever: motion → hksv_first_fragment is the measurable
+            // "recording visible to the hub" latency.
+            emitTelemetry(this.cameraName, "hksv_first_fragment", { streamId });
+          }
         }
-        pending = segment.data;
-      }
-      if (pending !== undefined) {
-        yield { data: pending, isLast: true };
+        yield { data: segment.data, isLast: false };
       }
     } finally {
       emitTelemetry(this.cameraName, "hksv_recording_stop", { streamId });
