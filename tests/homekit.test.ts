@@ -1,3 +1,4 @@
+import { createSocket } from "node:dgram";
 import { EventEmitter } from "node:events";
 import { describe, expect, it, vi } from "vitest";
 
@@ -484,6 +485,10 @@ describe("ArgusStreamingDelegate", () => {
     });
   }
 
+  function stopSession(delegate: ArgusStreamingDelegate, sessionID: string): void {
+    delegate.handleStreamRequest({ type: "stop", sessionID } as never, () => {});
+  }
+
   it("sources MAIN for a full-screen ask even when the cap lowers the encode below 720p", async () => {
     const spawnFn = vi.fn(() => Object.assign(new EventEmitter(), { kill: vi.fn() })) as unknown as typeof import("node:child_process").spawn;
     const delegate = new ArgusStreamingDelegate(
@@ -502,6 +507,7 @@ describe("ArgusStreamingDelegate", () => {
     const args = (spawnFn as unknown as { mock: { calls: [string, string[]][] } }).mock.calls[0]![1].join(" ");
     expect(args).toContain("-i rtsp://127.0.0.1:8554/backyard-left ");
     expect(args).toContain("scale=854:480:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=854:480");
+    stopSession(delegate, "s3");
   });
 
   it("keeps tile sessions (640x360 ask) on the sub stream even with a main grant", async () => {
@@ -517,6 +523,7 @@ describe("ArgusStreamingDelegate", () => {
 
     const args = (spawnFn as unknown as { mock: { calls: [string, string[]][] } }).mock.calls[0]![1].join(" ");
     expect(args).toContain("-i rtsp://127.0.0.1:8554/backyard-left-sub");
+    stopSession(delegate, "s4");
   });
 
   it("serves full-screen asks from the sub when no main grant exists (NVR channels)", async () => {
@@ -533,6 +540,7 @@ describe("ArgusStreamingDelegate", () => {
     const args = (spawnFn as unknown as { mock: { calls: [string, string[]][] } }).mock.calls[0]![1].join(" ");
     expect(args).toContain("-i rtsp://127.0.0.1:8554/backyard-left-sub");
     expect(args).toContain("scale=854:480:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=854:480");
+    stopSession(delegate, "s5");
   });
 
   it("re-picks MAIN on a full-screen RECONFIGURE from a tile session", async () => {
@@ -562,6 +570,67 @@ describe("ArgusStreamingDelegate", () => {
     const secondArgs = (spawnFn as unknown as { mock: { calls: [string, string[]][] } }).mock.calls[1]![1].join(" ");
     expect(secondArgs).toContain("-i rtsp://127.0.0.1:8554/backyard-left ");
     expect(secondArgs).toContain("scale=854:480:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=854:480");
+    stopSession(delegate, "s6");
+  });
+
+  it("does not force-stop a session when RTCP goes silent after one packet", async () => {
+    // Field 1.3.11–1.3.14: Home paints for minutes while sending at most ONE
+    // receiver report. The old 30s silence watchdog armed on that lone packet
+    // and force-stopped the healthy session at ~30s. Teardown belongs to the
+    // controller (STOP request, or HAP handleCloseConnection on disconnect).
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const fakeProc = Object.assign(new EventEmitter(), { kill: vi.fn() });
+      const spawnFn = vi.fn(() => fakeProc) as unknown as typeof import("node:child_process").spawn;
+      const delegate = new ArgusStreamingDelegate(
+        "Backyard Left",
+        "rtsp://127.0.0.1:8554/backyard-left-sub",
+        cacheWith(Buffer.from([0xff, 0xd8])),
+        { spawnFn, verbose: false },
+      );
+      const forceStop = vi.fn();
+      delegate.controller = { forceStopStreamingSession: forceStop } as never;
+
+      let videoReturnPort = 0;
+      await new Promise<void>((resolve, reject) => {
+        delegate.prepareStream(
+          { sessionID: "rtcp-1", targetAddress: "192.168.1.50",
+            video: { port: 50000, srtp_key: Buffer.alloc(16, 1), srtp_salt: Buffer.alloc(14, 2) },
+            audio: { port: 50002, srtp_key: Buffer.alloc(16, 3), srtp_salt: Buffer.alloc(14, 4) } } as never,
+          (error, response) => {
+            if (error || !response) return reject(error ?? new Error("no response"));
+            videoReturnPort = (response as { video: { port: number } }).video.port;
+            resolve();
+          },
+        );
+      });
+      const startDone = new Promise<void>((resolve, reject) => {
+        delegate.handleStreamRequest(
+          { type: "start", sessionID: "rtcp-1",
+            video: { pt: 99, max_bit_rate: 600, fps: 30, width: 854, height: 480, mtu: 1378, profile: 2, level: 2 },
+            audio: { pt: 110, sample_rate: 24, max_bit_rate: 24, codec: 3 } } as never,
+          (error) => (error ? reject(error) : resolve()),
+        );
+      });
+      await vi.advanceTimersByTimeAsync(100); // the START ack timer
+      await startDone;
+
+      // Home's lone RTCP receiver report (I/O is real; only timers are faked).
+      const sender = createSocket("udp4");
+      await new Promise<void>((resolve) =>
+        sender.send(Buffer.from([0x80, 0xc9, 0x00, 0x01]), videoReturnPort, "127.0.0.1", () => resolve()),
+      );
+      for (let i = 0; i < 25; i += 1) await new Promise((resolve) => setImmediate(resolve));
+      sender.close();
+
+      await vi.advanceTimersByTimeAsync(40_000); // past the old watchdog horizon
+      expect(forceStop).not.toHaveBeenCalled();
+      expect(fakeProc.kill).not.toHaveBeenCalled();
+
+      delegate.handleStreamRequest({ type: "stop", sessionID: "rtcp-1" } as never, () => {});
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("advertises firmware version 1.3.14 (restored LAN floors + preserved 1.3.13 unlocks)", () => {

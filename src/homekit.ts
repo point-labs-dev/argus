@@ -400,16 +400,25 @@ export function resolveSrtpTargetAddress(
   return requested;
 }
 
-/** Reserve a free UDP port by briefly binding an ephemeral socket. */
-async function reserveUdpPort(): Promise<number> {
-  return new Promise((resolve, reject) => {
-    const socket = createSocket("udp4");
-    socket.once("error", reject);
-    socket.bind(0, () => {
-      const port = socket.address() as { port: number };
-      socket.close(() => resolve(port.port));
-    });
-  });
+/**
+ * Reserve distinct free UDP ports by binding ephemeral sockets simultaneously,
+ * then releasing them together. Reserving one at a time let the OS hand the
+ * audio reservation the just-freed video port, and spawnLive then bound the
+ * same port twice (EADDRINUSE — which, unhandled, killed the process).
+ */
+async function reserveUdpPorts(count: number): Promise<number[]> {
+  const sockets = await Promise.all(
+    Array.from({ length: count }, () => {
+      return new Promise<ReturnType<typeof createSocket>>((resolve, reject) => {
+        const socket = createSocket("udp4");
+        socket.once("error", reject);
+        socket.bind(0, () => resolve(socket));
+      });
+    }),
+  );
+  const ports = sockets.map((socket) => (socket.address() as { port: number }).port);
+  await Promise.all(sockets.map((socket) => new Promise<void>((resolve) => socket.close(() => resolve()))));
+  return ports;
 }
 
 /**
@@ -430,8 +439,6 @@ interface ActiveSession {
   /** UDP socket bound to videoReturnPort to receive RTCP from Home (camera-ffmpeg pattern). */
   videoReturnSocket?: ReturnType<typeof createSocket>;
   audioReturnSocket?: ReturnType<typeof createSocket>;
-  /** Watchdog cleared when RTCP arrives; fires on stale stream. */
-  rtcpWatchdog?: NodeJS.Timeout;
   prepared: {
     targetAddress: string;
     video: { port: number; localRtcpPort: number; ssrc: number; srtpParams: string };
@@ -609,8 +616,7 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
     try {
       const videoSsrc = randomBytes(4).readUInt32BE(0) >>> 1;
       const audioSsrc = randomBytes(4).readUInt32BE(0) >>> 1;
-      const videoRtcp = await reserveUdpPort();
-      const audioRtcp = await reserveUdpPort();
+      const [videoRtcp, audioRtcp] = (await reserveUdpPorts(2)) as [number, number];
       // Encrypt outbound with the controller's own key material (from the request),
       // and echo it back in the response. Generating fresh keys here is the classic
       // "stream sends but the device shows a forever-spinner" bug.
@@ -813,52 +819,42 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
     const ffmpeg = this.spawnFn(this.ffmpegPath, args, { stdio: ["ignore", "ignore", "pipe"] });
     session.ffmpeg = ffmpeg;
 
-    // PRIMARY: Bind UDP return socket for RTCP (camera-ffmpeg pattern). Home sends
-    // RTCP RR/NACKs to the port we advertised in prepareStream. Without a listener,
-    // Home may refuse to unlock video. Firmware 1.3.5 adds this missing half.
-    try {
-      const videoSocket = createSocket("udp4");
-      if (this.bindAddress) {
-        videoSocket.bind(liveInput.video.localRtcpPort, this.bindAddress);
-      } else {
-        videoSocket.bind(liveInput.video.localRtcpPort);
-      }
-      videoSocket.on("message", (msg) => {
-        // Home sent RTCP (Receiver Report / NACK). Log first arrival.
-        if (!session.rtcpWatchdog) {
-          log(`RTCP arrived on video return port (${msg.length} bytes)`);
-        }
-        // Reset watchdog (30s idle → forceStop, camera-ffmpeg pattern)
-        if (session.rtcpWatchdog) clearTimeout(session.rtcpWatchdog);
-        session.rtcpWatchdog = setTimeout(() => {
-          log("RTCP watchdog fired (30s idle) — forcing stop");
-          this.controller?.forceStopStreamingSession(sessionID);
-        }, 30_000);
+    // Bind UDP return sockets for RTCP (camera-ffmpeg pattern). Home sends RTCP
+    // RR/NACKs to the ports we advertised in prepareStream, so a listener must
+    // own them — but SILENCE on them is normal: field across 1.3.11–1.3.14 shows
+    // Home painting for minutes while sending at most one receiver report. The
+    // 30s silence watchdog that used to live here forceStopped the session, so a
+    // lone report armed a timer that killed a healthy stream at ~30s. Session
+    // teardown belongs to the controller: Home sends STOP, and HAP-NodeJS
+    // force-stops active sessions when the controller connection closes
+    // (Accessory.handleCloseConnection) — Argus must not guess liveness from
+    // RTCP. bind() failures arrive as async "error" events, not throws; without
+    // a handler Node turns them into an uncaught exception that kills the
+    // process, so each socket logs and closes instead.
+    const bindReturnSocket = (label: string, port: number): ReturnType<typeof createSocket> => {
+      const socket = createSocket("udp4");
+      socket.on("error", (error) => {
+        log(`RTCP ${label} return socket error: ${error.message} — continuing without it`);
+        socket.close();
       });
-      session.videoReturnSocket = videoSocket;
-      log(`Bound video return RTCP: port ${liveInput.video.localRtcpPort}${this.bindAddress ? ` addr ${this.bindAddress}` : ""}`);
-
-      if (this.includeAudio) {
-        const audioSocket = createSocket("udp4");
-        if (this.bindAddress) {
-          audioSocket.bind(liveInput.audio.localRtcpPort, this.bindAddress);
-        } else {
-          audioSocket.bind(liveInput.audio.localRtcpPort);
+      let seen = false;
+      socket.on("message", (msg) => {
+        if (!seen) {
+          seen = true;
+          log(`RTCP arrived on ${label} return port (${msg.length} bytes)`);
         }
-        audioSocket.on("message", () => {
-          // Audio RTCP keepalive (same watchdog as video)
-          if (session.rtcpWatchdog) clearTimeout(session.rtcpWatchdog);
-          session.rtcpWatchdog = setTimeout(() => {
-            log("RTCP watchdog fired (30s idle) — forcing stop");
-            this.controller?.forceStopStreamingSession(sessionID);
-          }, 30_000);
-        });
-        session.audioReturnSocket = audioSocket;
-        log(`Bound audio return RTCP: port ${liveInput.audio.localRtcpPort}${this.bindAddress ? ` addr ${this.bindAddress}` : ""}`);
+      });
+      if (this.bindAddress) {
+        socket.bind(port, this.bindAddress);
+      } else {
+        socket.bind(port);
       }
-    } catch (error) {
-      log(`RTCP socket bind failed: ${error instanceof Error ? error.message : String(error)}`);
-      // Non-fatal: continue without return RTCP (may still work if Home doesn't require it)
+      log(`Bound ${label} return RTCP: port ${port}${this.bindAddress ? ` addr ${this.bindAddress}` : ""}`);
+      return socket;
+    };
+    session.videoReturnSocket = bindReturnSocket("video", liveInput.video.localRtcpPort);
+    if (this.includeAudio) {
+      session.audioReturnSocket = bindReturnSocket("audio", liveInput.audio.localRtcpPort);
     }
 
     // Detect first frame from FFmpeg progress output (pipe:2 → stderr). Progress format:
@@ -922,10 +918,14 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
   private stopStream(sessionID: string): void {
     const session = this.sessions.get(sessionID);
     session?.ffmpeg?.kill("SIGKILL");
-    // Clean up RTCP return sockets and watchdog
-    if (session?.rtcpWatchdog) clearTimeout(session.rtcpWatchdog);
-    session?.videoReturnSocket?.close();
-    session?.audioReturnSocket?.close();
+    // Close RTCP return sockets; a socket whose bind failed already closed itself.
+    for (const socket of [session?.videoReturnSocket, session?.audioReturnSocket]) {
+      try {
+        socket?.close();
+      } catch {
+        // already closed
+      }
+    }
     this.sessions.delete(sessionID);
   }
 }
