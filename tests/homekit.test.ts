@@ -633,8 +633,8 @@ describe("ArgusStreamingDelegate", () => {
     }
   });
 
-  it("advertises firmware version 1.3.14 (restored LAN floors + preserved 1.3.13 unlocks)", () => {
-    expect(ARGUS_FIRMWARE_REVISION).toBe("1.3.14");
+  it("advertises firmware version 1.3.15 (main-source fix, RTCP watchdog removal, HKSV delivery)", () => {
+    expect(ARGUS_FIRMWARE_REVISION).toBe("1.3.15");
   });
 
   it("prevents double-callback crash (swallows duplicate calls)", async () => {

@@ -1176,8 +1176,24 @@ export function buildCameraControllerOptions(
  * - Sharpness delta: 600k@854×480 >> 299k@854×480 (1.3.13 soft video + choppy audio)
  * - Requires ARGUS_LIVE_MAIN_SOURCE=1 in Mini plist (standalone ≥720p from main stream)
  * - CAP=854 is temporary safety; target stage: hires ladder + raise/remove CAP (not clamp-as-product)
+ * 
+ * 2026-10-03 (1.3.15): Live quality + fast start. Four verified-in-code fixes:
+ * (1) Source selection now follows the PRE-cap ask (planLiveSession): with CAP=854 the
+ *     old >=1280 post-cap check made MAIN unreachable even with ARGUS_LIVE_MAIN_SOURCE=1,
+ *     so full-screen upscaled the <=640-wide sub (the 1.3.14 softness; True Backyard
+ *     never left backyard-sub). Asks >640 wide now source MAIN when granted; tiles stay sub.
+ * (2) RECONFIGURE applies the same cap+plan as START (it previously bypassed the cap —
+ *     a 720p upgrade encoded the uncapped envelope the cap exists to prevent).
+ * (3) RTCP silence no longer forceStops sessions: field shows Home paints with at most
+ *     ONE receiver report, so the lone packet armed a 30s timer that killed healthy
+ *     sessions. Return sockets stay bound (+ bind errors no longer crash the process,
+ *     + video/audio RTCP ports reserved as a pair so they can't collide).
+ * (4) HKSV fragments deliver the moment they complete (hold-one-back removed: init
+ *     segment +4.3s→+0.04s, first video +8.3s→+4.2s, measured) and recording input
+ *     analysis drops 1s→200ms. New hksv_first_fragment telemetry for field measurement.
+ * No advertised-config change (ladder/profiles/audio identical to 1.3.14).
  */
-export const ARGUS_FIRMWARE_REVISION = "1.3.14";
+export const ARGUS_FIRMWARE_REVISION = "1.3.15";
 
 export interface CameraAccessoryHandle {
   accessory: Accessory;
@@ -1203,7 +1219,7 @@ export function createCameraAccessory(
   accessory
     .getService(Service.AccessoryInformation)!
     .setCharacteristic(Characteristic.Manufacturer, "Point Labs")
-    .setCharacteristic(Characteristic.Model, "Argus 1.3.14")
+    .setCharacteristic(Characteristic.Model, "Argus 1.3.15")
     .setCharacteristic(Characteristic.SerialNumber, `argus-${camera.host}-${camera.channel}`)
     .setCharacteristic(Characteristic.FirmwareRevision, ARGUS_FIRMWARE_REVISION);
 
