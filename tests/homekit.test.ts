@@ -439,7 +439,9 @@ describe("ArgusStreamingDelegate", () => {
       );
     });
 
-    // Full-screen upgrade: Apple sends RECONFIGURE on the SAME session.
+    // Full-screen upgrade: Apple sends RECONFIGURE on the SAME session. The cap
+    // applies here too (1.3.15 — before, RECONFIGURE bypassed it and a 720p
+    // upgrade encoded the uncapped envelope the cap exists to prevent).
     await new Promise<void>((resolve, reject) => {
       delegate.handleStreamRequest(
         { type: "reconfigure", sessionID: "s2",
@@ -451,13 +453,38 @@ describe("ArgusStreamingDelegate", () => {
     expect(spawnFn).toHaveBeenCalledTimes(2);
     expect(procs[0]!.kill).toHaveBeenCalledWith("SIGKILL");
     const secondArgs = (spawnFn as unknown as { mock: { calls: [string, string[]][] } }).mock.calls[1]![1].join(" ");
-    expect(secondArgs).toContain("scale=896:672:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=896:672");
+    expect(secondArgs).toContain("scale=854:480:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=854:480");
     expect(secondArgs).toContain("-b:v 600k");
     expect(secondArgs).toContain("-bufsize 1200k");
     expect(secondArgs).toContain("-maxrate 600k");
+    // No main grant on this delegate — the respawn stays on the sub.
+    expect(secondArgs).toContain("-i rtsp://127.0.0.1:8554/backyard-left-sub");
   });
 
-  it("with resolution cap, sessions use sub stream (854x480 < 720p threshold)", async () => {
+  async function prepareAndStart(
+    delegate: ArgusStreamingDelegate,
+    sessionID: string,
+    video: { width: number; height: number; max_bit_rate: number },
+  ): Promise<void> {
+    await new Promise<void>((resolve, reject) => {
+      delegate.prepareStream(
+        { sessionID, targetAddress: "192.168.1.50",
+          video: { port: 50000, srtp_key: Buffer.alloc(16, 1), srtp_salt: Buffer.alloc(14, 2) },
+          audio: { port: 50002, srtp_key: Buffer.alloc(16, 3), srtp_salt: Buffer.alloc(14, 4) } } as never,
+        (error) => (error ? reject(error) : resolve()),
+      );
+    });
+    await new Promise<void>((resolve, reject) => {
+      delegate.handleStreamRequest(
+        { type: "start", sessionID,
+          video: { pt: 99, fps: 30, mtu: 1378, profile: 2, level: 2, ...video },
+          audio: { pt: 110, sample_rate: 24, max_bit_rate: 24, codec: 3 } } as never,
+        (error) => (error ? reject(error) : resolve()),
+      );
+    });
+  }
+
+  it("sources MAIN for a full-screen ask even when the cap lowers the encode below 720p", async () => {
     const spawnFn = vi.fn(() => Object.assign(new EventEmitter(), { kill: vi.fn() })) as unknown as typeof import("node:child_process").spawn;
     const delegate = new ArgusStreamingDelegate(
       "Backyard Left",
@@ -466,28 +493,75 @@ describe("ArgusStreamingDelegate", () => {
       { spawnFn, mainStreamUrl: "rtsp://127.0.0.1:8554/backyard-left" },
     );
 
-    await new Promise<void>((resolve, reject) => {
-      delegate.prepareStream(
-        { sessionID: "s3", targetAddress: "192.168.1.50",
-          video: { port: 50000, srtp_key: Buffer.alloc(16, 1), srtp_salt: Buffer.alloc(14, 2) },
-          audio: { port: 50002, srtp_key: Buffer.alloc(16, 3), srtp_salt: Buffer.alloc(14, 4) } } as never,
-        (error) => (error ? reject(error) : resolve()),
-      );
-    });
-    // Home asks for 1280x720 but firmware 1.3.13 caps to 854x480.
-    // pickInputUrl sees 854x480 (< 720p threshold) → uses sub, not main.
+    // Home asks 1280x720; the cap lowers the ENCODE to 854x480, but the SOURCE
+    // follows the ask. Before 1.3.15 the source check compared the capped size,
+    // so MAIN was unreachable and full-screen upscaled the ≤640-wide sub (the
+    // field softness with ARGUS_LIVE_MAIN_SOURCE=1 that never took effect).
+    await prepareAndStart(delegate, "s3", { width: 1280, height: 720, max_bit_rate: 2000 });
+
+    const args = (spawnFn as unknown as { mock: { calls: [string, string[]][] } }).mock.calls[0]![1].join(" ");
+    expect(args).toContain("-i rtsp://127.0.0.1:8554/backyard-left ");
+    expect(args).toContain("scale=854:480:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=854:480");
+  });
+
+  it("keeps tile sessions (640x360 ask) on the sub stream even with a main grant", async () => {
+    const spawnFn = vi.fn(() => Object.assign(new EventEmitter(), { kill: vi.fn() })) as unknown as typeof import("node:child_process").spawn;
+    const delegate = new ArgusStreamingDelegate(
+      "Backyard Left",
+      "rtsp://127.0.0.1:8554/backyard-left-sub",
+      cacheWith(Buffer.from([0xff, 0xd8])),
+      { spawnFn, mainStreamUrl: "rtsp://127.0.0.1:8554/backyard-left" },
+    );
+
+    await prepareAndStart(delegate, "s4", { width: 640, height: 360, max_bit_rate: 132 });
+
+    const args = (spawnFn as unknown as { mock: { calls: [string, string[]][] } }).mock.calls[0]![1].join(" ");
+    expect(args).toContain("-i rtsp://127.0.0.1:8554/backyard-left-sub");
+  });
+
+  it("serves full-screen asks from the sub when no main grant exists (NVR channels)", async () => {
+    const spawnFn = vi.fn(() => Object.assign(new EventEmitter(), { kill: vi.fn() })) as unknown as typeof import("node:child_process").spawn;
+    const delegate = new ArgusStreamingDelegate(
+      "Backyard Left",
+      "rtsp://127.0.0.1:8554/backyard-left-sub",
+      cacheWith(Buffer.from([0xff, 0xd8])),
+      { spawnFn },
+    );
+
+    await prepareAndStart(delegate, "s5", { width: 1280, height: 720, max_bit_rate: 2000 });
+
+    const args = (spawnFn as unknown as { mock: { calls: [string, string[]][] } }).mock.calls[0]![1].join(" ");
+    expect(args).toContain("-i rtsp://127.0.0.1:8554/backyard-left-sub");
+    expect(args).toContain("scale=854:480:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=854:480");
+  });
+
+  it("re-picks MAIN on a full-screen RECONFIGURE from a tile session", async () => {
+    const procs: Array<EventEmitter & { kill: ReturnType<typeof vi.fn> }> = [];
+    const spawnFn = vi.fn(() => {
+      const proc = Object.assign(new EventEmitter(), { kill: vi.fn() });
+      procs.push(proc);
+      return proc;
+    }) as unknown as typeof import("node:child_process").spawn;
+    const delegate = new ArgusStreamingDelegate(
+      "Backyard Left",
+      "rtsp://127.0.0.1:8554/backyard-left-sub",
+      cacheWith(Buffer.from([0xff, 0xd8])),
+      { spawnFn, mainStreamUrl: "rtsp://127.0.0.1:8554/backyard-left" },
+    );
+
+    await prepareAndStart(delegate, "s6", { width: 640, height: 360, max_bit_rate: 132 });
     await new Promise<void>((resolve, reject) => {
       delegate.handleStreamRequest(
-        { type: "start", sessionID: "s3",
-          video: { pt: 99, max_bit_rate: 2000, fps: 30, width: 1280, height: 720, mtu: 1378, profile: 2, level: 2 },
-          audio: { pt: 110, sample_rate: 24, max_bit_rate: 24, codec: 3 } } as never,
+        { type: "reconfigure", sessionID: "s6",
+          video: { width: 1280, height: 720, fps: 30, max_bit_rate: 2000, rtcp_interval: 0.5 } } as never,
         (error) => (error ? reject(error) : resolve()),
       );
     });
 
-    const calls = (spawnFn as unknown as { mock: { calls: [string, string[]][] } }).mock.calls;
-    // With cap: 720p request → 854x480 encode → sub stream (not main)
-    expect(calls[0]![1].join(" ")).toContain("-i rtsp://127.0.0.1:8554/backyard-left-sub");
+    expect(spawnFn).toHaveBeenCalledTimes(2);
+    const secondArgs = (spawnFn as unknown as { mock: { calls: [string, string[]][] } }).mock.calls[1]![1].join(" ");
+    expect(secondArgs).toContain("-i rtsp://127.0.0.1:8554/backyard-left ");
+    expect(secondArgs).toContain("scale=854:480:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=854:480");
   });
 
   it("advertises firmware version 1.3.14 (restored LAN floors + preserved 1.3.13 unlocks)", () => {

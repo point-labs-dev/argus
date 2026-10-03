@@ -102,8 +102,8 @@ export interface SrtpParameters {
 export interface LiveFfmpegInput {
   /**
    * go2rtc local restream, e.g. rtsp://127.0.0.1:8554/backyard-left-sub.
-   * ≥720p transcode sessions get the camera's MAIN restream instead — the
-   * 896-wide ext stream has no pixels to fill 1280x720 (see pickInputUrl).
+   * Full-screen transcode sessions (ask >640 wide) get the camera's MAIN
+   * restream instead — the sub has no pixels above 640 (see planLiveSession).
    */
   inputUrl: string;
   targetAddress: string;
@@ -452,10 +452,12 @@ export interface StreamingDelegateOptions {
   videoMode?: "copy" | "transcode";
   /**
    * go2rtc restream of the camera's full-res MAIN stream. When set, transcode
-   * sessions negotiated at ≥720p source from it instead of the light sub/ext
-   * stream (896-wide — upscaling it is why full-screen looked the same as the
-   * tile). Sub remains the source below 720p: cheaper to decode, and its
-   * 1s keyframes start faster than the NVR mains' 4s.
+   * sessions whose ASK is above the tile tier (>640 wide) source from it, even
+   * when ARGUS_LIVE_CAP lowers the encode below 720p — upscaling the ≤640-wide
+   * sub is why full-screen looked the same as the tile. Tiles stay on the sub:
+   * cheaper to decode, and its 1s keyframes start faster than untuned mains'
+   * 4s (run scripts/tune-substreams.mjs --apply to pin standalone mains at
+   * gop=1 so main-sourced sessions start inside the 1s budget).
    */
   mainStreamUrl?: string;
   /**
@@ -518,16 +520,40 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
   }
 
   /**
-   * Live input per negotiated size: ≥720p transcode sessions pull the full-res
-   * MAIN restream (the sub/ext source tops out 896-wide — no pixels for 720p+);
-   * everything else stays on the light sub. Copy mode always passes the sub
-   * through (mains can be H.265, which copy can't deliver to HomeKit).
+   * Encode envelope + input source for a session, from the controller's ASK
+   * (pre-cap dimensions). One function so START and RECONFIGURE can't drift:
+   * before 1.3.15 RECONFIGURE skipped the cap entirely, so a 720p reconfigure
+   * encoded uncapped 720p — the exact envelope the cap exists to prevent.
+   *
+   * Encode dims: the 1.3.13 defensive clamp (ARGUS_LIVE_CAP, default 854 wide,
+   * 16:9 height) — Home's cached stream configs still ask 1280x720, and encoding
+   * that over WiFi is the "No Response" failure the cap fixed.
+   *
+   * Source: decided from the REQUESTED dims, not the capped ones. The ask tells
+   * us the viewer's intent. Anything above the Apple tile tier (640 wide) is a
+   * full-screen viewer, and serving it by upscaling the ≤640-wide RTSP sub is
+   * the softness 1.3.14 field kept seeing: the old ≥1280 threshold compared the
+   * post-cap size, so with CAP=854 the MAIN restream was unreachable even with
+   * ARGUS_LIVE_MAIN_SOURCE=1. Tiles (640x360) stay on the sub — its 1s keyframes
+   * start faster and a tile has no pixels to gain. Without a main grant
+   * (NVR-fronted channels, or ARGUS_LIVE_MAIN_SOURCE unset) full-screen stays on
+   * the sub with the bitrate floors — crisp-as-the-sub-allows, never silent.
+   * Copy mode always passes the sub through (mains can be H.265, which copy
+   * can't deliver to HomeKit).
    */
-  private pickInputUrl(width: number, height: number): string {
-    if (this.videoMode === "transcode" && this.mainStreamUrl && (width >= 1280 || height >= 720)) {
-      return this.mainStreamUrl;
-    }
-    return this.liveUrl;
+  private planLiveSession(
+    requestedWidth: number,
+    requestedHeight: number,
+  ): { width: number; height: number; inputUrl: string } {
+    const maxWidth = process.env.ARGUS_LIVE_CAP ? parseInt(process.env.ARGUS_LIVE_CAP, 10) : 854;
+    const width = Math.min(requestedWidth, maxWidth);
+    const height = Math.min(requestedHeight, Math.round((maxWidth / 16) * 9)); // Maintain 16:9
+    const fullScreenAsk = requestedWidth > 640;
+    const inputUrl =
+      this.videoMode === "transcode" && this.mainStreamUrl && fullScreenAsk
+        ? this.mainStreamUrl
+        : this.liveUrl;
+    return { width, height, inputUrl };
   }
 
   /**
@@ -656,27 +682,30 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
     if (!session?.liveInput || this.videoMode !== "transcode") {
       return;
     }
+    // Same cap + source plan as START (a full-screen upgrade moves to the main
+    // stream; the encode stays inside the WiFi cap).
+    const plan = this.planLiveSession(request.video.width, request.video.height);
     const bitrate = this.liveBitrateKbps(
-      request.video.width,
-      request.video.height,
+      plan.width,
+      plan.height,
       request.video.max_bit_rate,
       session.prepared.targetAddress,
     );
     const next: LiveFfmpegInput = {
       ...session.liveInput,
-      // Re-pick the source: a full-screen upgrade to ≥720p moves to the main stream.
-      inputUrl: this.pickInputUrl(request.video.width, request.video.height),
+      inputUrl: plan.inputUrl,
       video: {
         ...session.liveInput.video,
-        width: request.video.width,
-        height: request.video.height,
+        width: plan.width,
+        height: plan.height,
         fps: request.video.fps,
         maxBitrateKbps: bitrate,
       },
     };
     this.logLine(
-      `HomeKit reconfigure: ${request.video.width}x${request.video.height}@${request.video.fps} ` +
-        `asked=${request.video.max_bit_rate}k serving=${bitrate}k source=${next.inputUrl} — respawning encoder`,
+      `HomeKit reconfigure: asked=${request.video.width}x${request.video.height}@${request.video.fps} ` +
+        `serving=${plan.width}x${plan.height} asked=${request.video.max_bit_rate}k serving=${bitrate}k ` +
+        `source=${next.inputUrl} — respawning encoder`,
     );
     // SIGKILL is the teardown signal the exit handler ignores (no forceStop).
     session.ffmpeg?.kill("SIGKILL");
@@ -697,14 +726,14 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
     const profile = "baseline";
     const level = H264_LEVEL_TO_X264[request.video.level] ?? "4.0";
     
-    // Defensive resolution clamp: June WiFi working pattern (c5b368c, Garage Door 854x480).
+    // Defensive resolution clamp + input source, from one plan (see planLiveSession).
     // Field 1.3.12: changing wifiSet default ladder was INSUFFICIENT — MacBook Home still
     // negotiated 1280x720 despite code change + configVersion bump (cached stream configs?).
     // Force cap here even if Home asks 720p. ARGUS_LIVE_CAP env var overrides (default 854).
-    const maxWidth = process.env.ARGUS_LIVE_CAP ? parseInt(process.env.ARGUS_LIVE_CAP, 10) : 854;
-    const capWidth = Math.min(request.video.width, maxWidth);
-    const capHeight = Math.min(request.video.height, Math.round((maxWidth / 16) * 9));  // Maintain 16:9
-    
+    const plan = this.planLiveSession(request.video.width, request.video.height);
+    const capWidth = plan.width;
+    const capHeight = plan.height;
+
     const bitrate = this.liveBitrateKbps(
       capWidth,
       capHeight,
@@ -727,12 +756,12 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
       `HomeKit negotiated video: ${negotiatedLog}${capWidth}x${capHeight}@${request.video.fps} ` +
         `profile=${profile} level=${level} ptype=${request.video.pt} ssrc=${session.prepared.video.ssrc} ` +
         `suite=AES_CM_128_HMAC_SHA1_80 asked=${request.video.max_bit_rate}k serving=${bitrate}k mtu=${request.video.mtu} ` +
-        `mode=${this.videoMode} source=${this.pickInputUrl(capWidth, capHeight)}; ` +
+        `mode=${this.videoMode} source=${plan.inputUrl}; ` +
         audioLog,
     );
 
     const liveInputBase = {
-      inputUrl: this.pickInputUrl(capWidth, capHeight),
+      inputUrl: plan.inputUrl,
       targetAddress: session.prepared.targetAddress,
       videoMode: this.videoMode,
       video: {
