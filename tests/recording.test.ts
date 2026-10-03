@@ -1,8 +1,16 @@
-import { Readable } from "node:stream";
-import { describe, expect, it } from "vitest";
+import { EventEmitter } from "node:events";
+import { PassThrough, Readable } from "node:stream";
+import { describe, expect, it, vi } from "vitest";
 
-import { buildRecordingFfmpegArgs, buildRecordingOptions } from "../src/recording.js";
+import { ArgusRecordingDelegate, buildRecordingFfmpegArgs, buildRecordingOptions } from "../src/recording.js";
 import { readFragmentedMp4 } from "../src/mp4.js";
+
+function mp4Box(type: string, payload: Buffer): Buffer {
+  const header = Buffer.alloc(8);
+  header.writeUInt32BE(8 + payload.length, 0);
+  header.write(type, 4, "ascii");
+  return Buffer.concat([header, payload]);
+}
 
 // A CameraRecordingConfiguration as HomeKit would select it (enum values inlined).
 function recordingConfig() {
@@ -38,6 +46,42 @@ describe("buildRecordingFfmpegArgs", () => {
     expect(joined).toContain("-b:v 2000k");
     expect(joined).toContain("-ar 32000"); // samplerate 3 = KHZ_32
     expect(joined).toContain("expr:gte(t,n_forced*4)"); // 4000ms fragment -> 4s keyframes
+  });
+
+  it("caps input analysis at the measured 200ms floor (recording-start latency)", () => {
+    const joined = buildRecordingFfmpegArgs("rtsp://x/main", recordingConfig()).join(" ");
+    expect(joined).toContain("-analyzeduration 200000");
+    expect(joined).toContain("-probesize 500000");
+  });
+});
+
+describe("ArgusRecordingDelegate", () => {
+  it("delivers each fragment the moment it completes (no one-fragment hold-back)", async () => {
+    // Pre-1.3.15 the delegate held one segment back to flag the final one
+    // isLast, so with the init segment and fragment 1 available it had yielded
+    // only the init — every packet reached the Home Hub one 4s fragment late.
+    const stdout = new PassThrough();
+    const fakeProc = Object.assign(new EventEmitter(), { stdout, stderr: new PassThrough(), kill: vi.fn() });
+    const spawnFn = vi.fn(() => fakeProc) as unknown as typeof import("node:child_process").spawn;
+    const delegate = new ArgusRecordingDelegate("Cam", "rtsp://x/main", { spawnFn, verbose: false });
+    delegate.updateRecordingConfiguration(recordingConfig() as never);
+
+    stdout.write(mp4Box("ftyp", Buffer.from("isom")));
+    stdout.write(mp4Box("moov", Buffer.from("moovdata")));
+    stdout.write(mp4Box("moof", Buffer.from("moof1")));
+    stdout.write(mp4Box("mdat", Buffer.from("mediadata1")));
+    // The stream stays OPEN (a live recording): fragment 2 does not exist yet.
+
+    const received: Array<{ head: string; isLast: boolean | undefined }> = [];
+    for await (const packet of delegate.handleRecordingStreamRequest(7)) {
+      received.push({ head: packet.data.toString("ascii", 4, 8), isLast: packet.isLast });
+      if (received.length === 2) break;
+    }
+
+    expect(received).toEqual([
+      { head: "ftyp", isLast: false },
+      { head: "moof", isLast: false },
+    ]);
   });
 });
 
