@@ -3,6 +3,18 @@ import { randomBytes } from "node:crypto";
 import { createSocket } from "node:dgram";
 import { networkInterfaces } from "node:os";
 
+import {
+  SessionStateMachine,
+  type PreparedData,
+  type StreamingData,
+} from "./homekit/session-state-machine.js";
+import {
+  SessionPolicyEngine,
+  type PolicyEngineConfig,
+  type SessionPlan,
+} from "./homekit/session-policy.js";
+import { ObservableRtcpSocket } from "./homekit/observable-rtcp.js";
+
 /**
  * Get the primary LAN IPv4 address for HAP advertising and RTP source binding.
  * Prefers ARGUS_HAP_BIND env var, else first non-internal IPv4 (typically en0 on Mac).
@@ -432,18 +444,12 @@ function srtpParamsFromRequest(key: Buffer, salt: Buffer): string {
   return Buffer.concat([key, salt]).toString("base64");
 }
 
+/**
+ * Active streaming session (Phase 2: migrated to SessionStateMachine).
+ * The state machine handles lifecycle transitions and callback guards.
+ */
 interface ActiveSession {
-  ffmpeg?: ChildProcess;
-  /** The input used for the running FFmpeg — kept so RECONFIGURE can respawn with new video params. */
-  liveInput?: LiveFfmpegInput;
-  /** UDP socket bound to videoReturnPort to receive RTCP from Home (camera-ffmpeg pattern). */
-  videoReturnSocket?: ReturnType<typeof createSocket>;
-  audioReturnSocket?: ReturnType<typeof createSocket>;
-  prepared: {
-    targetAddress: string;
-    video: { port: number; localRtcpPort: number; ssrc: number; srtpParams: string };
-    audio: { port: number; localRtcpPort: number; ssrc: number; srtpParams: string };
-  };
+  stateMachine: SessionStateMachine;
 }
 
 export interface StreamingDelegateOptions {
@@ -493,6 +499,7 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
   public controller?: CameraController;
 
   private readonly sessions = new Map<string, ActiveSession>();
+  private readonly policyEngine: SessionPolicyEngine;
   private readonly snapshotProfile: SnapshotProfile;
   private readonly ffmpegPath: string;
   private readonly verbose: boolean;
@@ -517,6 +524,24 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
     if (options.mainStreamUrl !== undefined) this.mainStreamUrl = options.mainStreamUrl;
     if (options.bindAddress !== undefined) this.bindAddress = options.bindAddress;
     this.spawnFn = options.spawnFn ?? spawn;
+
+    // Initialize policy engine with configuration
+    const capWidth = process.env.ARGUS_LIVE_CAP ? parseInt(process.env.ARGUS_LIVE_CAP, 10) : 854;
+    const hubAddresses = (process.env.ARGUS_HUB_ADDRESSES ?? "")
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    const bitrateFloors = process.env.ARGUS_LIVE_OBEY_BITRATE !== "1";
+
+    const policyConfig: PolicyEngineConfig = {
+      capWidth,
+      subStreamUrl: this.liveUrl,
+      videoMode: this.videoMode,
+      bitrateFloors,
+      hubAddresses,
+      ...(this.mainStreamUrl !== undefined && { mainStreamUrl: this.mainStreamUrl }),
+    };
+    this.policyEngine = new SessionPolicyEngine(policyConfig);
   }
 
   /** Timestamped stderr line — session forensics without timestamps kept hurting. */
@@ -524,60 +549,6 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
     if (this.verbose) {
       process.stderr.write(`${new Date().toISOString()} [argus ${this.cameraName}] ${msg}\n`);
     }
-  }
-
-  /**
-   * Encode envelope + input source for a session, from the controller's ASK
-   * (pre-cap dimensions). One function so START and RECONFIGURE can't drift:
-   * before 1.3.15 RECONFIGURE skipped the cap entirely, so a 720p reconfigure
-   * encoded uncapped 720p — the exact envelope the cap exists to prevent.
-   *
-   * Encode dims: the 1.3.13 defensive clamp (ARGUS_LIVE_CAP, default 854 wide,
-   * 16:9 height) — Home's cached stream configs still ask 1280x720, and encoding
-   * that over WiFi is the "No Response" failure the cap fixed.
-   *
-   * Source: decided from the REQUESTED dims, not the capped ones. The ask tells
-   * us the viewer's intent. Anything above the Apple tile tier (640 wide) is a
-   * full-screen viewer, and serving it by upscaling the ≤640-wide RTSP sub is
-   * the softness 1.3.14 field kept seeing: the old ≥1280 threshold compared the
-   * post-cap size, so with CAP=854 the MAIN restream was unreachable even with
-   * ARGUS_LIVE_MAIN_SOURCE=1. Tiles (640x360) stay on the sub — its 1s keyframes
-   * start faster and a tile has no pixels to gain. Without a main grant
-   * (NVR-fronted channels, or ARGUS_LIVE_MAIN_SOURCE unset) full-screen stays on
-   * the sub with the bitrate floors — crisp-as-the-sub-allows, never silent.
-   * Copy mode always passes the sub through (mains can be H.265, which copy
-   * can't deliver to HomeKit).
-   */
-  private planLiveSession(
-    requestedWidth: number,
-    requestedHeight: number,
-  ): { width: number; height: number; inputUrl: string } {
-    const maxWidth = process.env.ARGUS_LIVE_CAP ? parseInt(process.env.ARGUS_LIVE_CAP, 10) : 854;
-    const width = Math.min(requestedWidth, maxWidth);
-    const height = Math.min(requestedHeight, Math.round((maxWidth / 16) * 9)); // Maintain 16:9
-    const fullScreenAsk = requestedWidth > 640;
-    const inputUrl =
-      this.videoMode === "transcode" && this.mainStreamUrl && fullScreenAsk
-        ? this.mainStreamUrl
-        : this.liveUrl;
-    return { width, height, inputUrl };
-  }
-
-  /**
-   * Encode bitrate for a session: the per-resolution floor policy
-   * (effectiveBitrateKbps), except spec-obedient for controllers listed in
-   * ARGUS_HUB_ADDRESSES — those are home-hub RELAYS fronting remote viewers
-   * whose uplink we can't see, so Apple's conservative ask wins there — or
-   * globally with ARGUS_LIVE_OBEY_BITRATE=1 (rollback switch).
-   */
-  private liveBitrateKbps(width: number, height: number, negotiated: number, controllerAddress: string): number {
-    if (process.env.ARGUS_LIVE_OBEY_BITRATE === "1") return negotiated;
-    const hubs = (process.env.ARGUS_HUB_ADDRESSES ?? "")
-      .split(",")
-      .map((s) => s.trim())
-      .filter(Boolean);
-    if (hubs.includes(controllerAddress)) return negotiated;
-    return effectiveBitrateKbps(width, height, negotiated);
   }
 
   public handleSnapshotRequest(_request: SnapshotRequest, callback: SnapshotRequestCallback): void {
@@ -595,15 +566,15 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
     request: PrepareStreamRequest,
     callback: PrepareStreamCallback,
   ): Promise<void> {
-    // Guard against double-calling (HAP-NodeJS throws if callback invoked twice).
-    // Field 1.3.9: removing guard caused double-callback → process crash exit 1.
-    let answered = false;
+    const stateMachine = new SessionStateMachine(request.sessionID);
+    
     const answer = (error?: Error, response?: PrepareStreamResponse): void => {
-      if (answered) {
+      // Use state machine's callback guard (prevents double-call crashes from 1.3.7-1.3.10)
+      if (!stateMachine.answerPrepareCallback()) {
         this.logLine(`prepareStream: callback already answered, ignoring duplicate call`);
         return;
       }
-      answered = true;
+      
       if (error) {
         callback(error);
       } else if (response) {
@@ -617,19 +588,27 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
       const videoSsrc = randomBytes(4).readUInt32BE(0) >>> 1;
       const audioSsrc = randomBytes(4).readUInt32BE(0) >>> 1;
       const [videoRtcp, audioRtcp] = (await reserveUdpPorts(2)) as [number, number];
+      
       // Encrypt outbound with the controller's own key material (from the request),
       // and echo it back in the response. Generating fresh keys here is the classic
       // "stream sends but the device shows a forever-spinner" bug.
       const videoSrtpParams = srtpParamsFromRequest(request.video.srtp_key, request.video.srtp_salt);
       const audioSrtpParams = srtpParamsFromRequest(request.audio.srtp_key, request.audio.srtp_salt);
 
-      this.sessions.set(request.sessionID, {
-        prepared: {
-          targetAddress: request.targetAddress,
-          video: { port: request.video.port, localRtcpPort: videoRtcp, ssrc: videoSsrc, srtpParams: videoSrtpParams },
-          audio: { port: request.audio.port, localRtcpPort: audioRtcp, ssrc: audioSsrc, srtpParams: audioSrtpParams },
-        },
-      });
+      const preparedData: PreparedData = {
+        targetAddress: request.targetAddress,
+        video: { port: request.video.port, localRtcpPort: videoRtcp, ssrc: videoSsrc, srtpParams: videoSrtpParams },
+        audio: { port: request.audio.port, localRtcpPort: audioRtcp, ssrc: audioSsrc, srtpParams: audioSrtpParams },
+      };
+
+      // Transition to PREPARED state
+      if (!stateMachine.prepare(preparedData)) {
+        answer(new Error("Failed to transition session to PREPARED state"));
+        return;
+      }
+
+      // Store session with state machine
+      this.sessions.set(request.sessionID, { stateMachine });
 
       const response: PrepareStreamResponse = {
         video: {
@@ -645,6 +624,7 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
           srtp_salt: request.audio.srtp_salt,
         },
       };
+      
       answer(undefined, response);
     } catch (error) {
       answer(error instanceof Error ? error : new Error(String(error)));
@@ -685,43 +665,107 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
     const session = this.sessions.get(request.sessionID);
     callback(); // ack immediately; the respawn proceeds on its own
 
-    if (!session?.liveInput || this.videoMode !== "transcode") {
+    if (!session || this.videoMode !== "transcode") {
       return;
     }
-    // Same cap + source plan as START (a full-screen upgrade moves to the main
-    // stream; the encode stays inside the WiFi cap).
-    const plan = this.planLiveSession(request.video.width, request.video.height);
-    const bitrate = this.liveBitrateKbps(
-      plan.width,
-      plan.height,
-      request.video.max_bit_rate,
-      session.prepared.targetAddress,
-    );
+
+    const state = session.stateMachine.getState();
+    if (state.tag !== "STREAMING") {
+      this.logLine(`Cannot reconfigure session ${request.sessionID} - not in STREAMING state`);
+      return;
+    }
+
+    const liveInput = state.streaming.liveInput;
+
+    // Same cap + source plan as START (ensures RECONFIGURE can't bypass caps)
+    const plan: SessionPlan = this.policyEngine.plan({
+      width: request.video.width,
+      height: request.video.height,
+      fps: request.video.fps,
+      bitrateKbps: request.video.max_bit_rate,
+      controllerAddress: liveInput.targetAddress,
+    });
+
     const next: LiveFfmpegInput = {
-      ...session.liveInput,
-      inputUrl: plan.inputUrl,
+      ...liveInput,
+      inputUrl: plan.policy.source.streamUrl,
       video: {
-        ...session.liveInput.video,
-        width: plan.width,
-        height: plan.height,
+        ...liveInput.video,
+        width: plan.policy.encode.width,
+        height: plan.policy.encode.height,
         fps: request.video.fps,
-        maxBitrateKbps: bitrate,
+        maxBitrateKbps: plan.policy.encode.bitrateKbps,
       },
     };
+
     this.logLine(
       `HomeKit reconfigure: asked=${request.video.width}x${request.video.height}@${request.video.fps} ` +
-        `serving=${plan.width}x${plan.height} asked=${request.video.max_bit_rate}k serving=${bitrate}k ` +
+        `serving=${plan.policy.encode.width}x${plan.policy.encode.height} ` +
+        `asked=${request.video.max_bit_rate}k serving=${plan.policy.encode.bitrateKbps}k ` +
         `source=${next.inputUrl} — respawning encoder`,
     );
-    // SIGKILL is the teardown signal the exit handler ignores (no forceStop).
-    session.ffmpeg?.kill("SIGKILL");
-    this.spawnLive(request.sessionID, session, next);
+    this.logLine(`Policy: ${plan.policy.reasoning}`);
+
+    // SIGKILL the old ffmpeg (the teardown signal the exit handler ignores)
+    state.streaming.ffmpeg?.kill("SIGKILL");
+
+    // Spawn new ffmpeg and update state machine
+    this.spawnLiveForReconfigure(request.sessionID, session, next);
+  }
+
+  /** Spawn FFmpeg for RECONFIGURE (updates state machine via reconfigure() instead of start()). */
+  private spawnLiveForReconfigure(
+    sessionID: string,
+    session: ActiveSession,
+    liveInput: LiveFfmpegInput,
+  ): void {
+    const args = buildLiveFfmpegArgs(liveInput, this.includeAudio);
+
+    const log = (msg: string): void => this.logLine(msg);
+    log(`ffmpeg ${this.ffmpegPath} ${args.join(" ")}`);
+
+    const ffmpeg = this.spawnFn(this.ffmpegPath, args, { stdio: ["ignore", "ignore", "pipe"] });
+
+    // Use state machine's reconfigure() to update live input and ffmpeg
+    session.stateMachine.reconfigure(liveInput, ffmpeg);
+
+    // Detect first frame (same as spawnLive)
+    let firstFrameEmitted = false;
+    const stderrBuffer: string[] = [];
+    ffmpeg.stderr?.on("data", (chunk: Buffer) => {
+      const text = chunk.toString();
+      stderrBuffer.push(text);
+      if (stderrBuffer.length > 5) stderrBuffer.shift();
+      
+      log(`ffmpeg: ${text.trimEnd()}`);
+      
+      if (!firstFrameEmitted && /^frame=([1-9]\d*)$/m.test(text)) {
+        firstFrameEmitted = true;
+        emitTelemetry(this.cameraName, "live_session_first_frame", { sessionId: sessionID });
+      }
+    });
+
+    ffmpeg.on("error", (error: Error) => {
+      log(`ffmpeg spawn error: ${error.message}`);
+    });
+    ffmpeg.once("exit", (code, signal) => {
+      log(`ffmpeg exited code=${code} signal=${signal}`);
+      if (code !== 0 && signal !== "SIGKILL") {
+        this.controller?.forceStopStreamingSession(sessionID);
+      }
+    });
   }
 
   private startStream(request: Extract<StreamingRequest, { type: StreamRequestTypes.START }>, callback: StreamRequestCallback): void {
     const session = this.sessions.get(request.sessionID);
     if (!session) {
       callback(new Error(`No prepared session ${request.sessionID} for ${this.cameraName}`));
+      return;
+    }
+
+    const prepared = session.stateMachine.getPrepared();
+    if (!prepared) {
+      callback(new Error(`Session ${request.sessionID} not in PREPARED state`));
       return;
     }
 
@@ -732,21 +776,16 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
     const profile = "baseline";
     const level = H264_LEVEL_TO_X264[request.video.level] ?? "4.0";
     
-    // Defensive resolution clamp + input source, from one plan (see planLiveSession).
-    // Field 1.3.12: changing wifiSet default ladder was INSUFFICIENT — MacBook Home still
-    // negotiated 1280x720 despite code change + configVersion bump (cached stream configs?).
-    // Force cap here even if Home asks 720p. ARGUS_LIVE_CAP env var overrides (default 854).
-    const plan = this.planLiveSession(request.video.width, request.video.height);
-    const capWidth = plan.width;
-    const capHeight = plan.height;
+    // Use PolicyEngine to plan the session (replaces planLiveSession + liveBitrateKbps)
+    const plan: SessionPlan = this.policyEngine.plan({
+      width: request.video.width,
+      height: request.video.height,
+      fps: request.video.fps,
+      bitrateKbps: request.video.max_bit_rate,
+      controllerAddress: prepared.targetAddress,
+    });
 
-    const bitrate = this.liveBitrateKbps(
-      capWidth,
-      capHeight,
-      request.video.max_bit_rate,
-      session.prepared.targetAddress,
-    );
-    // Log negotiation details
+    // Log negotiation details with policy reasoning
     const audioLog = this.includeAudio
       ? (() => {
           const audioEncoder = request.audio.codec === AudioStreamingCodecType.AAC_ELD ? "libfdk_aac/aac_eld" : "libopus";
@@ -754,45 +793,46 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
         })()
       : "audio: none (video-only)";
     
-    const negotiatedLog = request.video.width !== capWidth || request.video.height !== capHeight
+    const negotiatedLog = request.video.width !== plan.policy.encode.width || request.video.height !== plan.policy.encode.height
       ? `asked=${request.video.width}x${request.video.height} CAPPED→`
       : "";
     
     this.logLine(
-      `HomeKit negotiated video: ${negotiatedLog}${capWidth}x${capHeight}@${request.video.fps} ` +
-        `profile=${profile} level=${level} ptype=${request.video.pt} ssrc=${session.prepared.video.ssrc} ` +
-        `suite=AES_CM_128_HMAC_SHA1_80 asked=${request.video.max_bit_rate}k serving=${bitrate}k mtu=${request.video.mtu} ` +
-        `mode=${this.videoMode} source=${plan.inputUrl}; ` +
+      `HomeKit negotiated video: ${negotiatedLog}${plan.policy.encode.width}x${plan.policy.encode.height}@${request.video.fps} ` +
+        `profile=${profile} level=${level} ptype=${request.video.pt} ssrc=${prepared.video.ssrc} ` +
+        `suite=AES_CM_128_HMAC_SHA1_80 asked=${request.video.max_bit_rate}k serving=${plan.policy.encode.bitrateKbps}k mtu=${request.video.mtu} ` +
+        `mode=${this.videoMode} source=${plan.policy.source.streamUrl}; ` +
         audioLog,
     );
+    this.logLine(`Policy: ${plan.policy.reasoning}`);
 
     const liveInputBase = {
-      inputUrl: plan.inputUrl,
-      targetAddress: session.prepared.targetAddress,
+      inputUrl: plan.policy.source.streamUrl,
+      targetAddress: prepared.targetAddress,
       videoMode: this.videoMode,
       video: {
-        port: session.prepared.video.port,
-        localRtcpPort: session.prepared.video.localRtcpPort,
-        ssrc: session.prepared.video.ssrc,
+        port: prepared.video.port,
+        localRtcpPort: prepared.video.localRtcpPort,
+        ssrc: prepared.video.ssrc,
         payloadType: request.video.pt,
-        maxBitrateKbps: bitrate,
+        maxBitrateKbps: plan.policy.encode.bitrateKbps,
         fps: request.video.fps,
-        width: capWidth,
-        height: capHeight,
+        width: plan.policy.encode.width,
+        height: plan.policy.encode.height,
         mtu: request.video.mtu,
         profile,
         level,
-        srtpParams: session.prepared.video.srtpParams,
+        srtpParams: prepared.video.srtpParams,
       },
       audio: {
-        port: session.prepared.audio.port,
-        localRtcpPort: session.prepared.audio.localRtcpPort,
-        ssrc: session.prepared.audio.ssrc,
+        port: prepared.audio.port,
+        localRtcpPort: prepared.audio.localRtcpPort,
+        ssrc: prepared.audio.ssrc,
         payloadType: request.audio.pt,
         codec: request.audio.codec,
         sampleRateKhz: request.audio.sample_rate,
         maxBitrateKbps: request.audio.max_bit_rate,
-        srtpParams: session.prepared.audio.srtpParams,
+        srtpParams: prepared.audio.srtpParams,
       },
     };
     
@@ -811,51 +851,34 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
     callback?: StreamRequestCallback,
   ): void {
     const args = buildLiveFfmpegArgs(liveInput, this.includeAudio);
-    session.liveInput = liveInput;
 
     const log = (msg: string): void => this.logLine(msg);
     log(`ffmpeg ${this.ffmpegPath} ${args.join(" ")}`);
 
     const ffmpeg = this.spawnFn(this.ffmpegPath, args, { stdio: ["ignore", "ignore", "pipe"] });
-    session.ffmpeg = ffmpeg;
 
-    // Bind UDP return sockets for RTCP (camera-ffmpeg pattern). Home sends RTCP
-    // RR/NACKs to the ports we advertised in prepareStream, so a listener must
-    // own them — but SILENCE on them is normal: field across 1.3.11–1.3.14 shows
-    // Home painting for minutes while sending at most one receiver report. The
-    // 30s silence watchdog that used to live here forceStopped the session, so a
-    // lone report armed a timer that killed a healthy stream at ~30s. Session
-    // teardown belongs to the controller: Home sends STOP, and HAP-NodeJS
-    // force-stops active sessions when the controller connection closes
-    // (Accessory.handleCloseConnection) — Argus must not guess liveness from
-    // RTCP. bind() failures arrive as async "error" events, not throws; without
-    // a handler Node turns them into an uncaught exception that kills the
-    // process, so each socket logs and closes instead.
-    const bindReturnSocket = (label: string, port: number): ReturnType<typeof createSocket> => {
-      const socket = createSocket("udp4");
-      socket.on("error", (error) => {
-        log(`RTCP ${label} return socket error: ${error.message} — continuing without it`);
-        socket.close();
-      });
-      let seen = false;
-      socket.on("message", (msg) => {
-        if (!seen) {
-          seen = true;
-          log(`RTCP arrived on ${label} return port (${msg.length} bytes)`);
-        }
-      });
-      if (this.bindAddress) {
-        socket.bind(port, this.bindAddress);
-      } else {
-        socket.bind(port);
-      }
-      log(`Bound ${label} return RTCP: port ${port}${this.bindAddress ? ` addr ${this.bindAddress}` : ""}`);
-      return socket;
-    };
-    session.videoReturnSocket = bindReturnSocket("video", liveInput.video.localRtcpPort);
+    // Bind UDP return sockets for RTCP using ObservableRtcpSocket (Phase 2 migration).
+    // No watchdog timers — HAP-NodeJS manages session termination (STOP, connection close).
+    // Field evidence: Home paints for minutes with at most one RTCP receiver report.
+    const videoSocket = createSocket("udp4");
+    const videoReturnSocket = new ObservableRtcpSocket(videoSocket, "video", log);
+    videoReturnSocket.bind(liveInput.video.localRtcpPort, this.bindAddress);
+
+    let audioReturnSocket: ObservableRtcpSocket | undefined;
     if (this.includeAudio) {
-      session.audioReturnSocket = bindReturnSocket("audio", liveInput.audio.localRtcpPort);
+      const audioSocket = createSocket("udp4");
+      audioReturnSocket = new ObservableRtcpSocket(audioSocket, "audio", log);
+      audioReturnSocket.bind(liveInput.audio.localRtcpPort, this.bindAddress);
     }
+
+    // Transition state machine to STREAMING
+    const streamingData: StreamingData = {
+      ffmpeg,
+      liveInput,
+      videoReturnSocket: videoSocket,
+      ...(audioReturnSocket && { audioReturnSocket: audioReturnSocket.getSocket() }),
+    };
+    session.stateMachine.start(streamingData);
 
     // Detect first frame from FFmpeg progress output (pipe:2 → stderr). Progress format:
     // "frame=N\nfps=...\n..." with frame=0 first, then frame=1 when first encode completes.
@@ -917,15 +940,26 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
 
   private stopStream(sessionID: string): void {
     const session = this.sessions.get(sessionID);
-    session?.ffmpeg?.kill("SIGKILL");
-    // Close RTCP return sockets; a socket whose bind failed already closed itself.
-    for (const socket of [session?.videoReturnSocket, session?.audioReturnSocket]) {
-      try {
-        socket?.close();
-      } catch {
-        // already closed
+    if (!session) {
+      return;
+    }
+
+    // Use state machine's idempotent stop() to get resources to clean up
+    const resources = session.stateMachine.stop();
+    if (resources) {
+      // Kill FFmpeg process
+      resources.ffmpeg?.kill("SIGKILL");
+      
+      // Close RTCP return sockets (bind failures already closed themselves via ObservableRtcpSocket)
+      for (const socket of [resources.videoReturnSocket, resources.audioReturnSocket]) {
+        try {
+          socket?.close();
+        } catch {
+          // already closed
+        }
       }
     }
+
     this.sessions.delete(sessionID);
   }
 }
