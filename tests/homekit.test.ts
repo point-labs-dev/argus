@@ -10,6 +10,7 @@ import {
   buildCameraControllerOptions,
   buildLiveFfmpegArgs,
   effectiveBitrateKbps,
+  NO_RTCP_CONSUMER_ABANDON_MS,
   resolveSrtpTargetAddress,
   type LiveFfmpegInput,
 } from "../src/homekit.js";
@@ -573,11 +574,7 @@ describe("ArgusStreamingDelegate", () => {
     stopSession(delegate, "s6");
   });
 
-  it("does not force-stop a session when RTCP goes silent after one packet", async () => {
-    // Field 1.3.11–1.3.14: Home paints for minutes while sending at most ONE
-    // receiver report. The old 30s silence watchdog armed on that lone packet
-    // and force-stopped the healthy session at ~30s. Teardown belongs to the
-    // controller (STOP request, or HAP handleCloseConnection on disconnect).
+  it("does not stop ffmpeg during 40s of silence after one RTCP packet", async () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     try {
       const fakeProc = Object.assign(new EventEmitter(), { kill: vi.fn() });
@@ -629,6 +626,87 @@ describe("ArgusStreamingDelegate", () => {
 
       delegate.handleStreamRequest({ type: "stop", sessionID: "rtcp-1" } as never, () => {});
     } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("stops ffmpeg when an abandoned live session has no RTCP consumer and never receives STOP, and leaves a watched session running", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const procs: Array<EventEmitter & { kill: ReturnType<typeof vi.fn> }> = [];
+    const spawnFn = vi.fn(() => {
+      const proc = Object.assign(new EventEmitter(), { kill: vi.fn() });
+      procs.push(proc);
+      return proc;
+    }) as unknown as typeof import("node:child_process").spawn;
+    const delegate = new ArgusStreamingDelegate(
+      "Backyard",
+      "rtsp://127.0.0.1:8554/backyard-sub",
+      cacheWith(Buffer.from([0xff, 0xd8])),
+      { spawnFn, verbose: false },
+    );
+
+    async function start(sessionID: string): Promise<number> {
+      let videoReturnPort = 0;
+      await new Promise<void>((resolve, reject) => {
+        delegate.prepareStream(
+          {
+            sessionID,
+            targetAddress: "192.168.1.50",
+            video: { port: 50000, srtp_key: Buffer.alloc(16, 1), srtp_salt: Buffer.alloc(14, 2) },
+            audio: { port: 50002, srtp_key: Buffer.alloc(16, 3), srtp_salt: Buffer.alloc(14, 4) },
+          } as never,
+          (error, response) => {
+            if (error || !response) return reject(error ?? new Error("no response"));
+            videoReturnPort = (response as { video: { port: number } }).video.port;
+            resolve();
+          },
+        );
+      });
+      const startDone = new Promise<void>((resolve, reject) => {
+        delegate.handleStreamRequest(
+          {
+            type: "start",
+            sessionID,
+            video: { pt: 99, max_bit_rate: 600, fps: 30, width: 854, height: 480, mtu: 1378, profile: 2, level: 2 },
+            audio: { pt: 110, sample_rate: 24, max_bit_rate: 24, codec: 3 },
+          } as never,
+          (error) => (error ? reject(error) : resolve()),
+        );
+      });
+      await vi.advanceTimersByTimeAsync(100);
+      await startDone;
+      return videoReturnPort;
+    }
+
+    async function sendRtcp(port: number): Promise<void> {
+      const sender = createSocket("udp4");
+      try {
+        await new Promise<void>((resolve) =>
+          sender.send(Buffer.from([0x80, 0xc9, 0x00, 0x01]), port, "127.0.0.1", () => resolve()),
+        );
+        for (let i = 0; i < 25; i += 1) await new Promise((resolve) => setImmediate(resolve));
+      } finally {
+        sender.close();
+      }
+    }
+
+    try {
+      const abandonedPort = await start("abandoned-live");
+      const watchedPort = await start("watched-live");
+      const abandonedProc = procs[0]!;
+      const watchedProc = procs[1]!;
+
+      await sendRtcp(abandonedPort);
+      await sendRtcp(watchedPort);
+      await vi.advanceTimersByTimeAsync(NO_RTCP_CONSUMER_ABANDON_MS - 1000);
+      await sendRtcp(watchedPort);
+      await vi.advanceTimersByTimeAsync(2000);
+
+      expect(abandonedProc.kill).toHaveBeenCalledWith("SIGKILL");
+      expect(watchedProc.kill).not.toHaveBeenCalled();
+    } finally {
+      delegate.handleStreamRequest({ type: "stop", sessionID: "abandoned-live" } as never, () => {});
+      delegate.handleStreamRequest({ type: "stop", sessionID: "watched-live" } as never, () => {});
       vi.useRealTimers();
     }
   });

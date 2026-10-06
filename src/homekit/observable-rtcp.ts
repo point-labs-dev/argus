@@ -1,21 +1,6 @@
 import { EventEmitter } from "node:events";
 import type { Socket } from "node:dgram";
 
-/**
- * Observable RTCP socket (logs events without lifecycle timers).
- * 
- * Purpose: Make RTCP observable for debugging without watchdog timers that kill healthy sessions.
- * What it prevents (from 1.3.15 fix):
- * - Killing healthy sessions: no 30s watchdog (field: Home sends ONE RTCP at +0.5s, then silence)
- * - Process crashes: bind errors emit "error" event instead of throwing
- * - Lost debugging data: events emitted for external observers (tests, metrics)
- * 
- * Protocol contract: HAP-NodeJS manages session termination (STOP request, connection close
- * via Accessory.handleCloseConnection). Accessories log RTCP for observability but do NOT
- * use it for lifecycle decisions. Field evidence: Home paints for minutes with at most one
- * receiver report — silence is normal, not a failure signal.
- */
-
 export interface RtcpPacketEvent {
   size: number;
   time: number;
@@ -28,8 +13,6 @@ export interface RtcpPacketEvent {
  * - "packet": RTCP data arrived (size, timestamp) — observable for debugging/telemetry
  * - "error": bind/send failed — logged and socket closed, no process crash
  * - "close": socket closed (normal teardown or error recovery)
- * 
- * No watchdog timer: HAP manages session lifecycle, not the accessory.
  */
 export class ObservableRtcpSocket extends EventEmitter {
   private seen = false;
