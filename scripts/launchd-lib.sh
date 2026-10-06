@@ -84,12 +84,16 @@ retire_gui_job() {
   local home=$2
   local label=$3
   local plist=$4
-  local disabled
+  local disabled parked
   disabled="$(disabled_agents_dir "$home")"
+  parked="${disabled}/$(basename "$plist")"
   ensure_user_owned_dir "$disabled"
   if ! launchctl bootout "gui/${uid}/${label}"; then
-    echo "bootout gui/${uid}/${label} failed. Not bootstrapping the system daemon." >&2
-    exit 1
+    if launchctl print "gui/${uid}/${label}" >/dev/null 2>&1 \
+      || [[ -f "$plist" || ! -f "$parked" ]]; then
+      echo "bootout gui/${uid}/${label} failed. Not bootstrapping the system daemon." >&2
+      exit 1
+    fi
   fi
   abort_if_gui_loaded "$uid" "$label"
   launchctl disable "gui/${uid}/${label}" || true
