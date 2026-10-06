@@ -1,16 +1,9 @@
 #!/bin/bash
-# Writes the gui LaunchAgent plist and the system LaunchDaemon plist.
-# ARGUS_INSTALL_RENDER_ONLY=1 writes those plists and does not call launchctl.
-# ARGUS_INSTALL_ROOT prefixes both plist directories.
-# ARGUS_AGENT_PLIST is an agent plist whose ARGUS_* keys are copied.
-#
-# Usage: bash scripts/install-launchd.sh
-#        bash scripts/install-launchd.sh --uninstall
 set -euo pipefail
 
-LABEL="dev.point-labs.argus"
+source "$(cd "$(dirname "$0")" && pwd)/launchd-lib.sh"
+
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-CANONICAL_DAEMON_PLIST="/Library/LaunchDaemons/${LABEL}.plist"
 INSTALL_ROOT="${ARGUS_INSTALL_ROOT:-}"
 RENDER_ONLY="${ARGUS_INSTALL_RENDER_ONLY:-}"
 
@@ -26,16 +19,7 @@ job_user() {
   printf '%s' "$name"
 }
 
-gui_domain() {
-  local uid
-  uid="$(id -u)"
-  if [[ -n "${SUDO_UID:-}" && "${SUDO_USER:-}" != "root" ]]; then
-    uid="${SUDO_UID}"
-  fi
-  printf 'gui/%s' "$uid"
-}
-
-DOMAIN="$(gui_domain)"
+DOMAIN="gui/$(gui_uid)"
 
 if [[ -n "$INSTALL_ROOT" ]]; then
   AGENT_PLIST="${INSTALL_ROOT}/Library/LaunchAgents/${LABEL}.plist"
@@ -50,6 +34,15 @@ if [[ "${1:-}" == "--uninstall" ]]; then
   rm -f "${HOME}/Library/LaunchAgents/${LABEL}.plist"
   echo "uninstalled $LABEL"
   exit 0
+fi
+
+if [[ "$RENDER_ONLY" != "1" ]]; then
+  if [[ -z "${SUDO_USER:-}" || "${SUDO_USER}" == "root" ]]; then
+    if [[ -f "$DAEMON_PLIST" ]] || launchctl print "system/${LABEL}" >/dev/null 2>&1; then
+      echo "system daemon already exists. Refusing to bootstrap the gui agent. Use scripts/cutover-launchdaemon.sh or scripts/rollback-launchdaemon.sh." >&2
+      exit 1
+    fi
+  fi
 fi
 
 xml_escape() {
@@ -149,6 +142,8 @@ write_job_plist() {
       printf '%s\n' "$ARGUS_XML"
     fi
     printf '%s\n' '  </dict>'
+    printf '%s\n' '  <key>Umask</key>'
+    printf '%s\n' '  <integer>63</integer>'
     printf '%s\n' '  <key>RunAtLoad</key>'
     printf '%s\n' '  <true/>'
     printf '%s\n' '  <key>KeepAlive</key>'
@@ -164,6 +159,37 @@ write_job_plist() {
   } > "$dest"
 }
 
+write_logrotate_plist() {
+  local dest=$1
+  local user_name=$2
+  local home=$3
+  local program="${home}/bin/argus-logrotate.sh"
+  mkdir -p "$(dirname "$dest")"
+  {
+    printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>'
+    printf '%s\n' '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">'
+    printf '%s\n' '<plist version="1.0">'
+    printf '%s\n' '<dict>'
+    printf '%s\n' '  <key>Label</key>'
+    printf '%s\n' "  <string>${LOGROTATE_LABEL}</string>"
+    printf '%s\n' '  <key>UserName</key>'
+    printf '%s\n' "  <string>$(xml_escape "$user_name")</string>"
+    printf '%s\n' '  <key>ProgramArguments</key>'
+    printf '%s\n' '  <array>'
+    printf '%s\n' "    <string>$(xml_escape "$program")</string>"
+    printf '%s\n' '  </array>'
+    printf '%s\n' '  <key>EnvironmentVariables</key>'
+    printf '%s\n' '  <dict>'
+    printf '%s\n' '    <key>HOME</key>'
+    printf '%s\n' "    <string>$(xml_escape "$home")</string>"
+    printf '%s\n' '  </dict>'
+    printf '%s\n' '  <key>StartInterval</key>'
+    printf '%s\n' '  <integer>3600</integer>'
+    printf '%s\n' '</dict>'
+    printf '%s\n' '</plist>'
+  } > "$dest"
+}
+
 NODE_BIN="$(command -v node)"
 FFMPEG_BIN="$(command -v ffmpeg)"
 [[ -x "$NODE_BIN" ]] || { echo "node not found in PATH" >&2; exit 1; }
@@ -171,25 +197,41 @@ FFMPEG_BIN="$(command -v ffmpeg)"
 [[ -f "$REPO_DIR/dist/serve.js" ]] || { echo "dist/serve.js missing. Run npm run build first." >&2; exit 1; }
 [[ -f "$REPO_DIR/argus.yaml" ]] || { echo "argus.yaml missing in $REPO_DIR" >&2; exit 1; }
 
-# launchd does not source shell profiles, so spawn("ffmpeg") needs this PATH.
 DAEMON_PATH="$(dirname "$NODE_BIN"):$(dirname "$FFMPEG_BIN"):/usr/bin:/bin:/usr/sbin:/sbin"
 
-SOURCE_PLIST="${ARGUS_AGENT_PLIST:-}"
-if [[ -z "$SOURCE_PLIST" && -f "$AGENT_PLIST" ]]; then
-  SOURCE_PLIST="$AGENT_PLIST"
+SOURCE_PLIST=""
+if [[ -n "${ARGUS_AGENT_PLIST:-}" ]]; then
+  if [[ ! -f "$ARGUS_AGENT_PLIST" ]]; then
+    echo "ARGUS_AGENT_PLIST does not exist: ${ARGUS_AGENT_PLIST}" >&2
+    exit 1
+  fi
+  SOURCE_PLIST="$ARGUS_AGENT_PLIST"
+else
+  CANDIDATE="$(effective_home)/Library/LaunchAgents/${LABEL}.plist"
+  if [[ -f "$CANDIDATE" ]]; then
+    SOURCE_PLIST="$CANDIDATE"
+  fi
 fi
+ARGUS_XML=""
 build_argus_xml "$SOURCE_PLIST"
+if [[ -z "${ARGUS_XML}" ]]; then
+  echo "refusing to write the daemon plist with no ARGUS_* keys. Pass ARGUS_AGENT_PLIST, or run sudo from the account whose LaunchAgent plist has those keys." >&2
+  exit 1
+fi
 
 if [[ "$RENDER_ONLY" != "1" ]]; then
   mkdir -p "$REPO_DIR/logs"
 fi
 
+USER_NAME="$(job_user)"
+USER_HOME="$(effective_home)"
 if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" && -z "$INSTALL_ROOT" ]]; then
-  write_job_plist "$DAEMON_PLIST" "$(job_user)"
+  write_job_plist "$DAEMON_PLIST" "$USER_NAME"
 else
   write_job_plist "$AGENT_PLIST" ""
-  write_job_plist "$DAEMON_PLIST" "$(job_user)"
+  write_job_plist "$DAEMON_PLIST" "$USER_NAME"
 fi
+write_logrotate_plist "$(dirname "$DAEMON_PLIST")/${LOGROTATE_LABEL}.plist" "$USER_NAME" "$USER_HOME"
 echo "$CANONICAL_DAEMON_PLIST"
 
 if [[ "$RENDER_ONLY" == "1" ]]; then
