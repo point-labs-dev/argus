@@ -1,9 +1,14 @@
 import { spawn as nodeSpawn } from "node:child_process";
-import { mkdir, writeFile } from "node:fs/promises";
+import { chmod, mkdir, writeFile } from "node:fs/promises";
 import * as path from "node:path";
 
 import type { ArgusConfig } from "./config.js";
-import { generateGo2RtcYaml } from "./go2rtc.js";
+import {
+  generateGo2RtcConfig,
+  go2RtcAuthorizationHeader,
+  serializeGo2RtcConfig,
+  type Go2RtcApiCredentials,
+} from "./go2rtc.js";
 
 export type Go2RtcSupervisorErrorCode =
   | "CONFIG_EXISTS"
@@ -33,6 +38,7 @@ export interface WriteGo2RtcConfigFileOptions {
 export interface WriteGo2RtcConfigFileResult {
   path: string;
   bytes: number;
+  api: Go2RtcApiCredentials;
 }
 
 export interface Go2RtcHealthStatus {
@@ -47,6 +53,7 @@ export interface Go2RtcHealthOptions {
   apiBaseUrl?: string;
   fetch?: typeof fetch;
   requestTimeoutMs?: number;
+  apiCredentials?: Go2RtcApiCredentials;
 }
 
 export interface WaitForGo2RtcHealthOptions extends Go2RtcHealthOptions {
@@ -148,13 +155,16 @@ export async function writeGo2RtcConfigFile(
 
   await mkdir(path.dirname(resolvedConfigPath), { recursive: true });
 
-  const contents = ensureTrailingNewline(generateGo2RtcYaml(config));
+  const generated = generateGo2RtcConfig(config);
+  const contents = ensureTrailingNewline(serializeGo2RtcConfig(generated));
 
   try {
     await writeFile(resolvedConfigPath, contents, {
       encoding: "utf8",
       flag: options.force === true ? "w" : "wx",
+      mode: 0o600,
     });
+    await chmod(resolvedConfigPath, 0o600);
   } catch (error) {
     if (isNodeErrorWithCode(error, "EEXIST")) {
       throw new Go2RtcSupervisorError(
@@ -170,6 +180,10 @@ export async function writeGo2RtcConfigFile(
   return {
     path: resolvedConfigPath,
     bytes: Buffer.byteLength(contents, "utf8"),
+    api: {
+      username: generated.api.username,
+      password: generated.api.password,
+    },
   };
 }
 
@@ -180,7 +194,12 @@ export async function getGo2RtcHealth(options: Go2RtcHealthOptions): Promise<Go2
   const timeout = setTimeout(() => controller.abort(), options.requestTimeoutMs ?? 1_000);
 
   try {
-    const response = await fetchImpl(`${apiBaseUrl}/api/streams`, { signal: controller.signal });
+    const requestInit: RequestInit = { signal: controller.signal };
+    if (options.apiCredentials) {
+      requestInit.headers = { Authorization: go2RtcAuthorizationHeader(options.apiCredentials) };
+    }
+
+    const response = await fetchImpl(`${apiBaseUrl}/api/streams`, requestInit);
 
     if (!response.ok) {
       return {
@@ -236,6 +255,9 @@ export async function waitForGo2RtcHealth(options: WaitForGo2RtcHealthOptions): 
       }
       if (options.fetch !== undefined) {
         healthOptions.fetch = options.fetch;
+      }
+      if (options.apiCredentials !== undefined) {
+        healthOptions.apiCredentials = options.apiCredentials;
       }
 
       const status = await getGo2RtcHealth(healthOptions);
@@ -358,6 +380,7 @@ async function terminateProcess(
 
 export class Go2RtcSupervisor {
   private child: Go2RtcChildProcess | undefined;
+  private apiCredentialsValue: Go2RtcApiCredentials | undefined;
   private readonly apiBaseUrl: string;
 
   public constructor(
@@ -369,6 +392,14 @@ export class Go2RtcSupervisor {
 
   public get process(): Go2RtcChildProcess | undefined {
     return this.child;
+  }
+
+  public get apiCredentials(): Go2RtcApiCredentials {
+    if (!this.apiCredentialsValue) {
+      throw new Error("go2rtc API credentials are set when the supervisor starts.");
+    }
+
+    return this.apiCredentialsValue;
   }
 
   public async start(): Promise<Go2RtcStartResult> {
@@ -385,6 +416,7 @@ export class Go2RtcSupervisor {
     }
 
     const writeResult = await writeGo2RtcConfigFile(this.config, this.options.configPath, writeOptions);
+    this.apiCredentialsValue = writeResult.api;
 
     const spawnImpl = this.options.spawn ?? ((command, args, spawnOptions) => nodeSpawn(command, [...args], spawnOptions));
     const spawnOptions: { cwd?: string; stdio?: "ignore" | "inherit" | "pipe" } = {
@@ -420,7 +452,10 @@ export class Go2RtcSupervisor {
     });
 
     try {
-      const waitOptions: WaitForGo2RtcHealthOptions = { apiBaseUrl: this.apiBaseUrl };
+      const waitOptions: WaitForGo2RtcHealthOptions = {
+        apiBaseUrl: this.apiBaseUrl,
+        apiCredentials: writeResult.api,
+      };
       if (this.options.fetch !== undefined) {
         waitOptions.fetch = this.options.fetch;
       }
@@ -456,6 +491,9 @@ export class Go2RtcSupervisor {
 
   public async health(): Promise<Go2RtcHealthStatus> {
     const options: Go2RtcHealthOptions = { apiBaseUrl: this.apiBaseUrl };
+    if (this.apiCredentialsValue !== undefined) {
+      options.apiCredentials = this.apiCredentialsValue;
+    }
     if (this.options.fetch !== undefined) {
       options.fetch = this.options.fetch;
     }

@@ -1,10 +1,21 @@
+import { Buffer } from "node:buffer";
+import { randomBytes } from "node:crypto";
+
 import { stringify as stringifyYaml } from "yaml";
 
 import type { ArgusConfig, CameraConfig } from "./config.js";
 
+export interface Go2RtcApiCredentials {
+  username: string;
+  password: string;
+}
+
 export interface Go2RtcConfig {
   api: {
     listen: string;
+    username: string;
+    password: string;
+    local_auth: true;
   };
   rtsp: {
     listen: string;
@@ -32,6 +43,23 @@ export interface Go2RtcCameraStreamNames {
 
 function encodeCredential(value: string): string {
   return encodeURIComponent(value);
+}
+
+function createGo2RtcApiCredentials(): Go2RtcApiCredentials {
+  return {
+    username: "argus",
+    password: randomBytes(24).toString("base64url"),
+  };
+}
+
+export function go2RtcAuthorizationHeader(credentials: Go2RtcApiCredentials): string {
+  return `Basic ${Buffer.from(`${credentials.username}:${credentials.password}`).toString("base64")}`;
+}
+
+export function serializeGo2RtcConfig(generated: Go2RtcConfig): string {
+  return stringifyYaml(generated, {
+    lineWidth: 0,
+  });
 }
 
 function sanitizeStreamName(name: string): string {
@@ -144,9 +172,14 @@ export function generateGo2RtcConfig(config: ArgusConfig): Go2RtcConfig {
     preload[streamName.main] = "";
   });
 
+  const apiCredentials = createGo2RtcApiCredentials();
+
   return {
     api: {
       listen: `127.0.0.1:${config.go2rtc.api_port}`,
+      username: apiCredentials.username,
+      password: apiCredentials.password,
+      local_auth: true,
     },
     rtsp: {
       listen: "127.0.0.1:8554",
@@ -157,7 +190,5 @@ export function generateGo2RtcConfig(config: ArgusConfig): Go2RtcConfig {
 }
 
 export function generateGo2RtcYaml(config: ArgusConfig): string {
-  return stringifyYaml(generateGo2RtcConfig(config), {
-    lineWidth: 0,
-  });
+  return serializeGo2RtcConfig(generateGo2RtcConfig(config));
 }

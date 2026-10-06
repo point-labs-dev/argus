@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { mkdir, writeFile } from "node:fs/promises";
+import { chmod, mkdir, writeFile } from "node:fs/promises";
 import * as path from "node:path";
 
 import { ConfigError, loadArgusConfig } from "./config.js";
@@ -98,7 +98,9 @@ async function writeOutputFile(
     await writeFile(resolvedOutputPath, ensureTrailingNewline(contents), {
       encoding: "utf8",
       flag: force ? "w" : "wx",
+      mode: 0o600,
     });
+    await chmod(resolvedOutputPath, 0o600);
   } catch (error) {
     if (isNodeErrorWithCode(error, "EEXIST")) {
       throw new Error(`Output file already exists: ${resolvedOutputPath}. Pass --force to overwrite.`);

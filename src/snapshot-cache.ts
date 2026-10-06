@@ -1,7 +1,12 @@
 import { Buffer } from "node:buffer";
 
 import type { ArgusConfig } from "./config.js";
-import { buildGo2RtcStreamNames, type CameraProfile } from "./go2rtc.js";
+import {
+  buildGo2RtcStreamNames,
+  go2RtcAuthorizationHeader,
+  type CameraProfile,
+  type Go2RtcApiCredentials,
+} from "./go2rtc.js";
 
 export type SnapshotProfile = CameraProfile;
 
@@ -20,6 +25,7 @@ export interface SnapshotCacheOptions {
   now?: () => Date;
   defaultProfile?: SnapshotProfile;
   pollIntervalMs?: number;
+  apiCredentials?: Go2RtcApiCredentials;
 }
 
 export class SnapshotCacheError extends Error {
@@ -76,6 +82,7 @@ export class SnapshotCache {
   private readonly now: () => Date;
   private readonly defaultProfile: SnapshotProfile;
   private readonly pollIntervalMs: number;
+  private readonly authorizationHeader: string | undefined;
   private readonly camerasByName = new Map<string, CameraStreams>();
   private readonly snapshots = new Map<string, CachedSnapshot>();
   private pollingAbortController: AbortController | undefined;
@@ -86,6 +93,9 @@ export class SnapshotCache {
     this.now = options.now ?? (() => new Date());
     this.defaultProfile = options.defaultProfile ?? "sub";
     this.pollIntervalMs = options.pollIntervalMs ?? 30_000;
+    this.authorizationHeader = options.apiCredentials
+      ? go2RtcAuthorizationHeader(options.apiCredentials)
+      : undefined;
 
     for (const streamNames of buildGo2RtcStreamNames(config.cameras)) {
       if (this.camerasByName.has(streamNames.cameraName)) {
@@ -122,8 +132,14 @@ export class SnapshotCache {
   ): Promise<CachedSnapshot> {
     const streamName = this.resolveStreamName(cameraName, profile);
     const url = this.buildSnapshotUrl(streamName);
-    const requestInit: RequestInit | undefined = signal ? { signal } : undefined;
-    const response = await this.fetchFn(url, requestInit);
+    const requestInit: RequestInit = {};
+    if (signal) {
+      requestInit.signal = signal;
+    }
+    if (this.authorizationHeader) {
+      requestInit.headers = { Authorization: this.authorizationHeader };
+    }
+    const response = await this.fetchFn(url, signal || this.authorizationHeader ? requestInit : undefined);
 
     if (!response.ok) {
       throw new SnapshotCacheError(`Snapshot request failed for "${cameraName}" (${profile}): HTTP ${response.status}.`);
