@@ -65,17 +65,69 @@ plist_label() {
   python3 -c 'import plistlib,sys; print(plistlib.load(open(sys.argv[1],"rb")).get("Label",""))' "$1"
 }
 
+disabled_agents_dir() {
+  local home=$1
+  printf '%s' "${home}/Library/LaunchAgents-disabled"
+}
+
+ensure_user_owned_dir() {
+  local dir=$1
+  local owner="${SUDO_USER:-}"
+  mkdir -p "$dir"
+  if [[ "$(id -u)" -eq 0 && -n "$owner" && "$owner" != "root" ]]; then
+    chown "$owner" "$dir"
+  fi
+}
+
 retire_gui_job() {
   local uid=$1
   local home=$2
   local label=$3
   local plist=$4
-  launchctl bootout "gui/${uid}/${label}" 2>/dev/null || true
+  local disabled
+  disabled="$(disabled_agents_dir "$home")"
+  ensure_user_owned_dir "$disabled"
+  if ! launchctl bootout "gui/${uid}/${label}"; then
+    echo "bootout gui/${uid}/${label} failed. Not bootstrapping the system daemon." >&2
+    exit 1
+  fi
+  abort_if_gui_loaded "$uid" "$label"
   launchctl disable "gui/${uid}/${label}" || true
   if [[ -n "$plist" && -f "$plist" ]]; then
-    mkdir -p "${home}/Library/LaunchAgents-disabled"
-    mv "$plist" "${home}/Library/LaunchAgents-disabled/"
+    mv "$plist" "${disabled}/"
   fi
+}
+
+abort_if_gui_loaded() {
+  local uid=$1
+  local label=$2
+  if launchctl print "gui/${uid}/${label}" >/dev/null 2>&1; then
+    echo "gui/${uid}/${label} is still loaded. Not bootstrapping the system daemon." >&2
+    exit 1
+  fi
+}
+
+park_stale_argus_plists() {
+  local home=$1
+  local disabled
+  disabled="$(disabled_agents_dir "$home")"
+  ensure_user_owned_dir "$disabled"
+  shopt -s nullglob
+  local stale
+  for stale in "${home}/Library/LaunchAgents/${LABEL}.plist.bak-"*; do
+    mv "$stale" "${disabled}/"
+  done
+}
+
+restore_stale_argus_plists() {
+  local home=$1
+  local agents="${home}/Library/LaunchAgents"
+  shopt -s nullglob
+  local stale
+  for stale in "${home}/Library/LaunchAgents-disabled/${LABEL}.plist.bak-"*; do
+    mkdir -p "$agents"
+    mv "$stale" "${agents}/"
+  done
 }
 
 bootstrap_system() {
