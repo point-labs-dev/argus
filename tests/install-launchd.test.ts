@@ -576,4 +576,181 @@ exit 0
       cleanup(run);
     }
   });
+
+  it("continues cutover when the gui job is already booted out and its plist is parked", () => {
+    const run = renderDaemon("scripts/install-launchdaemon.sh", { SUDO_USER: "mini", SUDO_UID: "501" }, true, {
+      separateSudoHome: true,
+      includeAgentPlistEnv: false,
+    });
+    try {
+      const state = path.join(run.root, "launchctl.state");
+      writeFileSync(state, "");
+      writeFileSync(run.launchctlLog, "");
+      writeFileSync(
+        path.join(run.bin, "launchctl"),
+        `#!/bin/bash
+printf '%s\\n' "$*" >> ${JSON.stringify(run.launchctlLog)}
+cmd="$1"
+shift
+case "$cmd" in
+  bootout)
+    if grep -qxF "$1" ${JSON.stringify(state)}; then
+      grep -vxF "$1" ${JSON.stringify(state)} > ${JSON.stringify(state)}.tmp || true
+      mv ${JSON.stringify(state)}.tmp ${JSON.stringify(state)}
+      exit 0
+    fi
+    echo "Boot-out failed: 3: No such process" >&2
+    exit 3
+    ;;
+  bootstrap)
+    label="$(python3 -c 'import plistlib,sys; print(plistlib.load(open(sys.argv[1],"rb"))["Label"])' "$2")"
+    printf '%s/%s\\n' "$1" "$label" >> ${JSON.stringify(state)}
+    ;;
+  print)
+    if grep -qxF "$1" ${JSON.stringify(state)}; then
+      echo "state = running"
+      exit 0
+    fi
+    echo "Could not find service" >&2
+    exit 1
+    ;;
+esac
+exit 0
+`,
+      );
+      chmodSync(path.join(run.bin, "launchctl"), 0o755);
+      const daemonDir = path.join(run.installRoot, "Library", "LaunchDaemons");
+      mkdirSync(daemonDir, { recursive: true });
+      writeFileSync(
+        path.join(daemonDir, `${LABEL}.plist`),
+        `<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict><key>Label</key><string>${LABEL}</string></dict></plist>
+`,
+      );
+      writeFileSync(
+        path.join(daemonDir, `${LOGROTATE_LABEL}.plist`),
+        `<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict><key>Label</key><string>${LOGROTATE_LABEL}</string></dict></plist>
+`,
+      );
+      const agent = path.join(run.sudoHome, "Library", "LaunchAgents", `${LABEL}.plist`);
+      const disabledDir = path.join(run.sudoHome, "Library", "LaunchAgents-disabled");
+      const disabledAgent = path.join(disabledDir, `${LABEL}.plist`);
+      const parkedBody = readFileSync(agent, "utf8");
+      mkdirSync(disabledDir, { recursive: true });
+      writeFileSync(disabledAgent, parkedBody);
+      rmSync(agent);
+      const cutover = spawnSync("bash", ["scripts/cutover-launchdaemon.sh"], {
+        encoding: "utf8",
+        env: {
+          PATH: `${run.bin}:${process.env.PATH ?? ""}`,
+          HOME: run.home,
+          TMPDIR: run.root,
+          USER: "root",
+          LOGNAME: "root",
+          SHELL: "/bin/bash",
+          SUDO_USER: "mini",
+          SUDO_UID: "501",
+          ARGUS_INSTALL_ROOT: run.installRoot,
+        },
+      });
+      expect(cutover.status, `${cutover.stdout}\n${cutover.stderr}`).toBe(0);
+      expect(cutover.stdout).toBe(`cut over ${LABEL}\n`);
+      expect(existsSync(agent)).toBe(false);
+      expect(readFileSync(disabledAgent, "utf8")).toBe(parkedBody);
+      const log = readFileSync(run.launchctlLog, "utf8");
+      expect(log).toContain(`bootstrap system ${path.join(daemonDir, `${LABEL}.plist`)}`);
+      expect(log).toContain(`bootstrap system ${path.join(daemonDir, `${LOGROTATE_LABEL}.plist`)}`);
+      expect(log).not.toContain("bootstrap gui/501");
+      const loaded = readFileSync(state, "utf8");
+      expect(loaded).toBe(`system/${LABEL}\nsystem/${LOGROTATE_LABEL}\n`);
+    } finally {
+      cleanup(run);
+    }
+  });
+
+  it("aborts before bootstrap when bootout fails and the parked gui job is still loaded", () => {
+    const run = renderDaemon("scripts/install-launchdaemon.sh", { SUDO_USER: "mini", SUDO_UID: "501" }, true, {
+      separateSudoHome: true,
+      includeAgentPlistEnv: false,
+    });
+    try {
+      const state = path.join(run.root, "launchctl.state");
+      writeFileSync(state, "gui/501/dev.point-labs.argus\n");
+      writeFileSync(run.launchctlLog, "");
+      writeFileSync(
+        path.join(run.bin, "launchctl"),
+        `#!/bin/bash
+printf '%s\\n' "$*" >> ${JSON.stringify(run.launchctlLog)}
+cmd="$1"
+shift
+case "$cmd" in
+  bootout)
+    echo "Boot-out failed: 5: Input/output error" >&2
+    exit 5
+    ;;
+  bootstrap)
+    label="$(python3 -c 'import plistlib,sys; print(plistlib.load(open(sys.argv[1],"rb"))["Label"])' "$2")"
+    printf '%s/%s\\n' "$1" "$label" >> ${JSON.stringify(state)}
+    ;;
+  print)
+    if grep -qxF "$1" ${JSON.stringify(state)}; then
+      echo "state = running"
+      exit 0
+    fi
+    echo "Could not find service" >&2
+    exit 1
+    ;;
+esac
+exit 0
+`,
+      );
+      chmodSync(path.join(run.bin, "launchctl"), 0o755);
+      const daemonDir = path.join(run.installRoot, "Library", "LaunchDaemons");
+      mkdirSync(daemonDir, { recursive: true });
+      writeFileSync(
+        path.join(daemonDir, `${LABEL}.plist`),
+        `<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict><key>Label</key><string>${LABEL}</string></dict></plist>
+`,
+      );
+      writeFileSync(
+        path.join(daemonDir, `${LOGROTATE_LABEL}.plist`),
+        `<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict><key>Label</key><string>${LOGROTATE_LABEL}</string></dict></plist>
+`,
+      );
+      const agent = path.join(run.sudoHome, "Library", "LaunchAgents", `${LABEL}.plist`);
+      const disabledDir = path.join(run.sudoHome, "Library", "LaunchAgents-disabled");
+      const disabledAgent = path.join(disabledDir, `${LABEL}.plist`);
+      const parkedBody = readFileSync(agent, "utf8");
+      mkdirSync(disabledDir, { recursive: true });
+      writeFileSync(disabledAgent, parkedBody);
+      rmSync(agent);
+      const cutover = spawnSync("bash", ["scripts/cutover-launchdaemon.sh"], {
+        encoding: "utf8",
+        env: {
+          PATH: `${run.bin}:${process.env.PATH ?? ""}`,
+          HOME: run.home,
+          TMPDIR: run.root,
+          USER: "root",
+          LOGNAME: "root",
+          SHELL: "/bin/bash",
+          SUDO_USER: "mini",
+          SUDO_UID: "501",
+          ARGUS_INSTALL_ROOT: run.installRoot,
+        },
+      });
+      expect(cutover.status, `${cutover.stdout}\n${cutover.stderr}`).not.toBe(0);
+      expect(cutover.stderr).toMatch(/bootout gui\/501\/dev\.point-labs\.argus failed/);
+      expect(cutover.stderr).toMatch(/Not bootstrapping the system daemon/);
+      const log = readFileSync(run.launchctlLog, "utf8");
+      expect(log).not.toContain("bootstrap system");
+      expect(existsSync(agent)).toBe(false);
+      expect(readFileSync(disabledAgent, "utf8")).toBe(parkedBody);
+      expect(readFileSync(state, "utf8")).toBe("gui/501/dev.point-labs.argus\n");
+    } finally {
+      cleanup(run);
+    }
+  });
 });
