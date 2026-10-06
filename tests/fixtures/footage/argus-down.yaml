@@ -1,0 +1,28 @@
+cameras:
+  - name: Backyard
+    host: 10.0.0.8
+    channel: 0
+    mainCodec: h264
+    username: admin
+    password: fixture-password
+    transport: auto
+    streams:
+      main: main
+      sub: sub
+
+recording:
+  path: tests/fixtures/footage/not-written
+  retention:
+    continuous: 3
+    motion: 7
+    alerts: 30
+
+homekit:
+  pin: "123-45-678"
+
+go2rtc:
+  binary: ./go2rtc
+  api_port: 1984
+
+server:
+  port: 8080

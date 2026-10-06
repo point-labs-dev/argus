@@ -26,6 +26,15 @@ export class ReolinkError extends Error {
   }
 }
 
+export type ReolinkClock = {
+  year: number;
+  mon: number;
+  day: number;
+  hour: number;
+  min: number;
+  sec: number;
+};
+
 export class ReolinkClient {
   private token: string | undefined;
   private tokenExpiresAt = 0;
@@ -127,5 +136,34 @@ export class ReolinkClient {
       const detection = ai.value?.[type] as { alarm_state?: number; support?: number } | undefined;
       return detection?.alarm_state === 1;
     });
+  }
+
+  public async getHddInfo(): Promise<unknown> {
+    return this.readCommand("GetHddInfo", {});
+  }
+
+  public async getRec(channel: number): Promise<unknown> {
+    return this.readCommand("GetRec", { channel });
+  }
+
+  public async searchRecordings(channel: number, start: ReolinkClock, end: ReolinkClock): Promise<unknown> {
+    return this.readCommand("Search", {
+      Search: {
+        channel,
+        onlyStatus: 0,
+        streamType: "main",
+        StartTime: start,
+        EndTime: end,
+      },
+    });
+  }
+
+  private async readCommand(cmd: "GetHddInfo" | "GetRec" | "Search", param: Record<string, unknown>): Promise<unknown> {
+    const token = await this.ensureToken();
+    const result = await this.call(cmd, param, token);
+    if (result.code !== 0 || result.value === undefined) {
+      throw new ReolinkError(`${cmd} on ${this.options.host} failed: ${result.error?.detail ?? `code ${result.code}`}`);
+    }
+    return result.value;
   }
 }

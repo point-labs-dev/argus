@@ -1,0 +1,84 @@
+{
+  "Login": [
+    {
+      "cmd": "Login",
+      "code": 0,
+      "value": { "Token": { "name": "cam-token", "leaseTime": 3600 } }
+    }
+  ],
+  "GetHddInfo": [
+    {
+      "cmd": "GetHddInfo",
+      "code": 0,
+      "value": {
+        "HddInfo": [
+          { "capacity": 0, "format": 0, "id": 0, "mount": 0, "size": 0, "storageType": 2 }
+        ]
+      }
+    }
+  ],
+  "GetRec": {
+    "0": [
+      {
+        "cmd": "GetRec",
+        "code": 0,
+        "value": {
+          "Rec": {
+            "channel": 0,
+            "schedule": {
+              "channel": 0,
+              "enable": 1,
+              "table": {
+                "0": "000000000000000000000000",
+                "1": "000000000000000000000000",
+                "2": "000000000000000000000000",
+                "3": "000000000000000000000000",
+                "4": "000000000000000000000000",
+                "5": "000000000000000000000000",
+                "6": "000000000000000000000000"
+              }
+            }
+          }
+        }
+      }
+    ],
+    "4": [
+      {
+        "cmd": "GetRec",
+        "code": 0,
+        "value": {
+          "Rec": {
+            "channel": 4,
+            "schedule": {
+              "enable": 1,
+              "table": {
+                "0": "111111111111111111111111"
+              }
+            }
+          }
+        }
+      }
+    ]
+  },
+  "Search": {
+    "0": [
+      {
+        "cmd": "Search",
+        "code": 1,
+        "error": { "detail": "no disk", "rspCode": -1 }
+      }
+    ],
+    "4": [
+      {
+        "cmd": "Search",
+        "code": 0,
+        "value": {
+          "SearchResult": {
+            "channel": 4,
+            "File": [{ "name": "wrong-channel", "type": "main", "size": 1 }]
+          }
+        }
+      }
+    ]
+  }
+}

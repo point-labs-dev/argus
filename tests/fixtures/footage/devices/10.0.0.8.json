@@ -1,0 +1,18 @@
+{
+  "Login": [
+    {
+      "cmd": "Login",
+      "code": 1,
+      "error": { "detail": "login failed", "rspCode": -1 }
+    }
+  ],
+  "GetHddInfo": [
+    {
+      "cmd": "GetHddInfo",
+      "code": 0,
+      "value": { "HddInfo": [] }
+    }
+  ],
+  "GetRec": {},
+  "Search": {}
+}

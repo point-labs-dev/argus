@@ -9,7 +9,8 @@
   },
   "bin": {
     "argus": "./dist/cli.js",
-    "argus-serve": "./dist/serve.js"
+    "argus-serve": "./dist/serve.js",
+    "argus-footage": "./dist/footage-cli.js"
   },
   "exports": {
     ".": "./dist/index.js"
