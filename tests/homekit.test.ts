@@ -1,6 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { createSocket } from "node:dgram";
 import { EventEmitter } from "node:events";
+import { Characteristic, Service } from "hap-nodejs";
 import { describe, expect, it, vi } from "vitest";
 
 import { parseArgusConfig } from "../src/config.js";
@@ -10,6 +11,7 @@ import {
   ARGUS_FIRMWARE_REVISION,
   buildCameraControllerOptions,
   buildLiveFfmpegArgs,
+  createCameraAccessory,
   effectiveBitrateKbps,
   NO_RTCP_CONSUMER_ABANDON_MS,
   resolveSrtpTargetAddress,
@@ -321,7 +323,7 @@ describe("buildCameraControllerOptions", () => {
   });
 
   it("defaults to WiFi-friendly resolutions (June working pattern, Oct 2026+)", () => {
-    const delegate = new ArgusStreamingDelegate("Backyard Right", "rtsp://x", cacheWith(Buffer.from([0xff, 0xd8])));
+    const delegate = new ArgusStreamingDelegate("Backyard Left", "rtsp://x", cacheWith(Buffer.from([0xff, 0xd8])));
     const opts = buildCameraControllerOptions(delegate, true, undefined, { width: 896, height: 672 }, "transcode");
 
     const resolutions = opts.streamingOptions.video.resolutions.map((r) => `${r[0]}x${r[1]}`);
@@ -334,7 +336,7 @@ describe("buildCameraControllerOptions", () => {
   });
 
   it("restores the small tiers with ARGUS_LIVE_LADDER=compat (client-compat rollback)", () => {
-    const delegate = new ArgusStreamingDelegate("Backyard Right", "rtsp://x", cacheWith(Buffer.from([0xff, 0xd8])));
+    const delegate = new ArgusStreamingDelegate("Backyard Left", "rtsp://x", cacheWith(Buffer.from([0xff, 0xd8])));
     process.env.ARGUS_LIVE_LADDER = "compat";
     try {
       const opts = buildCameraControllerOptions(delegate, true, undefined, undefined, "transcode");
@@ -712,8 +714,25 @@ describe("ArgusStreamingDelegate", () => {
     }
   });
 
-  it("advertises firmware version 1.3.15 (main-source fix, RTCP watchdog removal, HKSV delivery)", () => {
-    expect(ARGUS_FIRMWARE_REVISION).toBe("1.3.15");
+  it("advertises firmware version 1.3.16 so controllers re-read the 4:3 ladder", () => {
+    expect(ARGUS_FIRMWARE_REVISION).toBe("1.3.16");
+    const config = parseArgusConfig({
+      cameras: [{ name: "Garage Door", host: "10.0.0.9", channel: 0, mainCodec: "h265",
+        username: "admin", password: "x", transport: "auto", streams: { main: "main", sub: "sub" } }],
+      recording: { path: "./rec", retention: { continuous: 3, motion: 7, alerts: 30 } },
+      homekit: { pin: "123-45-678" },
+      go2rtc: { binary: "./go2rtc", api_port: 1984 },
+      server: { port: 8080 },
+    });
+    const { accessory } = createCameraAccessory(
+      config.cameras[0]!,
+      "rtsp://127.0.0.1:8554/garage-door-sub",
+      "rtsp://127.0.0.1:8554/garage-door",
+      cacheWith(Buffer.from([0xff, 0xd8])),
+    );
+    const info = accessory.getService(Service.AccessoryInformation)!;
+    expect(info.getCharacteristic(Characteristic.FirmwareRevision).value).toBe("1.3.16");
+    expect(info.getCharacteristic(Characteristic.Model).value).toBe("Argus 1.3.16");
   });
 
   it("prevents double-callback crash (swallows duplicate calls)", async () => {
@@ -985,6 +1004,13 @@ describe("4:3 cameras keep an undistorted live frame", () => {
         const args = await ffmpegArgsFor(cameraName, ask);
         const vf = args[args.indexOf("-vf") + 1]!;
         expect(vf).not.toContain("pad=");
+        const slug = cameraName.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+        const input = args[args.indexOf("-i") + 1];
+        expect(input).toBe(
+          ask.width > 640
+            ? `rtsp://127.0.0.1:8554/${slug}`
+            : `rtsp://127.0.0.1:8554/${slug}-sub`,
+        );
         const frame = renderFilteredFrame(vf, 2560, 1920);
         expect(frame.width).toBe(ask.box[0]);
         expect(frame.height).toBe(ask.box[1]);

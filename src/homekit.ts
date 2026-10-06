@@ -111,15 +111,15 @@ export interface SrtpParameters {
   audioParams: string;
 }
 
-const LIVE_FILL_CAMERAS = new Set([
+const FOUR_BY_THREE_CAMERAS = new Set([
   "Garage Door",
   "Backyard",
   "Doorbell",
   "Backyard Right",
 ]);
 
-export function liveViewFillsFrame(cameraName: string): boolean {
-  return LIVE_FILL_CAMERAS.has(cameraName);
+export function isFourByThreeCamera(cameraName: string): boolean {
+  return FOUR_BY_THREE_CAMERAS.has(cameraName);
 }
 
 export function redactFfmpegArgsForLog(args: readonly string[]): string {
@@ -175,7 +175,7 @@ export interface LiveFfmpegInput {
     level: string;
     srtpParams: string;
   };
-  fillFrame?: boolean;
+  cropToFill?: boolean;
     audio: {
       port: number;
       localRtcpPort: number;
@@ -285,8 +285,8 @@ export function buildLiveFfmpegArgs(input: LiveFfmpegInput, includeAudio = true)
           "-pix_fmt", "yuv420p",
           "-color_range", "tv",
           "-r", String(video.fps),
-          "-vf", input.fillFrame
-            ? `scale=${boxWidth}:${boxHeight}:force_divisible_by=2,setsar=1`
+          "-vf", input.cropToFill
+            ? `scale=${boxWidth}:${boxHeight}:force_original_aspect_ratio=increase:force_divisible_by=2,crop=${boxWidth}:${boxHeight},setsar=1`
             : `scale=${boxWidth}:${boxHeight}:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=${boxWidth}:${boxHeight}:(ow-iw)/2:(oh-ih)/2`,
           "-bf", "0",
           ...keyframeArgs,
@@ -528,7 +528,7 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
   private readonly spawnFn: typeof spawn;
 
   public constructor(
-    private readonly cameraName: string,
+    public readonly cameraName: string,
     /** go2rtc local restream base name resolver, e.g. () => "rtsp://127.0.0.1:8554/backyard-left-sub" */
     private readonly liveUrl: string,
     private readonly snapshots: SnapshotCache,
@@ -828,7 +828,7 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
       inputUrl: plan.policy.source.streamUrl,
       targetAddress: prepared.targetAddress,
       videoMode: this.videoMode,
-      ...(liveViewFillsFrame(this.cameraName) ? { fillFrame: true } : {}),
+      ...(isFourByThreeCamera(this.cameraName) ? { cropToFill: true } : {}),
       video: {
         port: prepared.video.port,
         localRtcpPort: prepared.video.localRtcpPort,
@@ -1061,14 +1061,17 @@ export function buildCameraControllerOptions(
     [480, 270, 30],
     [320, 240, 15],
   ];
+  const fourByThree = isFourByThreeCamera(delegate.cameraName);
   const resolutions: [number, number, number][] =
     videoMode === "copy" && liveResolution
       ? [[liveResolution.width, liveResolution.height, 30]]
-      : process.env.ARGUS_LIVE_LADDER === "hires"
-        ? hiResSet
-        : process.env.ARGUS_LIVE_LADDER === "compat"
-          ? compatSet
-          : wifiSet;  // Default to WiFi-friendly caps (Oct 2026+)
+      : fourByThree
+        ? [[640, 480, 30]]
+        : process.env.ARGUS_LIVE_LADDER === "hires"
+          ? hiResSet
+          : process.env.ARGUS_LIVE_LADDER === "compat"
+            ? compatSet
+            : wifiSet;  // Default to WiFi-friendly caps (Oct 2026+)
 
   return {
     cameraStreamCount: 2, // allow two concurrent viewers
@@ -1275,7 +1278,7 @@ export function buildCameraControllerOptions(
  *     analysis drops 1s→200ms. New hksv_first_fragment telemetry for field measurement.
  * No advertised-config change (ladder/profiles/audio identical to 1.3.14).
  */
-export const ARGUS_FIRMWARE_REVISION = "1.3.15";
+export const ARGUS_FIRMWARE_REVISION = "1.3.16";
 
 export interface CameraAccessoryHandle {
   accessory: Accessory;
@@ -1301,7 +1304,7 @@ export function createCameraAccessory(
   accessory
     .getService(Service.AccessoryInformation)!
     .setCharacteristic(Characteristic.Manufacturer, "Point Labs")
-    .setCharacteristic(Characteristic.Model, "Argus 1.3.15")
+    .setCharacteristic(Characteristic.Model, "Argus 1.3.16")
     .setCharacteristic(Characteristic.SerialNumber, `argus-${camera.host}-${camera.channel}`)
     .setCharacteristic(Characteristic.FirmwareRevision, ARGUS_FIRMWARE_REVISION);
 
