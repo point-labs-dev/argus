@@ -244,7 +244,7 @@ describe("buildLiveFfmpegArgs", () => {
     expect(joined).toContain("-srtp_out_params VIDEOKEY==");
     expect(joined).toContain("srtp://192.168.1.50:50000?rtcpport=50000&pkt_size=1316");
     expect(joined).toContain("-srtp_out_params AUDIOKEY==");
-    expect(joined).toContain("srtp://192.168.1.50:50002?rtcpport=50002&pkt_size=1316");
+    expect(joined).toContain("srtp://192.168.1.50:50002?rtcpport=50002&pkt_size=188");
     expect(joined).toContain("-ssrc 1");
     expect(joined).toContain("-ssrc 2");
   });
