@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { createSocket } from "node:dgram";
 import { EventEmitter } from "node:events";
 import { describe, expect, it, vi } from "vitest";
@@ -817,5 +818,201 @@ describe("ArgusStreamingDelegate", () => {
     const elapsed = Date.now() - start;
     // Should complete quickly (< 3s), proving it doesn't hang forever waiting for stuck operations
     expect(elapsed).toBeLessThan(3000);
+  });
+});
+
+const FOUR_BY_THREE_CAMERAS = ["Garage Door", "Backyard", "Doorbell", "Backyard Right"] as const;
+
+function renderFilteredFrame(vf: string, srcWidth: number, srcHeight: number): {
+  width: number;
+  height: number;
+  rgb: Buffer;
+} {
+  const band = Math.round(srcHeight / 10);
+  const ppm = execFileSync(
+    "ffmpeg",
+    [
+      "-hide_banner",
+      "-loglevel",
+      "error",
+      "-f",
+      "lavfi",
+      "-i",
+      `color=c=red:s=${srcWidth}x${srcHeight}:r=1:d=1`,
+      "-vf",
+      `drawbox=x=0:y=0:w=${srcWidth}:h=${band}:color=green:t=fill,drawbox=x=0:y=${srcHeight - band}:w=${srcWidth}:h=${band}:color=blue:t=fill,${vf}`,
+      "-frames:v",
+      "1",
+      "-f",
+      "image2pipe",
+      "-vcodec",
+      "ppm",
+      "pipe:1",
+    ],
+    { maxBuffer: 16 * 1024 * 1024 },
+  );
+  let offset = 2;
+  const tokens: string[] = [];
+  while (tokens.length < 3) {
+    while (ppm[offset] === 0x20 || ppm[offset] === 0x0a || ppm[offset] === 0x0d || ppm[offset] === 0x09) offset += 1;
+    if (ppm[offset] === 0x23) {
+      while (ppm[offset] !== 0x0a) offset += 1;
+      continue;
+    }
+    const start = offset;
+    while (ppm[offset] > 0x20) offset += 1;
+    tokens.push(ppm.subarray(start, offset).toString());
+  }
+  offset += 1;
+  const width = Number(tokens[0]);
+  const height = Number(tokens[1]);
+  return { width, height, rgb: ppm.subarray(offset, offset + width * height * 3) };
+}
+
+function rgbAt(frame: { width: number; rgb: Buffer }, x: number, y: number): [number, number, number] {
+  const index = (y * frame.width + x) * 3;
+  return [frame.rgb[index]!, frame.rgb[index + 1]!, frame.rgb[index + 2]!];
+}
+
+async function ffmpegArgsFor(
+  cameraName: string,
+  ask: { width: number; height: number },
+): Promise<string[]> {
+  const slug = cameraName.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+  const spawnFn = vi.fn(() => Object.assign(new EventEmitter(), { kill: vi.fn() })) as unknown as typeof import("node:child_process").spawn;
+  const delegate = new ArgusStreamingDelegate(
+    cameraName,
+    `rtsp://127.0.0.1:8554/${slug}-sub`,
+    cacheWith(Buffer.from([0xff, 0xd8])),
+    { spawnFn, mainStreamUrl: `rtsp://127.0.0.1:8554/${slug}` },
+  );
+  await new Promise<void>((resolve, reject) => {
+    delegate.prepareStream(
+      {
+        sessionID: `${slug}-live`,
+        targetAddress: "10.0.0.41",
+        video: { port: 50000, srtp_key: Buffer.alloc(16, 1), srtp_salt: Buffer.alloc(14, 2) },
+        audio: { port: 50002, srtp_key: Buffer.alloc(16, 3), srtp_salt: Buffer.alloc(14, 4) },
+      } as never,
+      (error) => (error ? reject(error) : resolve()),
+    );
+  });
+  await new Promise<void>((resolve, reject) => {
+    delegate.handleStreamRequest(
+      {
+        type: "start",
+        sessionID: `${slug}-live`,
+        video: { pt: 99, max_bit_rate: 132, fps: 30, mtu: 1378, profile: 0, level: 2, ...ask },
+        audio: { pt: 110, sample_rate: 24, max_bit_rate: 24, codec: "AAC-eld" },
+      } as never,
+      (error) => (error ? reject(error) : resolve()),
+    );
+  });
+  const args = (spawnFn as unknown as { mock: { calls: [string, string[]][] } }).mock.calls[0]![1];
+  delegate.handleStreamRequest({ type: "stop", sessionID: `${slug}-live` } as never, () => {});
+  return args;
+}
+
+describe("4:3 cameras fill the live frame", () => {
+  it.each(FOUR_BY_THREE_CAMERAS)(
+    "%s keeps the whole 4:3 scene inside the exact box iOS asked for",
+    async (cameraName) => {
+      for (const ask of [
+        { width: 640, height: 360 },
+        { width: 1280, height: 720 },
+      ]) {
+        const args = await ffmpegArgsFor(cameraName, ask);
+        const vf = args[args.indexOf("-vf") + 1]!;
+        const scale = /^scale=(\d+):(\d+)/.exec(vf);
+        expect(scale).not.toBeNull();
+        const boxWidth = Number(scale![1]);
+        const boxHeight = Number(scale![2]);
+        expect(vf).not.toContain("pad=");
+
+        for (const [srcWidth, srcHeight] of [
+          [2560, 1920],
+          [640, 480],
+        ] as const) {
+          const frame = renderFilteredFrame(vf, srcWidth, srcHeight);
+          expect(frame.width).toBe(boxWidth);
+          expect(frame.height).toBe(boxHeight);
+          const midY = Math.floor(frame.height / 2);
+          expect(rgbAt(frame, 0, midY)).not.toEqual([0, 0, 0]);
+          expect(rgbAt(frame, frame.width - 1, midY)).not.toEqual([0, 0, 0]);
+          const top = rgbAt(frame, Math.floor(frame.width / 2), 1);
+          const bottom = rgbAt(frame, Math.floor(frame.width / 2), frame.height - 2);
+          expect(top[1]).toBeGreaterThan(top[0]);
+          expect(top[1]).toBeGreaterThan(top[2]);
+          const bottomBlue = bottom[2];
+          expect(bottomBlue).toBeGreaterThan(bottom[0]);
+          expect(bottomBlue).toBeGreaterThan(bottom[1]);
+        }
+      }
+    },
+  );
+
+  it("paces AAC-ELD with the Oct 1 clock and 188-byte audio packets", () => {
+    const args = buildLiveFfmpegArgs(
+      liveInput({ audio: { ...liveInput().audio, codec: "AAC-eld" } }),
+    ).join(" ");
+
+    expect(args).toContain("-c:a libfdk_aac");
+    expect(args).toContain("-profile:a aac_eld");
+    expect(args).toContain("-af asetpts=N/SR/TB");
+    expect(args).not.toContain("aresample");
+    expect(args).not.toContain("min_hard_comp");
+    expect(args).toContain("srtp://192.168.1.50:50002?rtcpport=50002&pkt_size=188");
+    expect(args).toContain("srtp://192.168.1.50:50000?rtcpport=50000&pkt_size=1316");
+  });
+
+  it("redacts SRTP keys from the ffmpeg log line", async () => {
+    const videoKey = Buffer.concat([Buffer.alloc(16, 0x11), Buffer.alloc(14, 0x22)]).toString("base64");
+    const audioKey = Buffer.concat([Buffer.alloc(16, 0x33), Buffer.alloc(14, 0x44)]).toString("base64");
+    const lines: string[] = [];
+    const spy = vi.spyOn(process.stderr, "write").mockImplementation((chunk) => {
+      lines.push(String(chunk));
+      return true;
+    });
+    const spawnFn = vi.fn(() => Object.assign(new EventEmitter(), { kill: vi.fn() })) as unknown as typeof import("node:child_process").spawn;
+    const delegate = new ArgusStreamingDelegate(
+      "Garage Door",
+      "rtsp://127.0.0.1:8554/garage-door-sub",
+      cacheWith(Buffer.from([0xff, 0xd8])),
+      { spawnFn },
+    );
+    try {
+      await new Promise<void>((resolve, reject) => {
+        delegate.prepareStream(
+          {
+            sessionID: "redact",
+            targetAddress: "10.0.0.41",
+            video: { port: 50000, srtp_key: Buffer.alloc(16, 0x11), srtp_salt: Buffer.alloc(14, 0x22) },
+            audio: { port: 50002, srtp_key: Buffer.alloc(16, 0x33), srtp_salt: Buffer.alloc(14, 0x44) },
+          } as never,
+          (error) => (error ? reject(error) : resolve()),
+        );
+      });
+      await new Promise<void>((resolve, reject) => {
+        delegate.handleStreamRequest(
+          {
+            type: "start",
+            sessionID: "redact",
+            video: { pt: 99, max_bit_rate: 132, fps: 30, width: 640, height: 360, mtu: 1378, profile: 0, level: 2 },
+            audio: { pt: 110, sample_rate: 24, max_bit_rate: 24, codec: "AAC-eld" },
+          } as never,
+          (error) => (error ? reject(error) : resolve()),
+        );
+      });
+      const logged = lines.join("");
+      expect(logged).toContain("<REDACTED>");
+      expect(logged).not.toContain(videoKey);
+      expect(logged).not.toContain(audioKey);
+      const args = (spawnFn as unknown as { mock: { calls: [string, string[]][] } }).mock.calls[0]![1].join(" ");
+      expect(args).toContain(videoKey);
+      expect(args).toContain(audioKey);
+      delegate.handleStreamRequest({ type: "stop", sessionID: "redact" } as never, () => {});
+    } finally {
+      spy.mockRestore();
+    }
   });
 });
