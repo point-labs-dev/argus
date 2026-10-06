@@ -111,6 +111,31 @@ export interface SrtpParameters {
   audioParams: string;
 }
 
+const FOUR_BY_THREE_CAMERAS = new Set([
+  "Garage Door",
+  "Backyard",
+  "Doorbell",
+  "Backyard Right",
+]);
+
+export function isFourByThreeCamera(cameraName: string): boolean {
+  return FOUR_BY_THREE_CAMERAS.has(cameraName);
+}
+
+export function redactFfmpegArgsForLog(args: readonly string[]): string {
+  const redacted: string[] = [];
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index]!;
+    if (arg === "-srtp_out_params") {
+      redacted.push(arg, "<REDACTED>");
+      index += 1;
+      continue;
+    }
+    redacted.push(arg);
+  }
+  return redacted.join(" ");
+}
+
 export interface LiveFfmpegInput {
   /**
    * go2rtc local restream, e.g. rtsp://127.0.0.1:8554/backyard-left-sub.
@@ -150,6 +175,7 @@ export interface LiveFfmpegInput {
     level: string;
     srtpParams: string;
   };
+  cropToFill?: boolean;
     audio: {
       port: number;
       localRtcpPort: number;
@@ -235,10 +261,7 @@ export function buildLiveFfmpegArgs(input: LiveFfmpegInput, includeAudio = true)
   // zero-copy VT pipeline on the Mac mini only if CPU becomes the constraint.)
   //
   // Output shaping:
-  // - Fit within the negotiated box, preserving aspect (homebridge-camera-ffmpeg
-  //   pattern). A plain WxH scale would stretch the 4:3 sources (RLC-520A main is
-  //   2560x1920) into the 16:9 sizes Apple negotiates. Never exceeds the
-  //   negotiated dimensions — oversize is what controllers kill sessions over.
+  // - Never exceed the negotiated dimensions. Oversize is what controllers kill sessions over.
   // - HomeKit needs periodic IDRs and no B-frames, or the iOS client waits
   //   forever for a decodable keyframe (the "spinner that never resolves" symptom).
   // - HomeKit also needs in-band SPS/PPS on every keyframe for reliable decode/unlock.
@@ -262,10 +285,9 @@ export function buildLiveFfmpegArgs(input: LiveFfmpegInput, includeAudio = true)
           "-pix_fmt", "yuv420p",
           "-color_range", "tv",
           "-r", String(video.fps),
-          // Scale to fit then pad to EXACT negotiated dimensions. Field 2026-10-01:
-          // 4:3 source (2560×1920) scaled to 960×720 != negotiated 1280×720 → Home blank.
-          // Home enforces exact W×H. Pad centers with black bars (pillarbox/letterbox).
-          "-vf", `scale=${boxWidth}:${boxHeight}:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=${boxWidth}:${boxHeight}:(ow-iw)/2:(oh-ih)/2`,
+          "-vf", input.cropToFill
+            ? `scale=${boxWidth}:${boxHeight}:force_original_aspect_ratio=increase:force_divisible_by=2,crop=${boxWidth}:${boxHeight},setsar=1`
+            : `scale=${boxWidth}:${boxHeight}:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=${boxWidth}:${boxHeight}:(ow-iw)/2:(oh-ih)/2`,
           "-bf", "0",
           ...keyframeArgs,
           // CBR-style encoding (camera-ffmpeg pattern): -b:v sets target bitrate.
@@ -368,14 +390,7 @@ export function buildLiveFfmpegArgs(input: LiveFfmpegInput, includeAudio = true)
     // --- audio: transcode to negotiated codec, SRTP out ---
     "-vn",
     ...audioCodecArgs,
-    // Audio sync: Use aresample with gentle async compensation. Mini f517acc evidence:
-    // async=1000:first_pts=0 showed Run1 −261 (better than baseline −360!) but Run2
-    // −1380 (much worse, degradation). High async value + first_pts causes instability.
-    // Trying minimal compensation async=1 (1 sample/sec max, not deprecated flag) without
-    // first_pts. Lets video CFR (-r 30) lead; audio resampler makes micro-adjustments
-    // without aggressive stretching or forced initial offset. Gentler than async=1000,
-    // more stable than no sync (baseline −360 consistent but failing).
-    "-af", "aresample=async=1:min_hard_comp=0.01",
+    "-af", "asetpts=N/SR/TB",
     "-ac", "1",
     "-ar", `${audio.sampleRateKhz}k`,
     "-b:a", `${audio.maxBitrateKbps}k`,
@@ -385,7 +400,7 @@ export function buildLiveFfmpegArgs(input: LiveFfmpegInput, includeAudio = true)
     "-srtp_out_suite", "AES_CM_128_HMAC_SHA1_80",
     "-srtp_out_params", audio.srtpParams,
     // Same SRTP pattern as video (clean URL + localaddr + Node return-bind)
-    `srtp://${targetAddress}:${audio.port}?rtcpport=${audio.port}&pkt_size=1316${localAddress ? `&localaddr=${localAddress}` : ""}`,
+    `srtp://${targetAddress}:${audio.port}?rtcpport=${audio.port}&pkt_size=188${localAddress ? `&localaddr=${localAddress}` : ""}`,
   ];
 }
 
@@ -513,7 +528,7 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
   private readonly spawnFn: typeof spawn;
 
   public constructor(
-    private readonly cameraName: string,
+    public readonly cameraName: string,
     /** go2rtc local restream base name resolver, e.g. () => "rtsp://127.0.0.1:8554/backyard-left-sub" */
     private readonly liveUrl: string,
     private readonly snapshots: SnapshotCache,
@@ -725,7 +740,7 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
     const args = buildLiveFfmpegArgs(liveInput, this.includeAudio);
 
     const log = (msg: string): void => this.logLine(msg);
-    log(`ffmpeg ${this.ffmpegPath} ${args.join(" ")}`);
+    log(`ffmpeg ${this.ffmpegPath} ${redactFfmpegArgsForLog(args)}`);
 
     const ffmpeg = this.spawnFn(this.ffmpegPath, args, { stdio: ["ignore", "ignore", "pipe"] });
 
@@ -813,6 +828,7 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
       inputUrl: plan.policy.source.streamUrl,
       targetAddress: prepared.targetAddress,
       videoMode: this.videoMode,
+      ...(isFourByThreeCamera(this.cameraName) ? { cropToFill: true } : {}),
       video: {
         port: prepared.video.port,
         localRtcpPort: prepared.video.localRtcpPort,
@@ -856,7 +872,7 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
     const args = buildLiveFfmpegArgs(liveInput, this.includeAudio);
 
     const log = (msg: string): void => this.logLine(msg);
-    log(`ffmpeg ${this.ffmpegPath} ${args.join(" ")}`);
+    log(`ffmpeg ${this.ffmpegPath} ${redactFfmpegArgsForLog(args)}`);
 
     const ffmpeg = this.spawnFn(this.ffmpegPath, args, { stdio: ["ignore", "ignore", "pipe"] });
 
@@ -1045,14 +1061,17 @@ export function buildCameraControllerOptions(
     [480, 270, 30],
     [320, 240, 15],
   ];
+  const fourByThree = isFourByThreeCamera(delegate.cameraName);
   const resolutions: [number, number, number][] =
     videoMode === "copy" && liveResolution
       ? [[liveResolution.width, liveResolution.height, 30]]
-      : process.env.ARGUS_LIVE_LADDER === "hires"
-        ? hiResSet
-        : process.env.ARGUS_LIVE_LADDER === "compat"
-          ? compatSet
-          : wifiSet;  // Default to WiFi-friendly caps (Oct 2026+)
+      : fourByThree
+        ? [[640, 480, 30]]
+        : process.env.ARGUS_LIVE_LADDER === "hires"
+          ? hiResSet
+          : process.env.ARGUS_LIVE_LADDER === "compat"
+            ? compatSet
+            : wifiSet;  // Default to WiFi-friendly caps (Oct 2026+)
 
   return {
     cameraStreamCount: 2, // allow two concurrent viewers
@@ -1259,7 +1278,7 @@ export function buildCameraControllerOptions(
  *     analysis drops 1s→200ms. New hksv_first_fragment telemetry for field measurement.
  * No advertised-config change (ladder/profiles/audio identical to 1.3.14).
  */
-export const ARGUS_FIRMWARE_REVISION = "1.3.15";
+export const ARGUS_FIRMWARE_REVISION = "1.3.16";
 
 export interface CameraAccessoryHandle {
   accessory: Accessory;
@@ -1285,7 +1304,7 @@ export function createCameraAccessory(
   accessory
     .getService(Service.AccessoryInformation)!
     .setCharacteristic(Characteristic.Manufacturer, "Point Labs")
-    .setCharacteristic(Characteristic.Model, "Argus 1.3.15")
+    .setCharacteristic(Characteristic.Model, "Argus 1.3.16")
     .setCharacteristic(Characteristic.SerialNumber, `argus-${camera.host}-${camera.channel}`)
     .setCharacteristic(Characteristic.FirmwareRevision, ARGUS_FIRMWARE_REVISION);
 

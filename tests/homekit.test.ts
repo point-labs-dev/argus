@@ -1,5 +1,7 @@
+import { execFileSync } from "node:child_process";
 import { createSocket } from "node:dgram";
 import { EventEmitter } from "node:events";
+import { Characteristic, Service } from "hap-nodejs";
 import { describe, expect, it, vi } from "vitest";
 
 import { parseArgusConfig } from "../src/config.js";
@@ -9,6 +11,7 @@ import {
   ARGUS_FIRMWARE_REVISION,
   buildCameraControllerOptions,
   buildLiveFfmpegArgs,
+  createCameraAccessory,
   effectiveBitrateKbps,
   NO_RTCP_CONSUMER_ABANDON_MS,
   resolveSrtpTargetAddress,
@@ -243,7 +246,7 @@ describe("buildLiveFfmpegArgs", () => {
     expect(joined).toContain("-srtp_out_params VIDEOKEY==");
     expect(joined).toContain("srtp://192.168.1.50:50000?rtcpport=50000&pkt_size=1316");
     expect(joined).toContain("-srtp_out_params AUDIOKEY==");
-    expect(joined).toContain("srtp://192.168.1.50:50002?rtcpport=50002&pkt_size=1316");
+    expect(joined).toContain("srtp://192.168.1.50:50002?rtcpport=50002&pkt_size=188");
     expect(joined).toContain("-ssrc 1");
     expect(joined).toContain("-ssrc 2");
   });
@@ -320,7 +323,7 @@ describe("buildCameraControllerOptions", () => {
   });
 
   it("defaults to WiFi-friendly resolutions (June working pattern, Oct 2026+)", () => {
-    const delegate = new ArgusStreamingDelegate("Backyard Right", "rtsp://x", cacheWith(Buffer.from([0xff, 0xd8])));
+    const delegate = new ArgusStreamingDelegate("Backyard Left", "rtsp://x", cacheWith(Buffer.from([0xff, 0xd8])));
     const opts = buildCameraControllerOptions(delegate, true, undefined, { width: 896, height: 672 }, "transcode");
 
     const resolutions = opts.streamingOptions.video.resolutions.map((r) => `${r[0]}x${r[1]}`);
@@ -333,7 +336,7 @@ describe("buildCameraControllerOptions", () => {
   });
 
   it("restores the small tiers with ARGUS_LIVE_LADDER=compat (client-compat rollback)", () => {
-    const delegate = new ArgusStreamingDelegate("Backyard Right", "rtsp://x", cacheWith(Buffer.from([0xff, 0xd8])));
+    const delegate = new ArgusStreamingDelegate("Backyard Left", "rtsp://x", cacheWith(Buffer.from([0xff, 0xd8])));
     process.env.ARGUS_LIVE_LADDER = "compat";
     try {
       const opts = buildCameraControllerOptions(delegate, true, undefined, undefined, "transcode");
@@ -711,8 +714,25 @@ describe("ArgusStreamingDelegate", () => {
     }
   });
 
-  it("advertises firmware version 1.3.15 (main-source fix, RTCP watchdog removal, HKSV delivery)", () => {
-    expect(ARGUS_FIRMWARE_REVISION).toBe("1.3.15");
+  it("advertises firmware version 1.3.16 so controllers re-read the 4:3 ladder", () => {
+    expect(ARGUS_FIRMWARE_REVISION).toBe("1.3.16");
+    const config = parseArgusConfig({
+      cameras: [{ name: "Garage Door", host: "10.0.0.9", channel: 0, mainCodec: "h265",
+        username: "admin", password: "x", transport: "auto", streams: { main: "main", sub: "sub" } }],
+      recording: { path: "./rec", retention: { continuous: 3, motion: 7, alerts: 30 } },
+      homekit: { pin: "123-45-678" },
+      go2rtc: { binary: "./go2rtc", api_port: 1984 },
+      server: { port: 8080 },
+    });
+    const { accessory } = createCameraAccessory(
+      config.cameras[0]!,
+      "rtsp://127.0.0.1:8554/garage-door-sub",
+      "rtsp://127.0.0.1:8554/garage-door",
+      cacheWith(Buffer.from([0xff, 0xd8])),
+    );
+    const info = accessory.getService(Service.AccessoryInformation)!;
+    expect(info.getCharacteristic(Characteristic.FirmwareRevision).value).toBe("1.3.16");
+    expect(info.getCharacteristic(Characteristic.Model).value).toBe("Argus 1.3.16");
   });
 
   it("prevents double-callback crash (swallows duplicate calls)", async () => {
@@ -817,5 +837,256 @@ describe("ArgusStreamingDelegate", () => {
     const elapsed = Date.now() - start;
     // Should complete quickly (< 3s), proving it doesn't hang forever waiting for stuck operations
     expect(elapsed).toBeLessThan(3000);
+  });
+});
+
+const FOUR_BY_THREE_CAMERAS = ["Garage Door", "Backyard", "Doorbell", "Backyard Right"] as const;
+
+function renderFilteredFrame(vf: string, srcWidth: number, srcHeight: number): {
+  width: number;
+  height: number;
+  rgb: Buffer;
+} {
+  const band = Math.round(srcHeight / 10);
+  const side = Math.round(Math.min(srcWidth, srcHeight) * 0.2);
+  const squareX = Math.floor((srcWidth - side) / 2);
+  const squareY = Math.floor((srcHeight - side) / 2);
+  const ppm = execFileSync(
+    "ffmpeg",
+    [
+      "-hide_banner",
+      "-loglevel",
+      "error",
+      "-f",
+      "lavfi",
+      "-i",
+      `color=c=red:s=${srcWidth}x${srcHeight}:r=1:d=1`,
+      "-vf",
+      `drawbox=x=0:y=0:w=${srcWidth}:h=${band}:color=green:t=fill,drawbox=x=0:y=${srcHeight - band}:w=${srcWidth}:h=${band}:color=blue:t=fill,drawbox=x=${squareX}:y=${squareY}:w=${side}:h=${side}:color=white:t=fill,${vf}`,
+      "-frames:v",
+      "1",
+      "-f",
+      "image2pipe",
+      "-vcodec",
+      "ppm",
+      "pipe:1",
+    ],
+    { maxBuffer: 16 * 1024 * 1024 },
+  );
+  let offset = 2;
+  const tokens: string[] = [];
+  while (tokens.length < 3) {
+    while (ppm[offset] === 0x20 || ppm[offset] === 0x0a || ppm[offset] === 0x0d || ppm[offset] === 0x09) offset += 1;
+    if (ppm[offset] === 0x23) {
+      while (ppm[offset] !== 0x0a) offset += 1;
+      continue;
+    }
+    const start = offset;
+    while (ppm[offset] > 0x20) offset += 1;
+    tokens.push(ppm.subarray(start, offset).toString());
+  }
+  offset += 1;
+  const width = Number(tokens[0]);
+  const height = Number(tokens[1]);
+  return { width, height, rgb: ppm.subarray(offset, offset + width * height * 3) };
+}
+
+function rgbAt(frame: { width: number; rgb: Buffer }, x: number, y: number): [number, number, number] {
+  const index = (y * frame.width + x) * 3;
+  return [frame.rgb[index]!, frame.rgb[index + 1]!, frame.rgb[index + 2]!];
+}
+
+function whiteSquare(frame: { width: number; height: number; rgb: Buffer }): { width: number; height: number } {
+  let minX = frame.width;
+  let maxX = -1;
+  let minY = frame.height;
+  let maxY = -1;
+  for (let y = 0; y < frame.height; y += 1) {
+    for (let x = 0; x < frame.width; x += 1) {
+      const [r, g, b] = rgbAt(frame, x, y);
+      if (r > 200 && g > 200 && b > 200) {
+        minX = Math.min(minX, x);
+        maxX = Math.max(maxX, x);
+        minY = Math.min(minY, y);
+        maxY = Math.max(maxY, y);
+      }
+    }
+  }
+  return { width: maxX - minX + 1, height: maxY - minY + 1 };
+}
+
+function isGreen(pixel: [number, number, number]): boolean {
+  return pixel[1] > pixel[0] && pixel[1] > pixel[2];
+}
+
+function isBlue(pixel: [number, number, number]): boolean {
+  return pixel[2] > pixel[0] && pixel[2] > pixel[1];
+}
+
+async function ffmpegArgsFor(
+  cameraName: string,
+  ask: { width: number; height: number },
+): Promise<string[]> {
+  const slug = cameraName.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+  const spawnFn = vi.fn(() => Object.assign(new EventEmitter(), { kill: vi.fn() })) as unknown as typeof import("node:child_process").spawn;
+  const delegate = new ArgusStreamingDelegate(
+    cameraName,
+    `rtsp://127.0.0.1:8554/${slug}-sub`,
+    cacheWith(Buffer.from([0xff, 0xd8])),
+    { spawnFn, mainStreamUrl: `rtsp://127.0.0.1:8554/${slug}` },
+  );
+  await new Promise<void>((resolve, reject) => {
+    delegate.prepareStream(
+      {
+        sessionID: `${slug}-live`,
+        targetAddress: "10.0.0.41",
+        video: { port: 50000, srtp_key: Buffer.alloc(16, 1), srtp_salt: Buffer.alloc(14, 2) },
+        audio: { port: 50002, srtp_key: Buffer.alloc(16, 3), srtp_salt: Buffer.alloc(14, 4) },
+      } as never,
+      (error) => (error ? reject(error) : resolve()),
+    );
+  });
+  await new Promise<void>((resolve, reject) => {
+    delegate.handleStreamRequest(
+      {
+        type: "start",
+        sessionID: `${slug}-live`,
+        video: { pt: 99, max_bit_rate: 132, fps: 30, mtu: 1378, profile: 0, level: 2, ...ask },
+        audio: { pt: 110, sample_rate: 24, max_bit_rate: 24, codec: "AAC-eld" },
+      } as never,
+      (error) => (error ? reject(error) : resolve()),
+    );
+  });
+  const args = (spawnFn as unknown as { mock: { calls: [string, string[]][] } }).mock.calls[0]![1];
+  delegate.handleStreamRequest({ type: "stop", sessionID: `${slug}-live` } as never, () => {});
+  return args;
+}
+
+describe("4:3 cameras keep an undistorted live frame", () => {
+  it.each(FOUR_BY_THREE_CAMERAS)("%s advertises only a 4:3 box Home has unlocked", (cameraName) => {
+    const delegate = new ArgusStreamingDelegate(cameraName, "rtsp://x", cacheWith(Buffer.from([0xff, 0xd8])));
+    const resolutions = buildCameraControllerOptions(delegate).streamingOptions.video.resolutions;
+    expect(resolutions.map((r) => `${r[0]}x${r[1]}`)).toContain("640x480");
+    for (const [width, height] of resolutions) {
+      expect(width * 3).toBe(height * 4);
+      expect(width).toBeLessThanOrEqual(640);
+      expect(height).toBeGreaterThanOrEqual(480);
+    }
+  });
+
+  it.each(FOUR_BY_THREE_CAMERAS)(
+    "%s scales a 4:3 ask without stretch, pad, or crop",
+    async (cameraName) => {
+      const args = await ffmpegArgsFor(cameraName, { width: 640, height: 480 });
+      const vf = args[args.indexOf("-vf") + 1]!;
+      expect(vf).not.toContain("pad=");
+      const slug = cameraName.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+      expect(args[args.indexOf("-i") + 1]).toBe(`rtsp://127.0.0.1:8554/${slug}-sub`);
+
+      const frame = renderFilteredFrame(vf, 2560, 1920);
+      expect(frame.width).toBe(640);
+      expect(frame.height).toBe(480);
+      const square = whiteSquare(frame);
+      expect(square.width / square.height).toBeCloseTo(1, 1);
+      expect(rgbAt(frame, 0, Math.floor(frame.height / 2))).not.toEqual([0, 0, 0]);
+      expect(isGreen(rgbAt(frame, Math.floor(frame.width / 2), 1))).toBe(true);
+      expect(isBlue(rgbAt(frame, Math.floor(frame.width / 2), frame.height - 2))).toBe(true);
+    },
+  );
+
+  it.each(FOUR_BY_THREE_CAMERAS)(
+    "%s center-crops a cached 16:9 ask without stretching",
+    async (cameraName) => {
+      for (const ask of [
+        { width: 640, height: 360, box: [640, 360] },
+        { width: 1280, height: 720, box: [854, 480] },
+      ]) {
+        const args = await ffmpegArgsFor(cameraName, ask);
+        const vf = args[args.indexOf("-vf") + 1]!;
+        expect(vf).not.toContain("pad=");
+        const slug = cameraName.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+        const input = args[args.indexOf("-i") + 1];
+        expect(input).toBe(
+          ask.width > 640
+            ? `rtsp://127.0.0.1:8554/${slug}`
+            : `rtsp://127.0.0.1:8554/${slug}-sub`,
+        );
+        const frame = renderFilteredFrame(vf, 2560, 1920);
+        expect(frame.width).toBe(ask.box[0]);
+        expect(frame.height).toBe(ask.box[1]);
+        const square = whiteSquare(frame);
+        expect(square.width / square.height).toBeCloseTo(1, 1);
+        const midY = Math.floor(frame.height / 2);
+        expect(rgbAt(frame, 0, midY)).not.toEqual([0, 0, 0]);
+        expect(rgbAt(frame, frame.width - 1, midY)).not.toEqual([0, 0, 0]);
+        expect(isGreen(rgbAt(frame, Math.floor(frame.width / 2), 1))).toBe(false);
+        expect(isBlue(rgbAt(frame, Math.floor(frame.width / 2), frame.height - 2))).toBe(false);
+      }
+    },
+  );
+
+  it("paces AAC-ELD with the Oct 1 clock and 188-byte audio packets", () => {
+    const args = buildLiveFfmpegArgs(
+      liveInput({ audio: { ...liveInput().audio, codec: "AAC-eld" } }),
+    ).join(" ");
+
+    expect(args).toContain("-c:a libfdk_aac");
+    expect(args).toContain("-profile:a aac_eld");
+    expect(args).toContain("-af asetpts=N/SR/TB");
+    expect(args).not.toContain("aresample");
+    expect(args).not.toContain("min_hard_comp");
+    expect(args).toContain("srtp://192.168.1.50:50002?rtcpport=50002&pkt_size=188");
+    expect(args).toContain("srtp://192.168.1.50:50000?rtcpport=50000&pkt_size=1316");
+  });
+
+  it("redacts SRTP keys from the ffmpeg log line", async () => {
+    const videoKey = Buffer.concat([Buffer.alloc(16, 0x11), Buffer.alloc(14, 0x22)]).toString("base64");
+    const audioKey = Buffer.concat([Buffer.alloc(16, 0x33), Buffer.alloc(14, 0x44)]).toString("base64");
+    const lines: string[] = [];
+    const spy = vi.spyOn(process.stderr, "write").mockImplementation((chunk) => {
+      lines.push(String(chunk));
+      return true;
+    });
+    const spawnFn = vi.fn(() => Object.assign(new EventEmitter(), { kill: vi.fn() })) as unknown as typeof import("node:child_process").spawn;
+    const delegate = new ArgusStreamingDelegate(
+      "Garage Door",
+      "rtsp://127.0.0.1:8554/garage-door-sub",
+      cacheWith(Buffer.from([0xff, 0xd8])),
+      { spawnFn },
+    );
+    try {
+      await new Promise<void>((resolve, reject) => {
+        delegate.prepareStream(
+          {
+            sessionID: "redact",
+            targetAddress: "10.0.0.41",
+            video: { port: 50000, srtp_key: Buffer.alloc(16, 0x11), srtp_salt: Buffer.alloc(14, 0x22) },
+            audio: { port: 50002, srtp_key: Buffer.alloc(16, 0x33), srtp_salt: Buffer.alloc(14, 0x44) },
+          } as never,
+          (error) => (error ? reject(error) : resolve()),
+        );
+      });
+      await new Promise<void>((resolve, reject) => {
+        delegate.handleStreamRequest(
+          {
+            type: "start",
+            sessionID: "redact",
+            video: { pt: 99, max_bit_rate: 132, fps: 30, width: 640, height: 360, mtu: 1378, profile: 0, level: 2 },
+            audio: { pt: 110, sample_rate: 24, max_bit_rate: 24, codec: "AAC-eld" },
+          } as never,
+          (error) => (error ? reject(error) : resolve()),
+        );
+      });
+      const logged = lines.join("");
+      expect(logged).toContain("<REDACTED>");
+      expect(logged).not.toContain(videoKey);
+      expect(logged).not.toContain(audioKey);
+      const args = (spawnFn as unknown as { mock: { calls: [string, string[]][] } }).mock.calls[0]![1].join(" ");
+      expect(args).toContain(videoKey);
+      expect(args).toContain(audioKey);
+      delegate.handleStreamRequest({ type: "stop", sessionID: "redact" } as never, () => {});
+    } finally {
+      spy.mockRestore();
+    }
   });
 });
