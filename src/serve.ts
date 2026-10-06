@@ -39,7 +39,10 @@ export async function startArgusServer(config: ArgusConfig, configDir = process.
     stdio: "ignore",
   });
 
-  const cache = new SnapshotCache(config, { defaultProfile: "sub" });
+  const cache = new SnapshotCache(config, {
+    defaultProfile: "sub",
+    apiCredentials: supervisor.apiCredentials,
+  });
   // Home-app grid stills come from the MAIN streams (2560x1920–4512x2512 —
   // go2rtc decodes a JPEG per request, HEVC included, verified fleet-wide
   // 2026-06-12). The poll loop is sequential, so one decode at a time: a full
