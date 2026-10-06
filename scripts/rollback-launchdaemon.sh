@@ -43,5 +43,7 @@ for plist in "${home}/Library/LaunchAgents-disabled/"*.plist; do
   fi
 done
 
+restore_stale_argus_plists "$home"
+
 assert_single_argus "$uid"
 echo "rolled back ${LABEL}"

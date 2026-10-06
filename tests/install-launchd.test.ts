@@ -376,6 +376,37 @@ exit 0
       const agent = path.join(run.sudoHome, "Library", "LaunchAgents", `${LABEL}.plist`);
       const disabledAgent = path.join(run.sudoHome, "Library", "LaunchAgents-disabled", `${LABEL}.plist`);
       const disabledRotate = path.join(run.sudoHome, "Library", "LaunchAgents-disabled", "local.argus.logrotate.plist");
+      const bakNames = [
+        "dev.point-labs.argus.plist.bak-1",
+        "dev.point-labs.argus.plist.bak-2",
+        "dev.point-labs.argus.plist.bak-3",
+        "dev.point-labs.argus.plist.bak-4",
+      ];
+      const agentsDir = path.join(run.sudoHome, "Library", "LaunchAgents");
+      const disabledDir = path.join(run.sudoHome, "Library", "LaunchAgents-disabled");
+      for (const name of bakNames) {
+        writeFileSync(path.join(agentsDir, name), `stale ${name}\n`);
+      }
+      const chownLog = path.join(run.root, "chown.log");
+      writeFileSync(
+        path.join(run.bin, "id"),
+        `#!/bin/bash
+if [[ "$1" == "-u" ]]; then
+  echo 0
+  exit 0
+fi
+exec /usr/bin/id "$@"
+`,
+      );
+      chmodSync(path.join(run.bin, "id"), 0o755);
+      writeFileSync(
+        path.join(run.bin, "chown"),
+        `#!/bin/bash
+printf '%s\\n' "$*" >> ${JSON.stringify(chownLog)}
+exit 0
+`,
+      );
+      chmodSync(path.join(run.bin, "chown"), 0o755);
       const cutover = spawnSync("bash", ["scripts/cutover-launchdaemon.sh"], { encoding: "utf8", env });
       expect(cutover.status, `${cutover.stdout}\n${cutover.stderr}`).toBe(0);
       expect(existsSync(agent)).toBe(false);
@@ -396,6 +427,13 @@ exit 0
       expect(loaded).toContain("system/dev.point-labs.argus");
       expect(loaded).not.toContain("gui/501/dev.point-labs.argus");
       expect(loaded).not.toContain("gui/501/local.argus.logrotate");
+      const chownText = existsSync(chownLog) ? readFileSync(chownLog, "utf8") : "";
+      expect(chownText).toContain(`mini ${disabledDir}`);
+      for (const name of bakNames) {
+        expect(existsSync(path.join(agentsDir, name))).toBe(false);
+        expect(readFileSync(path.join(disabledDir, name), "utf8")).toBe(`stale ${name}\n`);
+        expect(log).not.toContain(name);
+      }
 
       const rollback = spawnSync("bash", ["scripts/rollback-launchdaemon.sh"], { encoding: "utf8", env });
       expect(rollback.status, `${rollback.stdout}\n${rollback.stderr}`).toBe(0);
@@ -406,6 +444,12 @@ exit 0
       expect(after).toContain("gui/501/dev.point-labs.argus");
       expect(after).not.toContain("system/dev.point-labs.argus");
       expect(after).not.toContain(`system/${LOGROTATE_LABEL}`);
+      const rollbackLog = readFileSync(run.launchctlLog, "utf8");
+      for (const name of bakNames) {
+        expect(readFileSync(path.join(agentsDir, name), "utf8")).toBe(`stale ${name}\n`);
+        expect(existsSync(path.join(disabledDir, name))).toBe(false);
+        expect(rollbackLog).not.toContain(`bootstrap gui/501 ${path.join(agentsDir, name)}`);
+      }
     } finally {
       cleanup(run);
     }
@@ -457,8 +501,77 @@ exit 0
           ARGUS_TEST_IGNORE_BOOTOUT: "1",
         },
       });
+      const agent = path.join(run.sudoHome, "Library", "LaunchAgents", `${LABEL}.plist`);
       expect(cutover.status, `${cutover.stdout}\n${cutover.stderr}`).not.toBe(0);
-      expect(cutover.stderr).toMatch(/two Argus instances/);
+      expect(cutover.stderr).toMatch(/still loaded/);
+      expect(cutover.stderr).toMatch(/Not bootstrapping the system daemon/);
+      const log = readFileSync(run.launchctlLog, "utf8");
+      expect(log).not.toContain("bootstrap system");
+      expect(existsSync(agent)).toBe(true);
+    } finally {
+      cleanup(run);
+    }
+  });
+
+  it("aborts before bootstrapping the system daemon when gui bootout fails", () => {
+    const run = renderDaemon("scripts/install-launchdaemon.sh", { SUDO_USER: "mini", SUDO_UID: "501" }, true, {
+      separateSudoHome: true,
+      includeAgentPlistEnv: false,
+    });
+    try {
+      writeFileSync(run.launchctlLog, "");
+      writeFileSync(
+        path.join(run.bin, "launchctl"),
+        `#!/bin/bash
+printf '%s\\n' "$*" >> ${JSON.stringify(run.launchctlLog)}
+cmd="$1"
+if [[ "$cmd" == "bootout" ]]; then
+  echo "Boot-out failed: 3: No such process" >&2
+  exit 1
+fi
+if [[ "$cmd" == "print" ]]; then
+  echo "state = running"
+  exit 0
+fi
+exit 0
+`,
+      );
+      chmodSync(path.join(run.bin, "launchctl"), 0o755);
+      const daemonDir = path.join(run.installRoot, "Library", "LaunchDaemons");
+      mkdirSync(daemonDir, { recursive: true });
+      writeFileSync(
+        path.join(daemonDir, `${LABEL}.plist`),
+        `<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict><key>Label</key><string>${LABEL}</string></dict></plist>
+`,
+      );
+      writeFileSync(
+        path.join(daemonDir, `${LOGROTATE_LABEL}.plist`),
+        `<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict><key>Label</key><string>${LOGROTATE_LABEL}</string></dict></plist>
+`,
+      );
+      const agent = path.join(run.sudoHome, "Library", "LaunchAgents", `${LABEL}.plist`);
+      const cutover = spawnSync("bash", ["scripts/cutover-launchdaemon.sh"], {
+        encoding: "utf8",
+        env: {
+          PATH: `${run.bin}:${process.env.PATH ?? ""}`,
+          HOME: run.home,
+          TMPDIR: run.root,
+          USER: "root",
+          LOGNAME: "root",
+          SHELL: "/bin/bash",
+          SUDO_USER: "mini",
+          SUDO_UID: "501",
+          ARGUS_INSTALL_ROOT: run.installRoot,
+        },
+      });
+      expect(cutover.status, `${cutover.stdout}\n${cutover.stderr}`).not.toBe(0);
+      expect(cutover.stderr).toMatch(/bootout gui\/501\/dev\.point-labs\.argus failed/);
+      expect(cutover.stderr).toMatch(/Not bootstrapping the system daemon/);
+      const log = readFileSync(run.launchctlLog, "utf8");
+      expect(log).not.toContain("bootstrap system");
+      expect(existsSync(agent)).toBe(true);
     } finally {
       cleanup(run);
     }

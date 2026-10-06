@@ -27,6 +27,9 @@ for plist in "${home}/Library/LaunchAgents/"*.plist; do
   fi
 done
 
+park_stale_argus_plists "$home"
+abort_if_gui_loaded "$uid" "$LABEL"
+
 bootstrap_system "$daemon"
 bootstrap_system "$rotate_daemon"
 assert_single_argus "$uid"
