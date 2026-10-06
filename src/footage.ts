@@ -47,6 +47,10 @@ type HostSession = {
   storage: () => Promise<StorageReport>;
 };
 
+type FootageQuery =
+  | { kind: "shared-host"; host: string; channel: number }
+  | { kind: "own-host"; host: string; channel: 0 };
+
 const defaultIo: FootageIo = {
   stdout: (text) => {
     process.stdout.write(text);
@@ -229,10 +233,10 @@ function clockUtc(clock: ReolinkClock): number {
   return Date.UTC(clock.year, clock.mon - 1, clock.day, clock.hour, clock.min, clock.sec);
 }
 
-function channelFor(camera: CameraConfig, cameras: readonly CameraConfig[]): number {
-  // A camera alone on its host is standalone. Reolink standalone channels are 0.
-  const standalone = cameras.filter((other) => other.host === camera.host).length === 1;
-  return standalone ? 0 : camera.channel;
+function footageQuery(camera: CameraConfig, cameras: readonly CameraConfig[]): FootageQuery {
+  const ownHost = cameras.filter((other) => other.host === camera.host).length === 1;
+  if (ownHost) return { kind: "own-host", host: camera.host, channel: 0 };
+  return { kind: "shared-host", host: camera.host, channel: camera.channel };
 }
 
 async function collectFootage(
@@ -246,12 +250,21 @@ async function collectFootage(
 
   for (const camera of cameras) {
     try {
-      const channel = channelFor(camera, cameras);
+      const query = footageQuery(camera, cameras);
       const session = sessionFor(camera, sessions, fetchFn);
       const storage = await session.storage();
-      const schedule = scheduleMode(await session.client.getRec(channel));
-      const files = await filesFor(session.client, channel, window, storage);
-      lines.push(formatLine({ camera: camera.name, device: camera.host, channel, schedule, storage, files }));
+      const schedule = scheduleMode(await session.client.getRec(query.channel));
+      const files = await filesFor(session.client, query.channel, window, storage);
+      lines.push(
+        formatLine({
+          camera: camera.name,
+          device: query.host,
+          channel: query.channel,
+          schedule,
+          storage,
+          files,
+        }),
+      );
     } catch (error) {
       failures.push(`${camera.name}: ${errorText(error)}`);
     }

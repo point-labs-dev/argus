@@ -7,7 +7,7 @@ import { describe, expect, it } from "vitest";
 import { runFootage, type FootageRequest } from "../src/footage.js";
 
 const root = fileURLToPath(new URL("./fixtures/footage/", import.meta.url));
-const configPath = path.join(root, "argus.yaml");
+const configPath = path.join(root, "fleet.yaml");
 const devicesPath = path.join(root, "devices");
 const from = "2026-10-05T18:00:00";
 const to = "2026-10-06T08:00:00";
