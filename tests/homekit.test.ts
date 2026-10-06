@@ -829,6 +829,9 @@ function renderFilteredFrame(vf: string, srcWidth: number, srcHeight: number): {
   rgb: Buffer;
 } {
   const band = Math.round(srcHeight / 10);
+  const side = Math.round(Math.min(srcWidth, srcHeight) * 0.2);
+  const squareX = Math.floor((srcWidth - side) / 2);
+  const squareY = Math.floor((srcHeight - side) / 2);
   const ppm = execFileSync(
     "ffmpeg",
     [
@@ -840,7 +843,7 @@ function renderFilteredFrame(vf: string, srcWidth: number, srcHeight: number): {
       "-i",
       `color=c=red:s=${srcWidth}x${srcHeight}:r=1:d=1`,
       "-vf",
-      `drawbox=x=0:y=0:w=${srcWidth}:h=${band}:color=green:t=fill,drawbox=x=0:y=${srcHeight - band}:w=${srcWidth}:h=${band}:color=blue:t=fill,${vf}`,
+      `drawbox=x=0:y=0:w=${srcWidth}:h=${band}:color=green:t=fill,drawbox=x=0:y=${srcHeight - band}:w=${srcWidth}:h=${band}:color=blue:t=fill,drawbox=x=${squareX}:y=${squareY}:w=${side}:h=${side}:color=white:t=fill,${vf}`,
       "-frames:v",
       "1",
       "-f",
@@ -872,6 +875,33 @@ function renderFilteredFrame(vf: string, srcWidth: number, srcHeight: number): {
 function rgbAt(frame: { width: number; rgb: Buffer }, x: number, y: number): [number, number, number] {
   const index = (y * frame.width + x) * 3;
   return [frame.rgb[index]!, frame.rgb[index + 1]!, frame.rgb[index + 2]!];
+}
+
+function whiteSquare(frame: { width: number; height: number; rgb: Buffer }): { width: number; height: number } {
+  let minX = frame.width;
+  let maxX = -1;
+  let minY = frame.height;
+  let maxY = -1;
+  for (let y = 0; y < frame.height; y += 1) {
+    for (let x = 0; x < frame.width; x += 1) {
+      const [r, g, b] = rgbAt(frame, x, y);
+      if (r > 200 && g > 200 && b > 200) {
+        minX = Math.min(minX, x);
+        maxX = Math.max(maxX, x);
+        minY = Math.min(minY, y);
+        maxY = Math.max(maxY, y);
+      }
+    }
+  }
+  return { width: maxX - minX + 1, height: maxY - minY + 1 };
+}
+
+function isGreen(pixel: [number, number, number]): boolean {
+  return pixel[1] > pixel[0] && pixel[1] > pixel[2];
+}
+
+function isBlue(pixel: [number, number, number]): boolean {
+  return pixel[2] > pixel[0] && pixel[2] > pixel[1];
 }
 
 async function ffmpegArgsFor(
@@ -913,40 +943,58 @@ async function ffmpegArgsFor(
   return args;
 }
 
-describe("4:3 cameras fill the live frame", () => {
+describe("4:3 cameras keep an undistorted live frame", () => {
+  it.each(FOUR_BY_THREE_CAMERAS)("%s advertises only a 4:3 box Home has unlocked", (cameraName) => {
+    const delegate = new ArgusStreamingDelegate(cameraName, "rtsp://x", cacheWith(Buffer.from([0xff, 0xd8])));
+    const resolutions = buildCameraControllerOptions(delegate).streamingOptions.video.resolutions;
+    expect(resolutions.map((r) => `${r[0]}x${r[1]}`)).toContain("640x480");
+    for (const [width, height] of resolutions) {
+      expect(width * 3).toBe(height * 4);
+      expect(width).toBeLessThanOrEqual(640);
+      expect(height).toBeGreaterThanOrEqual(480);
+    }
+  });
+
   it.each(FOUR_BY_THREE_CAMERAS)(
-    "%s keeps the whole 4:3 scene inside the exact box iOS asked for",
+    "%s scales a 4:3 ask without stretch, pad, or crop",
+    async (cameraName) => {
+      const args = await ffmpegArgsFor(cameraName, { width: 640, height: 480 });
+      const vf = args[args.indexOf("-vf") + 1]!;
+      expect(vf).not.toContain("pad=");
+      const slug = cameraName.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+      expect(args[args.indexOf("-i") + 1]).toBe(`rtsp://127.0.0.1:8554/${slug}-sub`);
+
+      const frame = renderFilteredFrame(vf, 2560, 1920);
+      expect(frame.width).toBe(640);
+      expect(frame.height).toBe(480);
+      const square = whiteSquare(frame);
+      expect(square.width / square.height).toBeCloseTo(1, 1);
+      expect(rgbAt(frame, 0, Math.floor(frame.height / 2))).not.toEqual([0, 0, 0]);
+      expect(isGreen(rgbAt(frame, Math.floor(frame.width / 2), 1))).toBe(true);
+      expect(isBlue(rgbAt(frame, Math.floor(frame.width / 2), frame.height - 2))).toBe(true);
+    },
+  );
+
+  it.each(FOUR_BY_THREE_CAMERAS)(
+    "%s center-crops a cached 16:9 ask without stretching",
     async (cameraName) => {
       for (const ask of [
-        { width: 640, height: 360 },
-        { width: 1280, height: 720 },
+        { width: 640, height: 360, box: [640, 360] },
+        { width: 1280, height: 720, box: [854, 480] },
       ]) {
         const args = await ffmpegArgsFor(cameraName, ask);
         const vf = args[args.indexOf("-vf") + 1]!;
-        const scale = /^scale=(\d+):(\d+)/.exec(vf);
-        expect(scale).not.toBeNull();
-        const boxWidth = Number(scale![1]);
-        const boxHeight = Number(scale![2]);
         expect(vf).not.toContain("pad=");
-
-        for (const [srcWidth, srcHeight] of [
-          [2560, 1920],
-          [640, 480],
-        ] as const) {
-          const frame = renderFilteredFrame(vf, srcWidth, srcHeight);
-          expect(frame.width).toBe(boxWidth);
-          expect(frame.height).toBe(boxHeight);
-          const midY = Math.floor(frame.height / 2);
-          expect(rgbAt(frame, 0, midY)).not.toEqual([0, 0, 0]);
-          expect(rgbAt(frame, frame.width - 1, midY)).not.toEqual([0, 0, 0]);
-          const top = rgbAt(frame, Math.floor(frame.width / 2), 1);
-          const bottom = rgbAt(frame, Math.floor(frame.width / 2), frame.height - 2);
-          expect(top[1]).toBeGreaterThan(top[0]);
-          expect(top[1]).toBeGreaterThan(top[2]);
-          const bottomBlue = bottom[2];
-          expect(bottomBlue).toBeGreaterThan(bottom[0]);
-          expect(bottomBlue).toBeGreaterThan(bottom[1]);
-        }
+        const frame = renderFilteredFrame(vf, 2560, 1920);
+        expect(frame.width).toBe(ask.box[0]);
+        expect(frame.height).toBe(ask.box[1]);
+        const square = whiteSquare(frame);
+        expect(square.width / square.height).toBeCloseTo(1, 1);
+        const midY = Math.floor(frame.height / 2);
+        expect(rgbAt(frame, 0, midY)).not.toEqual([0, 0, 0]);
+        expect(rgbAt(frame, frame.width - 1, midY)).not.toEqual([0, 0, 0]);
+        expect(isGreen(rgbAt(frame, Math.floor(frame.width / 2), 1))).toBe(false);
+        expect(isBlue(rgbAt(frame, Math.floor(frame.width / 2), frame.height - 2))).toBe(false);
       }
     },
   );
