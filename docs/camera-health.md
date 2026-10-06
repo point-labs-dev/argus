@@ -64,10 +64,10 @@ Expect 14 go2rtc names if those seven names are unchanged: `garage-door` and `ga
 
 Label is `dev.point-labs.argus` in both domains.
 
-- **LaunchAgent:** `gui/<uid>/dev.point-labs.argus` (on the house Mini that uid is `501`). Plist: `$HOME/Library/LaunchAgents/dev.point-labs.argus.plist`. Needs a GUI session (`gui/<uid>`), including one created by automatic login. A reboot with nobody logged in does not start this job.
+- **LaunchAgent:** `gui/<uid>/dev.point-labs.argus` (on the house Mini that uid is `501`). Plist: `$HOME/Library/LaunchAgents/dev.point-labs.argus.plist`. Needs a GUI session (`gui/<uid>`), including one created by automatic login. A reboot with nobody logged in does not start this job. After `scripts/cutover-launchdaemon.sh`, that plist is moved to `$HOME/Library/LaunchAgents-disabled/dev.point-labs.argus.plist` and the LaunchAgents path is empty.
 - **LaunchDaemon:** `system/dev.point-labs.argus` after `scripts/cutover-launchdaemon.sh`. Plist: `/Library/LaunchDaemons/dev.point-labs.argus.plist`. This is the boot-level job. FileVault still has to be unlocked before any job can start.
 
-`scripts/install-launchd.sh` writes the agent plist and, when run with sudo as the Mini user, also writes the daemon plist. Cutover retires the gui job and bootstraps the system job. This runbook only *reads* both domains. It does not install, cut over, or kickstart.
+With `SUDO_USER` set and `ARGUS_INSTALL_ROOT` unset, `scripts/install-launchd.sh` writes only `/Library/LaunchDaemons/dev.point-labs.argus.plist` and exits before it bootstraps the gui agent. `scripts/install-launchdaemon.sh` execs that script. Cutover bootstraps the system job and parks the gui plist under `LaunchAgents-disabled`. This runbook only *reads* both domains. It does not install, cut over, or kickstart.
 
 ## Commands for Peter (via Chief of Staff)
 
@@ -79,6 +79,7 @@ Paste the whole block. It prints one section at a time.
 set -u
 LABEL="dev.point-labs.argus"
 AGENT="$HOME/Library/LaunchAgents/${LABEL}.plist"
+PARKED="$HOME/Library/LaunchAgents-disabled/${LABEL}.plist"
 DAEMON="/Library/LaunchDaemons/${LABEL}.plist"
 UID_NUM="$(id -u)"
 
@@ -90,7 +91,9 @@ echo "gui_session=$(who | awk '{print $2}' | tr '\n' ' ')"
 
 echo "===== 2. which plist exists ====="
 # Prints: path and size, or "No such file". Does not load or unload anything.
+# After cutover the gui plist is parked under LaunchAgents-disabled, not deleted.
 ls -l "$AGENT" 2>&1
+ls -l "$PARKED" 2>&1
 ls -l "$DAEMON" 2>&1
 
 echo "===== 3. agent job (read-only) ====="
@@ -309,12 +312,12 @@ fi
 | Section | Healthy | Down or wrong install |
 |---|---|---|
 | 1 | Mini’s computer name, console user, a GUI session (`console`) | No `console` in `who` means nobody is in the GUI. A LaunchAgent is not running across a headless boot |
-| 2 | Agent plist, daemon plist, or both. After cutover the daemon plist exists and the agent plist may be gone | Neither plist is a missing install. Send the `ls` lines |
+| 2 | Agent plist, daemon plist, or both. After cutover the daemon plist exists, `$HOME/Library/LaunchAgents/dev.point-labs.argus.plist` is absent, and the gui plist is at `$HOME/Library/LaunchAgents-disabled/dev.point-labs.argus.plist` | No daemon plist and no agent plist in LaunchAgents or LaunchAgents-disabled is a missing install. Send the `ls` lines |
 | 3 | `state = running` **or** `Could not find service` after cutover (then section 4 must be running) | `Could not find service` here **and** in section 4 means Argus is not loaded |
 | 4 | `state = running` after `cutover-launchdaemon.sh`, **or** `Could not find service` while the gui agent is still the live job | `Could not find service` here **and** in section 3 means Argus is not loaded |
 | 5 | `RunAtLoad` true, `KeepAlive` true, log paths under the repo | `ARGUS_AUDIO = 0` is video-only mode. Send the line if present |
 | 6 | One `dist/serve.js` and one `go2rtc` | No matching lines means the bridge is not running |
-| 7 | `camera_count=7` and seven name/host/channel rows; firmware line contains `1.3.15` | A count other than 7, or a missing `argus.yaml`, is the inventory mismatch |
+| 7 | `camera_count=7` and seven name/host/channel rows; firmware line contains `1.3.16` | A count other than 7, or a missing `argus.yaml`, is the inventory mismatch |
 | 8 | `stream_count=14`, `up_count=14`, every line `UP` plus codec/width/height, `stream_health_exit=0` | A `DOWN` line is that restream failing. Exit 1 is unhealthy. This is not an API call |
 | 8b | `api_streams_http=401` and `auth_check=expected` | `200` means the API is open (do not dump the body). Unreachable means go2rtc is not listening |
 | 9 | Each `*-sub` line is `jpeg` | `DOWN` or `not-jpeg` is that camera’s sub restream failing. Mains are separate rows in section 8 |
