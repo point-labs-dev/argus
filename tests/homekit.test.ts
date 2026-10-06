@@ -10,6 +10,7 @@ import {
   buildCameraControllerOptions,
   buildLiveFfmpegArgs,
   effectiveBitrateKbps,
+  NO_RTCP_CONSUMER_ABANDON_MS,
   resolveSrtpTargetAddress,
   type LiveFfmpegInput,
 } from "../src/homekit.js";
@@ -573,11 +574,7 @@ describe("ArgusStreamingDelegate", () => {
     stopSession(delegate, "s6");
   });
 
-  it("does not force-stop a session when RTCP goes silent after one packet", async () => {
-    // Field 1.3.11–1.3.14: Home paints for minutes while sending at most ONE
-    // receiver report. The old 30s silence watchdog armed on that lone packet
-    // and force-stopped the healthy session at ~30s. Teardown belongs to the
-    // controller (STOP request, or HAP handleCloseConnection on disconnect).
+  it("does not stop ffmpeg during 40s of silence after one RTCP packet", async () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     try {
       const fakeProc = Object.assign(new EventEmitter(), { kill: vi.fn() });
@@ -634,10 +631,6 @@ describe("ArgusStreamingDelegate", () => {
   });
 
   it("stops ffmpeg when an abandoned live session has no RTCP consumer and never receives STOP, and leaves a watched session running", async () => {
-    // Signal: no RTCP consumer. Home's one receiver report is not a viewer.
-    // Silence past this horizon, with no STOP and no live_session_stop, means
-    // the live view was abandoned. A later consumer packet means it is still watched.
-    const NO_RTCP_CONSUMER_ABANDON_MS = 15 * 60 * 1000;
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     const procs: Array<EventEmitter & { kill: ReturnType<typeof vi.fn> }> = [];
     const spawnFn = vi.fn(() => {

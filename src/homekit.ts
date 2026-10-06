@@ -450,7 +450,10 @@ function srtpParamsFromRequest(key: Buffer, salt: Buffer): string {
  */
 interface ActiveSession {
   stateMachine: SessionStateMachine;
+  noRtcpConsumerTimer?: ReturnType<typeof setTimeout>;
 }
+
+export const NO_RTCP_CONSUMER_ABANDON_MS = 15 * 60 * 1000;
 
 export interface StreamingDelegateOptions {
   /** Which stream's stills to serve for HomeKit snapshot requests. Default "sub". */
@@ -857,9 +860,6 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
 
     const ffmpeg = this.spawnFn(this.ffmpegPath, args, { stdio: ["ignore", "ignore", "pipe"] });
 
-    // Bind UDP return sockets for RTCP using ObservableRtcpSocket (Phase 2 migration).
-    // No watchdog timers — HAP-NodeJS manages session termination (STOP, connection close).
-    // Field evidence: Home paints for minutes with at most one RTCP receiver report.
     const videoSocket = createSocket("udp4");
     const videoReturnSocket = new ObservableRtcpSocket(videoSocket, "video", log);
     videoReturnSocket.bind(liveInput.video.localRtcpPort, this.bindAddress);
@@ -879,6 +879,9 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
       ...(audioReturnSocket && { audioReturnSocket: audioReturnSocket.getSocket() }),
     };
     session.stateMachine.start(streamingData);
+    const rtcpSockets = [videoReturnSocket];
+    if (audioReturnSocket) rtcpSockets.push(audioReturnSocket);
+    this.armNoRtcpConsumerWatch(sessionID, rtcpSockets);
 
     // Detect first frame from FFmpeg progress output (pipe:2 → stderr). Progress format:
     // "frame=N\nfps=...\n..." with frame=0 first, then frame=1 when first encode completes.
@@ -938,11 +941,40 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
     setTimeout(() => answer(), 100);
   }
 
+  private armNoRtcpConsumerWatch(sessionID: string, sockets: ObservableRtcpSocket[]): void {
+    const arm = (): void => {
+      const session = this.sessions.get(sessionID);
+      if (!session || session.stateMachine.getState().tag !== "STREAMING") return;
+      if (session.noRtcpConsumerTimer) clearTimeout(session.noRtcpConsumerTimer);
+      session.noRtcpConsumerTimer = setTimeout(() => {
+        this.reapAbandonedLiveSession(sessionID);
+      }, NO_RTCP_CONSUMER_ABANDON_MS);
+    };
+
+    for (const socket of sockets) socket.on("packet", arm);
+    arm();
+  }
+
+  private reapAbandonedLiveSession(sessionID: string): void {
+    const session = this.sessions.get(sessionID);
+    if (!session || session.stateMachine.getState().tag !== "STREAMING") return;
+    this.logLine(
+      `no RTCP consumer for ${NO_RTCP_CONSUMER_ABANDON_MS}ms, tearing down live session ${sessionID}`,
+    );
+    emitTelemetry(this.cameraName, "live_session_stop", {
+      sessionId: sessionID,
+      reason: "no_rtcp_consumer",
+    });
+    this.stopStream(sessionID);
+    this.controller?.forceStopStreamingSession(sessionID);
+  }
+
   private stopStream(sessionID: string): void {
     const session = this.sessions.get(sessionID);
     if (!session) {
       return;
     }
+    if (session.noRtcpConsumerTimer) clearTimeout(session.noRtcpConsumerTimer);
 
     // Use state machine's idempotent stop() to get resources to clean up
     const resources = session.stateMachine.stop();
