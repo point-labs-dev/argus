@@ -4,6 +4,7 @@ import {
   existsSync,
   mkdtempSync,
   mkdirSync,
+  readFileSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -66,15 +67,46 @@ function readPlist(file: string): Record<string, unknown> {
 }
 
 const CRED_FILE = "/tmp/argus-streams.json";
+const LABEL = "dev.point-labs.argus";
+const LOGROTATE_LABEL = "dev.point-labs.argus.logrotate";
 
-function renderDaemon(script: string, extraEnv: Record<string, string>, renderOnly = true) {
+type RenderOptions = {
+  includeAgentPlistEnv?: boolean;
+  separateSudoHome?: boolean;
+  agentBody?: string;
+  seedDaemon?: boolean;
+};
+
+function writeDscl(bin: string, userHome: string) {
+  writeFileSync(
+    path.join(bin, "dscl"),
+    `#!/bin/bash
+if [[ "$1" == "." && "$2" == "-read" ]]; then
+  echo "NFSHomeDirectory: ${userHome}"
+  exit 0
+fi
+exit 1
+`,
+  );
+  chmodSync(path.join(bin, "dscl"), 0o755);
+}
+
+function renderDaemon(
+  script: string,
+  extraEnv: Record<string, string>,
+  renderOnly = true,
+  options: RenderOptions = {},
+) {
   const root = mkdtempSync(path.join(tmpdir(), "argus-launchd-"));
   const home = path.join(root, "home");
   const installRoot = path.join(root, "install");
   const bin = path.join(root, "bin");
   const launchctlLog = path.join(root, "launchctl.log");
   const fixture = path.join(root, "agent.plist");
-  mkdirSync(home);
+  const sudoHome = options.separateSudoHome ? path.join(root, "sudo-home") : home;
+  mkdirSync(home, { recursive: true });
+  mkdirSync(sudoHome, { recursive: true });
+  mkdirSync(path.join(sudoHome, "bin"), { recursive: true });
   mkdirSync(installRoot);
   mkdirSync(bin);
   writeFileSync(
@@ -82,9 +114,22 @@ function renderDaemon(script: string, extraEnv: Record<string, string>, renderOn
     `#!/bin/sh\necho "$@" >> ${JSON.stringify(launchctlLog)}\nexit 0\n`,
   );
   chmodSync(path.join(bin, "launchctl"), 0o755);
-  writeFileSync(fixture, agentFixture(FIXTURE_ENV));
+  writeDscl(bin, sudoHome);
+  writeFileSync(path.join(sudoHome, "bin", "argus-logrotate.sh"), "#!/bin/sh\nexit 0\n");
+  chmodSync(path.join(sudoHome, "bin", "argus-logrotate.sh"), 0o755);
+  const agentBody = options.agentBody ?? agentFixture(FIXTURE_ENV);
+  writeFileSync(fixture, agentBody);
+  const agentInHome = path.join(sudoHome, "Library", "LaunchAgents", `${LABEL}.plist`);
+  mkdirSync(path.dirname(agentInHome), { recursive: true });
+  writeFileSync(agentInHome, agentBody);
+  if (options.seedDaemon) {
+    const dest = path.join(installRoot, "Library/LaunchDaemons", `${LABEL}.plist`);
+    mkdirSync(path.dirname(dest), { recursive: true });
+    writeFileSync(dest, agentFixture(FIXTURE_ENV));
+  }
   const createdServe = ensureRepoFile("dist/serve.js", "");
   const createdConfig = ensureRepoFile("argus.yaml", "cameras: []\n");
+  const includeAgentPlistEnv = options.includeAgentPlistEnv ?? true;
   try {
     const result = spawnSync("bash", [script], {
       encoding: "utf8",
@@ -97,11 +142,11 @@ function renderDaemon(script: string, extraEnv: Record<string, string>, renderOn
         SHELL: "/bin/bash",
         ...(renderOnly ? { ARGUS_INSTALL_RENDER_ONLY: "1" } : {}),
         ARGUS_INSTALL_ROOT: installRoot,
-        ARGUS_AGENT_PLIST: fixture,
+        ...(includeAgentPlistEnv ? { ARGUS_AGENT_PLIST: fixture } : {}),
         ...extraEnv,
       },
     });
-    return { result, installRoot, launchctlLog, createdServe, createdConfig, root };
+    return { result, installRoot, launchctlLog, createdServe, createdConfig, root, home, sudoHome, bin };
   } catch (error) {
     if (createdServe) rmSync("dist/serve.js", { force: true });
     if (createdConfig) rmSync("argus.yaml", { force: true });
@@ -134,6 +179,7 @@ describe("install-launchd daemon plist", () => {
       const plist = readPlist(dest);
       const user = execFileSync("id", ["-un"], { encoding: "utf8" }).trim();
       expect(plist.UserName).toBe(user);
+      expect(plist.Umask).toBe(63);
       expect(plist.RunAtLoad).toBe(true);
       expect(plist.KeepAlive).toBe(true);
 
@@ -179,6 +225,240 @@ describe("install-launchd daemon plist", () => {
       expect(readPlist(dest).UserName).toBe("mini");
       expect(existsSync(launchctlLog)).toBe(false);
       expect(existsSync(CRED_FILE)).toBe(false);
+    } finally {
+      cleanup(run);
+    }
+  });
+});
+
+describe("sudo HOME and cutover", () => {
+  it("reads ARGUS keys from SUDO_USER home when sudo resets HOME, and writes logrotate", () => {
+    const run = renderDaemon(
+      "scripts/install-launchdaemon.sh",
+      { SUDO_USER: "mini", SUDO_UID: "501" },
+      true,
+      { includeAgentPlistEnv: false, separateSudoHome: true },
+    );
+    try {
+      const { result, installRoot, sudoHome } = run;
+      const dest = path.join(installRoot, "Library/LaunchDaemons/dev.point-labs.argus.plist");
+      expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+      const plist = readPlist(dest);
+      const env = plist.EnvironmentVariables as Record<string, string>;
+      expect(plist.UserName).toBe("mini");
+      expect(env.ARGUS_HAP_BIND).toBe("10.0.0.8");
+      expect(env.ARGUS_LIVE_MAIN_SOURCE).toBe("1");
+      expect(plist.Umask).toBe(63);
+      expect(run.home).not.toBe(sudoHome);
+
+      const rotate = readPlist(
+        path.join(installRoot, "Library/LaunchDaemons", `${LOGROTATE_LABEL}.plist`),
+      );
+      const rotateEnv = rotate.EnvironmentVariables as Record<string, string>;
+      expect(rotate.Label).toBe(LOGROTATE_LABEL);
+      expect(rotate.UserName).toBe("mini");
+      expect(rotate.StartInterval).toBe(3600);
+      expect(rotateEnv.HOME).toBe(sudoHome);
+      expect(rotate.ProgramArguments).toEqual([path.join(sudoHome, "bin", "argus-logrotate.sh")]);
+      expect(JSON.stringify(rotate)).not.toContain("password");
+    } finally {
+      cleanup(run);
+    }
+  });
+
+  it("refuses to write a daemon plist when the agent has no ARGUS keys", () => {
+    const run = renderDaemon(
+      "scripts/install-launchdaemon.sh",
+      { SUDO_USER: "mini", SUDO_UID: "501" },
+      true,
+      {
+        includeAgentPlistEnv: false,
+        agentBody: agentFixture({}),
+      },
+    );
+    try {
+      const dest = path.join(run.installRoot, "Library/LaunchDaemons/dev.point-labs.argus.plist");
+      expect(run.result.status, run.result.stdout).not.toBe(0);
+      expect(run.result.stderr).toMatch(/ARGUS_/);
+      expect(existsSync(dest)).toBe(false);
+    } finally {
+      cleanup(run);
+    }
+  });
+
+  it("does not bootstrap the gui agent when the system daemon plist already exists", () => {
+    const run = renderDaemon("scripts/install-launchd.sh", {}, false, { seedDaemon: true });
+    try {
+      const log = existsSync(run.launchctlLog) ? readFileSync(run.launchctlLog, "utf8") : "";
+      expect(run.result.status, `${run.result.stdout}\n${run.result.stderr}`).not.toBe(0);
+      expect(log).not.toContain("bootstrap");
+      expect(run.result.stderr).toMatch(/gui agent/);
+    } finally {
+      cleanup(run);
+    }
+  });
+
+  it("cuts the gui agent over to the system daemon and rolls back", () => {
+    const run = renderDaemon("scripts/install-launchdaemon.sh", { SUDO_USER: "mini", SUDO_UID: "501" }, true, {
+      separateSudoHome: true,
+      includeAgentPlistEnv: false,
+    });
+    try {
+      writeFileSync(run.launchctlLog, "");
+      const state = path.join(run.root, "launchctl.state");
+      writeFileSync(state, "gui/501/dev.point-labs.argus\ngui/501/local.argus.logrotate\n");
+      writeFileSync(
+        path.join(run.bin, "launchctl"),
+        `#!/bin/bash
+printf '%s\\n' "$*" >> ${JSON.stringify(run.launchctlLog)}
+cmd="$1"
+shift
+case "$cmd" in
+  bootout)
+    if [[ -z "\${ARGUS_TEST_IGNORE_BOOTOUT:-}" ]]; then
+      grep -vxF "$1" ${JSON.stringify(state)} > ${JSON.stringify(state)}.tmp || true
+      mv ${JSON.stringify(state)}.tmp ${JSON.stringify(state)}
+    fi
+    ;;
+  bootstrap)
+    label="$(python3 -c 'import plistlib,sys; print(plistlib.load(open(sys.argv[1],"rb"))["Label"])' "$2")"
+    printf '%s/%s\\n' "$1" "$label" >> ${JSON.stringify(state)}
+    ;;
+  print)
+    if grep -qxF "$1" ${JSON.stringify(state)}; then
+      echo "state = running"
+      exit 0
+    fi
+    echo "Could not find service" >&2
+    exit 1
+    ;;
+esac
+exit 0
+`,
+      );
+      chmodSync(path.join(run.bin, "launchctl"), 0o755);
+      const daemonDir = path.join(run.installRoot, "Library", "LaunchDaemons");
+      mkdirSync(daemonDir, { recursive: true });
+      writeFileSync(
+        path.join(daemonDir, `${LABEL}.plist`),
+        `<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict><key>Label</key><string>${LABEL}</string></dict></plist>
+`,
+      );
+      writeFileSync(
+        path.join(daemonDir, `${LOGROTATE_LABEL}.plist`),
+        `<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict><key>Label</key><string>${LOGROTATE_LABEL}</string></dict></plist>
+`,
+      );
+      const rotateAgent = path.join(run.sudoHome, "Library", "LaunchAgents", "local.argus.logrotate.plist");
+      writeFileSync(
+        rotateAgent,
+        `<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+  <key>Label</key><string>local.argus.logrotate</string>
+  <key>ProgramArguments</key>
+  <array><string>${path.join(run.sudoHome, "bin", "argus-logrotate.sh")}</string></array>
+</dict></plist>
+`,
+      );
+      const env = {
+        PATH: `${run.bin}:${process.env.PATH ?? ""}`,
+        HOME: run.home,
+        TMPDIR: run.root,
+        USER: "root",
+        LOGNAME: "root",
+        SHELL: "/bin/bash",
+        SUDO_USER: "mini",
+        SUDO_UID: "501",
+        ARGUS_INSTALL_ROOT: run.installRoot,
+      };
+      const agent = path.join(run.sudoHome, "Library", "LaunchAgents", `${LABEL}.plist`);
+      const disabledAgent = path.join(run.sudoHome, "Library", "LaunchAgents-disabled", `${LABEL}.plist`);
+      const disabledRotate = path.join(run.sudoHome, "Library", "LaunchAgents-disabled", "local.argus.logrotate.plist");
+      const cutover = spawnSync("bash", ["scripts/cutover-launchdaemon.sh"], { encoding: "utf8", env });
+      expect(cutover.status, `${cutover.stdout}\n${cutover.stderr}`).toBe(0);
+      expect(existsSync(agent)).toBe(false);
+      expect(existsSync(disabledAgent)).toBe(true);
+      expect(existsSync(rotateAgent)).toBe(false);
+      expect(existsSync(disabledRotate)).toBe(true);
+      const log = readFileSync(run.launchctlLog, "utf8");
+      const bootoutAt = log.indexOf("bootout gui/501/dev.point-labs.argus");
+      const disableAt = log.indexOf("disable gui/501/dev.point-labs.argus");
+      const bootstrapAt = log.indexOf(`bootstrap system ${path.join(daemonDir, `${LABEL}.plist`)}`);
+      expect(bootoutAt).toBeGreaterThanOrEqual(0);
+      expect(disableAt).toBeGreaterThan(bootoutAt);
+      expect(bootstrapAt).toBeGreaterThan(disableAt);
+      expect(log).toContain("bootout gui/501/local.argus.logrotate");
+      expect(log).toContain("disable gui/501/local.argus.logrotate");
+      expect(log).toContain(`bootstrap system ${path.join(daemonDir, `${LOGROTATE_LABEL}.plist`)}`);
+      const loaded = readFileSync(state, "utf8");
+      expect(loaded).toContain("system/dev.point-labs.argus");
+      expect(loaded).not.toContain("gui/501/dev.point-labs.argus");
+      expect(loaded).not.toContain("gui/501/local.argus.logrotate");
+
+      const rollback = spawnSync("bash", ["scripts/rollback-launchdaemon.sh"], { encoding: "utf8", env });
+      expect(rollback.status, `${rollback.stdout}\n${rollback.stderr}`).toBe(0);
+      expect(existsSync(agent)).toBe(true);
+      expect(existsSync(disabledAgent)).toBe(false);
+      expect(existsSync(rotateAgent)).toBe(true);
+      const after = readFileSync(state, "utf8");
+      expect(after).toContain("gui/501/dev.point-labs.argus");
+      expect(after).not.toContain("system/dev.point-labs.argus");
+      expect(after).not.toContain(`system/${LOGROTATE_LABEL}`);
+    } finally {
+      cleanup(run);
+    }
+  });
+
+  it("exits non-zero when the gui agent is still loaded beside the system daemon", () => {
+    const run = renderDaemon("scripts/install-launchdaemon.sh", { SUDO_USER: "mini", SUDO_UID: "501" }, true, {
+      separateSudoHome: true,
+      includeAgentPlistEnv: false,
+    });
+    try {
+      const state = path.join(run.root, "launchctl.state");
+      writeFileSync(state, "gui/501/dev.point-labs.argus\n");
+      writeFileSync(run.launchctlLog, "");
+      writeFileSync(
+        path.join(run.bin, "launchctl"),
+        `#!/bin/bash
+printf '%s\\n' "$*" >> ${JSON.stringify(run.launchctlLog)}
+exit 0
+`,
+      );
+      chmodSync(path.join(run.bin, "launchctl"), 0o755);
+      const daemonDir = path.join(run.installRoot, "Library", "LaunchDaemons");
+      mkdirSync(daemonDir, { recursive: true });
+      writeFileSync(
+        path.join(daemonDir, `${LABEL}.plist`),
+        `<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict><key>Label</key><string>${LABEL}</string></dict></plist>
+`,
+      );
+      writeFileSync(
+        path.join(daemonDir, `${LOGROTATE_LABEL}.plist`),
+        `<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict><key>Label</key><string>${LOGROTATE_LABEL}</string></dict></plist>
+`,
+      );
+      const cutover = spawnSync("bash", ["scripts/cutover-launchdaemon.sh"], {
+        encoding: "utf8",
+        env: {
+          PATH: `${run.bin}:${process.env.PATH ?? ""}`,
+          HOME: run.home,
+          TMPDIR: run.root,
+          USER: "root",
+          LOGNAME: "root",
+          SHELL: "/bin/bash",
+          SUDO_USER: "mini",
+          SUDO_UID: "501",
+          ARGUS_INSTALL_ROOT: run.installRoot,
+          ARGUS_TEST_IGNORE_BOOTOUT: "1",
+        },
+      });
+      expect(cutover.status, `${cutover.stdout}\n${cutover.stderr}`).not.toBe(0);
+      expect(cutover.stderr).toMatch(/two Argus instances/);
     } finally {
       cleanup(run);
     }
