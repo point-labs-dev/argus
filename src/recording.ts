@@ -15,6 +15,7 @@ import {
 
 import { readFragmentedMp4 } from "./mp4.js";
 import { emitTelemetry } from "./telemetry.js";
+import { emitTiming } from "./timing.js";
 
 const PROFILE_TO_X264: Record<number, string> = {
   [H264Profile.BASELINE]: "baseline",
@@ -176,12 +177,14 @@ export class ArgusRecordingDelegate implements CameraRecordingDelegate {
       streamId,
       resolution: config.videoCodec.resolution,
     });
+    emitTiming({ stage: "recording_start", camera: this.cameraName, streamId });
 
     const args = buildRecordingFfmpegArgs(this.mainUrl, config);
     if (this.verbose) {
       process.stderr.write(`[argus ${this.cameraName}] HKSV recording ${config.videoCodec.resolution.join("x")} -> ffmpeg ${args.join(" ")}\n`);
     }
     const ffmpeg = this.spawnFn(this.ffmpegPath, args, { stdio: ["ignore", "pipe", "pipe"] });
+    emitTiming({ stage: "recording_ffmpeg_spawn", camera: this.cameraName, streamId });
     this.processes.set(streamId, ffmpeg);
     ffmpeg.stderr?.on("data", (chunk: Buffer) => {
       if (this.verbose) process.stderr.write(`[argus ${this.cameraName}] hksv-ffmpeg: ${chunk.toString().trimEnd()}\n`);
@@ -207,6 +210,7 @@ export class ArgusRecordingDelegate implements CameraRecordingDelegate {
             // Field lever: motion → hksv_first_fragment is the measurable
             // "recording visible to the hub" latency.
             emitTelemetry(this.cameraName, "hksv_first_fragment", { streamId });
+            emitTiming({ stage: "recording_first_fragment", camera: this.cameraName, streamId });
           }
         }
         yield { data: segment.data, isLast: false };
