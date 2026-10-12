@@ -85,6 +85,7 @@ import type { CameraConfig } from "./config.js";
 import { ArgusRecordingDelegate, buildRecordingOptions } from "./recording.js";
 import type { SnapshotCache, SnapshotProfile } from "./snapshot-cache.js";
 import { emitTelemetry } from "./telemetry.js";
+import { emitTiming } from "./timing.js";
 
 // HomeKit negotiates ONE H.264 profile/level during stream setup and rejects video
 // encoded outside it (the device receives SRTP but can't decode → forever-spinner).
@@ -577,6 +578,7 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
   }
 
   public prepareStream(request: PrepareStreamRequest, callback: PrepareStreamCallback): void {
+    emitTiming({ stage: "prepare_stream_enter", camera: this.cameraName, sessionId: request.sessionID });
     void this.prepareStreamAsync(request, callback);
   }
 
@@ -592,7 +594,12 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
         this.logLine(`prepareStream: callback already answered, ignoring duplicate call`);
         return;
       }
-      
+      emitTiming({
+        stage: "prepare_stream_answered",
+        camera: this.cameraName,
+        sessionId: request.sessionID,
+      });
+
       if (error) {
         callback(error);
       } else if (response) {
@@ -657,6 +664,7 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
         height: request.video.height,
         fps: request.video.fps,
       });
+      emitTiming({ stage: "live_session_start", camera: this.cameraName, sessionId: request.sessionID });
       this.startStream(request, callback);
       return;
     }
@@ -743,6 +751,7 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
     log(`ffmpeg ${this.ffmpegPath} ${redactFfmpegArgsForLog(args)}`);
 
     const ffmpeg = this.spawnFn(this.ffmpegPath, args, { stdio: ["ignore", "ignore", "pipe"] });
+    emitTiming({ stage: "live_ffmpeg_spawn", camera: this.cameraName, sessionId: sessionID });
 
     // Use state machine's reconfigure() to update live input and ffmpeg
     session.stateMachine.reconfigure(liveInput, ffmpeg);
@@ -760,6 +769,7 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
       if (!firstFrameEmitted && /^frame=([1-9]\d*)$/m.test(text)) {
         firstFrameEmitted = true;
         emitTelemetry(this.cameraName, "live_session_first_frame", { sessionId: sessionID });
+        emitTiming({ stage: "live_first_frame", camera: this.cameraName, sessionId: sessionID });
       }
     });
 
@@ -875,6 +885,7 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
     log(`ffmpeg ${this.ffmpegPath} ${redactFfmpegArgsForLog(args)}`);
 
     const ffmpeg = this.spawnFn(this.ffmpegPath, args, { stdio: ["ignore", "ignore", "pipe"] });
+    emitTiming({ stage: "live_ffmpeg_spawn", camera: this.cameraName, sessionId: sessionID });
 
     const videoSocket = createSocket("udp4");
     const videoReturnSocket = new ObservableRtcpSocket(videoSocket, "video", log);
@@ -919,6 +930,7 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
       if (!firstFrameEmitted && /^frame=([1-9]\d*)$/m.test(text)) {
         firstFrameEmitted = true;
         emitTelemetry(this.cameraName, "live_session_first_frame", { sessionId: sessionID });
+        emitTiming({ stage: "live_first_frame", camera: this.cameraName, sessionId: sessionID });
       }
     });
 
@@ -1337,7 +1349,11 @@ export function createCameraAccessory(
     accessory,
     delegate,
     setMotion: (detected: boolean) => {
-      motionSensor?.updateCharacteristic(Characteristic.MotionDetected, detected);
+      if (!motionSensor) return;
+      motionSensor.updateCharacteristic(Characteristic.MotionDetected, detected);
+      if (detected) {
+        emitTiming({ stage: "motion_characteristic_set", camera: camera.name });
+      }
     },
   };
 }

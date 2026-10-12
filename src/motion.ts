@@ -1,6 +1,7 @@
 import type { CameraConfig } from "./config.js";
 import { ReolinkClient } from "./reolink.js";
 import { emitTelemetry } from "./telemetry.js";
+import { emitTiming } from "./timing.js";
 
 // Polls each camera's Reolink motion state and reports edges (on/off) with a
 // cooldown, so a brief gap in detection doesn't flap the HomeKit motion sensor.
@@ -98,6 +99,7 @@ export class MotionMonitor {
       if (!state.detected) {
         state.detected = true;
         emitTelemetry(state.camera.name, "motion_detected");
+        emitTiming({ stage: "motion_detected", camera: state.camera.name });
         this.onMotion(state.camera.name, true);
       }
     } else if (state.detected && now - state.lastMotionAt >= this.cooldownMs) {
