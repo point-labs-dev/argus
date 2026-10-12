@@ -207,8 +207,6 @@ export class ArgusRecordingDelegate implements CameraRecordingDelegate {
         if (!segment.isInit) {
           mediaFragments += 1;
           if (mediaFragments === 1) {
-            // Field lever: motion → hksv_first_fragment is the measurable
-            // "recording visible to the hub" latency.
             emitTelemetry(this.cameraName, "hksv_first_fragment", { streamId });
             emitTiming({ stage: "recording_first_fragment", camera: this.cameraName, streamId });
           }

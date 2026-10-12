@@ -64,7 +64,7 @@ export function emitTiming(mark: TimingEmit, now: () => number = () => performan
     const monoMs = Math.round(now());
     process.stderr.write(`ARGUS_TIMING: ${serialize(mark, monoMs)}\n`);
   } catch {
-    // A log failure must not change motion, recording, or live streaming.
+    return;
   }
 }
 
