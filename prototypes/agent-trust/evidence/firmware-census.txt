@@ -1,0 +1,25 @@
+pr3_commits 56
+pr3_versions 16 from 1.1.0 to 1.3.13
+JUSTIFIED 1.1.0 -> 1.2.0 35a4316a37fed206464ce861de70e38b11dcecc0 Fix live feed spinner: bump firmware to invalidate iOS cache
+CHURN 1.2.0 -> 1.3.0 6ed2defaa85633ac59164444b2262eb612d01385 Implement video-only interim path: firmware 1.3.0 + correct video-only
+JUSTIFIED 1.3.0 -> 1.3.1 2312c702ccedb8d0587fff0bebe3f269765143b6 Force Baseline H.264 profile for Apple Home live unlock
+CHURN 1.3.1 -> 1.3.2 01dee8139693f1da2c0eba27b940afd80413631e Fix video-only prepareStream to not advertise audio ports
+CHURN 1.3.2 -> 1.3.3 91e96938139e0199db7005ad43d431ea3a8c4cbd Fix HomeKit RTCP keepalive timeout (firmware 1.3.3)
+CHURN 1.3.3 -> 1.3.4 e045386291d92e185a1c1e4add829fa296512e3b Remove localrtpport to fix bidirectional RTCP (firmware 1.3.4)
+CHURN 1.3.4 -> 1.3.5 ecadaaaf3f3e4f2cdbbb38e87355c1c3604ac203 Complete camera-ffmpeg return-port + CBR + interface pinning (firmware 1.3.5)
+CHURN 1.3.5 -> 1.3.6 7fce38a52308da72757f25fc25a581e7a7965f8e Bump firmware 1.3.6 to force iOS cache refresh for audio
+CHURN 1.3.6 -> 1.3.7 6117635239cb0e5bdcbd877160fe877967a1d99e firmware 1.3.7: fix prepareStreamAsync double-callback race
+CHURN 1.3.7 -> 1.3.8 aab691bcabac9ab9d7b7bdad8825e3d0c2196f8d firmware 1.3.8: guarantee Setup Endpoints callback always fires
+CHURN 1.3.8 -> 1.3.9 56045dd342d8c18909dc233ca8b769dd43e9f067 firmware 1.3.9: revert to pre-1.3.7 direct callback pattern
+CHURN 1.3.9 -> 1.3.10 40fb7224daf2ec4e528922daa52eaf6ed6ba5fae firmware 1.3.10: guard + June simple pattern (prevent crash + answer HAP)
+CHURN 1.3.10 -> 1.3.11 6e8afcc6d08a15c39079dccd9aaccc5cd8caef5d firmware 1.3.11: resolve interface names to IP addresses (fix ENOTFOUND crash)
+JUSTIFIED 1.3.11 -> 1.3.12 16b483c79d89f9a940b4952e4a06693827548dab firmware 1.3.12: cap live resolution for WiFi MacBook accept (June pattern)
+CHURN 1.3.12 -> 1.3.13 67a5df94322a0d2965ba96d790f53fe817d6b878 firmware 1.3.13: force resolution clamp in startStream (defensive cap)
+pr3_justified 3
+pr3_churn 12
+main_firmware_commits
+first 1.1.0 df0408300b2d8dab59158153cbef86e9573d4984 Realpath main-module guard (daemon outage fix) + FirmwareRevision cache-buster
+AD_CHANGED 1.3.13 dafd2d9901e147a33d0066c6c02e8ee1d5d7fdb4 Fix HomeKit live feed hang (Argus 1.3.13)
+AD_SAME 1.3.14 fcca4a5069ec431615e66c57aeada43be8b5b7fa Argus 1.3.14 — Restore HomeKit Live A/V Quality (#5)
+AD_SAME 1.3.15 96174fd3a6839b67eaa266c2a2c03b88d9a95f32 Argus 1.3.15 — MAIN-source live, no RTCP watchdog kill, HKSV one cycle sooner (#6)
+AD_CHANGED 1.3.16 87fe4edf22e25a9f15b17ae705bcdd7b98901944 Keep the four by three live views square (#18)
