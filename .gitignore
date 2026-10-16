@@ -27,3 +27,5 @@ recordings/
 
 # launchd daemon logs
 logs/
+
+.cursor/skills/verify-argus/evidence/
