@@ -22,8 +22,8 @@ function liveInput(overrides: Partial<LiveFfmpegInput> = {}): LiveFfmpegInput {
   return {
     inputUrl: "rtsp://127.0.0.1:8554/backyard-left-sub",
     targetAddress: "192.168.1.50",
-    localAddress: undefined,
     videoMode: "transcode",
+    aspect: "16:9",
     video: {
       port: 50000,
       localRtcpPort: 60000,
@@ -54,7 +54,7 @@ function liveInput(overrides: Partial<LiveFfmpegInput> = {}): LiveFfmpegInput {
 
 function cacheWith(jpeg: Buffer): SnapshotCache {
   const config = parseArgusConfig({
-    cameras: [{ name: "Backyard Left", host: "10.0.0.5", channel: 0, mainCodec: "h265",
+      cameras: [{ name: "Backyard Left", aspect: "16:9", host: "10.0.0.5", channel: 0, mainCodec: "h265",
       username: "admin", password: "x", transport: "auto", streams: { main: "main", sub: "sub" } }],
     recording: { path: "./rec", retention: { continuous: 3, motion: 7, alerts: 30 } },
     homekit: { pin: "123-45-678" },
@@ -136,19 +136,23 @@ describe("buildLiveFfmpegArgs", () => {
     expect(args).toContain("-maxrate 132k");
   });
 
-  it("pads to exact negotiated dimensions for all aspect ratios", () => {
-    // Field 2026-10-01: 4:3 source (2560×1920) scaled to fit 1280×720 (16:9) becomes
-    // 960×720 without padding. Home expects EXACT 1280×720 → blank. Pad fills the gap.
-    const input720p = liveInput({ video: { ...liveInput().video, width: 1280, height: 720 } });
+  it("pads a sixteen by nine camera to the negotiated box", () => {
+    const input720p = liveInput({ aspect: "16:9", video: { ...liveInput().video, width: 1280, height: 720 } });
     const args720p = buildLiveFfmpegArgs(input720p).join(" ");
-    
-    // Should scale to fit then pad to exact 1280×720
+
     expect(args720p).toContain("scale=1280:720:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=1280:720:(ow-iw)/2:(oh-ih)/2");
-    
-    // Same for other resolutions
-    const input1080p = liveInput({ video: { ...liveInput().video, width: 1920, height: 1080 } });
+    expect(args720p).not.toContain("crop=");
+
+    const input1080p = liveInput({ aspect: "16:9", video: { ...liveInput().video, width: 1920, height: 1080 } });
     const args1080p = buildLiveFfmpegArgs(input1080p).join(" ");
     expect(args1080p).toContain("pad=1920:1080:(ow-iw)/2:(oh-ih)/2");
+    expect(args1080p).not.toContain("crop=");
+  });
+
+  it("crops a four by three camera into the negotiated box", () => {
+    const args = buildLiveFfmpegArgs(liveInput({ aspect: "4:3" })).join(" ");
+    expect(args).toContain("scale=1280:720:force_original_aspect_ratio=increase:force_divisible_by=2,crop=1280:720,setsar=1");
+    expect(args).not.toContain("pad=");
   });
 
   it("enables the intra-refresh experiment with ARGUS_LIVE_INTRA=1", () => {
@@ -287,7 +291,7 @@ describe("resolveSrtpTargetAddress", () => {
 
 describe("buildCameraControllerOptions", () => {
   it("advertises the HomeKit-required crypto suite, H.264 levels, and AAC-ELD + Opus audio", () => {
-    const delegate = new ArgusStreamingDelegate("Backyard Left", "rtsp://x", cacheWith(Buffer.from([0xff, 0xd8])));
+    const delegate = new ArgusStreamingDelegate("Backyard Left", "rtsp://x", cacheWith(Buffer.from([0xff, 0xd8])), { aspect: "16:9" });
     const opts = buildCameraControllerOptions(delegate);
 
     expect(opts.cameraStreamCount).toBe(2);
@@ -305,7 +309,7 @@ describe("buildCameraControllerOptions", () => {
   it("advertises ONLY Baseline H.264 profile for Apple Home compatibility", () => {
     // Field 2026-10-01: High profile with dump_extra → "No Response". Force
     // Baseline advertisement so Home negotiates it (iOS caches profile list).
-    const delegate = new ArgusStreamingDelegate("Backyard Left", "rtsp://x", cacheWith(Buffer.from([0xff, 0xd8])));
+    const delegate = new ArgusStreamingDelegate("Backyard Left", "rtsp://x", cacheWith(Buffer.from([0xff, 0xd8])), { aspect: "16:9" });
     const opts = buildCameraControllerOptions(delegate);
 
     const profiles = opts.streamingOptions.video.codec.profiles;
@@ -316,14 +320,14 @@ describe("buildCameraControllerOptions", () => {
   });
 
   it("advertises ONLY the native resolution in copy mode (mismatch kills the session)", () => {
-    const delegate = new ArgusStreamingDelegate("Backyard Left", "rtsp://x", cacheWith(Buffer.from([0xff, 0xd8])));
+    const delegate = new ArgusStreamingDelegate("Backyard Left", "rtsp://x", cacheWith(Buffer.from([0xff, 0xd8])), { aspect: "16:9" });
     const opts = buildCameraControllerOptions(delegate, true, undefined, { width: 896, height: 512 }, "copy");
 
     expect(opts.streamingOptions.video.resolutions).toEqual([[896, 512, 30]]);
   });
 
   it("defaults to WiFi-friendly resolutions (June working pattern, Oct 2026+)", () => {
-    const delegate = new ArgusStreamingDelegate("Backyard Left", "rtsp://x", cacheWith(Buffer.from([0xff, 0xd8])));
+    const delegate = new ArgusStreamingDelegate("Backyard Left", "rtsp://x", cacheWith(Buffer.from([0xff, 0xd8])), { aspect: "16:9" });
     const opts = buildCameraControllerOptions(delegate, true, undefined, { width: 896, height: 672 }, "transcode");
 
     const resolutions = opts.streamingOptions.video.resolutions.map((r) => `${r[0]}x${r[1]}`);
@@ -336,7 +340,7 @@ describe("buildCameraControllerOptions", () => {
   });
 
   it("restores the small tiers with ARGUS_LIVE_LADDER=compat (client-compat rollback)", () => {
-    const delegate = new ArgusStreamingDelegate("Backyard Left", "rtsp://x", cacheWith(Buffer.from([0xff, 0xd8])));
+    const delegate = new ArgusStreamingDelegate("Backyard Left", "rtsp://x", cacheWith(Buffer.from([0xff, 0xd8])), { aspect: "16:9" });
     process.env.ARGUS_LIVE_LADDER = "compat";
     try {
       const opts = buildCameraControllerOptions(delegate, true, undefined, undefined, "transcode");
@@ -353,7 +357,7 @@ describe("buildCameraControllerOptions", () => {
 describe("ArgusStreamingDelegate", () => {
   it("serves snapshots straight from the SnapshotCache buffer", async () => {
     const jpeg = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0xaa, 0xbb]); // valid JPEG/JFIF signature
-    const delegate = new ArgusStreamingDelegate("Backyard Left", "rtsp://x", cacheWith(jpeg));
+    const delegate = new ArgusStreamingDelegate("Backyard Left", "rtsp://x", cacheWith(jpeg), { aspect: "16:9" });
 
     const buffer = await new Promise<Buffer>((resolve, reject) => {
       delegate.handleSnapshotRequest({ width: 1280, height: 720 } as never, (error, data) => {
@@ -372,7 +376,7 @@ describe("ArgusStreamingDelegate", () => {
       "Backyard Left",
       "rtsp://127.0.0.1:8554/backyard-left-sub",
       cacheWith(Buffer.from([0xff, 0xd8])),
-      { spawnFn },
+      { aspect: "16:9",  spawnFn },
     );
 
     // prepareStream reserves real UDP ports and stores the session.
@@ -424,7 +428,7 @@ describe("ArgusStreamingDelegate", () => {
       "Backyard Left",
       "rtsp://127.0.0.1:8554/backyard-left-sub",
       cacheWith(Buffer.from([0xff, 0xd8])),
-      { spawnFn },
+      { aspect: "16:9",  spawnFn },
     );
 
     await new Promise<void>((resolve, reject) => {
@@ -499,7 +503,7 @@ describe("ArgusStreamingDelegate", () => {
       "Backyard Left",
       "rtsp://127.0.0.1:8554/backyard-left-sub",
       cacheWith(Buffer.from([0xff, 0xd8])),
-      { spawnFn, mainStreamUrl: "rtsp://127.0.0.1:8554/backyard-left" },
+      { aspect: "16:9",  spawnFn, mainStreamUrl: "rtsp://127.0.0.1:8554/backyard-left" },
     );
 
     // Home asks 1280x720; the cap lowers the ENCODE to 854x480, but the SOURCE
@@ -520,7 +524,7 @@ describe("ArgusStreamingDelegate", () => {
       "Backyard Left",
       "rtsp://127.0.0.1:8554/backyard-left-sub",
       cacheWith(Buffer.from([0xff, 0xd8])),
-      { spawnFn, mainStreamUrl: "rtsp://127.0.0.1:8554/backyard-left" },
+      { aspect: "16:9",  spawnFn, mainStreamUrl: "rtsp://127.0.0.1:8554/backyard-left" },
     );
 
     await prepareAndStart(delegate, "s4", { width: 640, height: 360, max_bit_rate: 132 });
@@ -536,7 +540,7 @@ describe("ArgusStreamingDelegate", () => {
       "Backyard Left",
       "rtsp://127.0.0.1:8554/backyard-left-sub",
       cacheWith(Buffer.from([0xff, 0xd8])),
-      { spawnFn },
+      { aspect: "16:9",  spawnFn },
     );
 
     await prepareAndStart(delegate, "s5", { width: 1280, height: 720, max_bit_rate: 2000 });
@@ -558,7 +562,7 @@ describe("ArgusStreamingDelegate", () => {
       "Backyard Left",
       "rtsp://127.0.0.1:8554/backyard-left-sub",
       cacheWith(Buffer.from([0xff, 0xd8])),
-      { spawnFn, mainStreamUrl: "rtsp://127.0.0.1:8554/backyard-left" },
+      { aspect: "16:9",  spawnFn, mainStreamUrl: "rtsp://127.0.0.1:8554/backyard-left" },
     );
 
     await prepareAndStart(delegate, "s6", { width: 640, height: 360, max_bit_rate: 132 });
@@ -586,7 +590,7 @@ describe("ArgusStreamingDelegate", () => {
         "Backyard Left",
         "rtsp://127.0.0.1:8554/backyard-left-sub",
         cacheWith(Buffer.from([0xff, 0xd8])),
-        { spawnFn, verbose: false },
+        { aspect: "16:9",  spawnFn, verbose: false },
       );
       const forceStop = vi.fn();
       delegate.controller = { forceStopStreamingSession: forceStop } as never;
@@ -645,7 +649,7 @@ describe("ArgusStreamingDelegate", () => {
       "Backyard",
       "rtsp://127.0.0.1:8554/backyard-sub",
       cacheWith(Buffer.from([0xff, 0xd8])),
-      { spawnFn, verbose: false },
+      { aspect: "4:3",  spawnFn, verbose: false },
     );
 
     async function start(sessionID: string): Promise<number> {
@@ -717,7 +721,7 @@ describe("ArgusStreamingDelegate", () => {
   it("advertises firmware version 1.3.16 so controllers re-read the 4:3 ladder", () => {
     expect(ARGUS_FIRMWARE_REVISION).toBe("1.3.16");
     const config = parseArgusConfig({
-      cameras: [{ name: "Garage Door", host: "10.0.0.9", channel: 0, mainCodec: "h265",
+      cameras: [{ name: "Garage Door", aspect: "4:3", host: "10.0.0.9", channel: 0, mainCodec: "h265",
         username: "admin", password: "x", transport: "auto", streams: { main: "main", sub: "sub" } }],
       recording: { path: "./rec", retention: { continuous: 3, motion: 7, alerts: 30 } },
       homekit: { pin: "123-45-678" },
@@ -744,6 +748,7 @@ describe("ArgusStreamingDelegate", () => {
       "Test Camera",
       "rtsp://127.0.0.1:8554/test",
       cacheWith(Buffer.from([0xff, 0xd8])),
+      { aspect: "16:9" },
     );
 
     let callbackCount = 0;
@@ -773,6 +778,20 @@ describe("ArgusStreamingDelegate", () => {
     expect(lastResponse).toBeDefined();
     expect(lastResponse?.video).toBeDefined();
     expect(lastResponse?.audio).toBeDefined();
+
+    delegate.prepareStream(
+      {
+        sessionID: "double-call-test",
+        targetAddress: "192.168.1.50",
+        video: { port: 50000, srtp_key: Buffer.alloc(16, 1), srtp_salt: Buffer.alloc(14, 2) },
+        audio: { port: 50002, srtp_key: Buffer.alloc(16, 3), srtp_salt: Buffer.alloc(14, 4) },
+      } as PrepareStreamRequest,
+      () => {
+        callbackCount += 1;
+      },
+    );
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(callbackCount).toBe(1);
   });
 
   it("guarantees prepareStream callback fires on success path", async () => {
@@ -780,6 +799,7 @@ describe("ArgusStreamingDelegate", () => {
       "Test Camera",
       "rtsp://127.0.0.1:8554/test",
       cacheWith(Buffer.from([0xff, 0xd8])),
+      { aspect: "16:9" },
     );
 
     // Normal success: callback should fire with response
@@ -811,6 +831,7 @@ describe("ArgusStreamingDelegate", () => {
       "Test Camera",
       "rtsp://127.0.0.1:8554/test",
       cacheWith(Buffer.from([0xff, 0xd8])),
+      { aspect: "16:9" },
     );
 
     // We can't easily simulate a hung reserveUdpPort in tests without mocking,
@@ -933,7 +954,7 @@ async function ffmpegArgsFor(
     cameraName,
     `rtsp://127.0.0.1:8554/${slug}-sub`,
     cacheWith(Buffer.from([0xff, 0xd8])),
-    { spawnFn, mainStreamUrl: `rtsp://127.0.0.1:8554/${slug}` },
+    { spawnFn, mainStreamUrl: `rtsp://127.0.0.1:8554/${slug}`, aspect: "4:3" },
   );
   await new Promise<void>((resolve, reject) => {
     delegate.prepareStream(
@@ -964,7 +985,9 @@ async function ffmpegArgsFor(
 
 describe("4:3 cameras keep an undistorted live frame", () => {
   it.each(FOUR_BY_THREE_CAMERAS)("%s advertises only a 4:3 box Home has unlocked", (cameraName) => {
-    const delegate = new ArgusStreamingDelegate(cameraName, "rtsp://x", cacheWith(Buffer.from([0xff, 0xd8])));
+    const delegate = new ArgusStreamingDelegate(cameraName, "rtsp://x", cacheWith(Buffer.from([0xff, 0xd8])), {
+      aspect: "4:3",
+    });
     const resolutions = buildCameraControllerOptions(delegate).streamingOptions.video.resolutions;
     expect(resolutions.map((r) => `${r[0]}x${r[1]}`)).toContain("640x480");
     for (const [width, height] of resolutions) {
@@ -1052,7 +1075,7 @@ describe("4:3 cameras keep an undistorted live frame", () => {
       "Garage Door",
       "rtsp://127.0.0.1:8554/garage-door-sub",
       cacheWith(Buffer.from([0xff, 0xd8])),
-      { spawnFn },
+      { aspect: "4:3",  spawnFn },
     );
     try {
       await new Promise<void>((resolve, reject) => {

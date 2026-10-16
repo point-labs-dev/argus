@@ -1,5 +1,6 @@
 cameras:
   - name: Front L
+    aspect: "16:9"
     host: 10.0.0.13
     channel: 2
     mainCodec: h265
@@ -10,6 +11,7 @@ cameras:
       main: main
       sub: sub
   - name: Front R
+    aspect: "16:9"
     host: 10.0.0.13
     channel: 3
     mainCodec: h265
@@ -20,6 +22,7 @@ cameras:
       main: main
       sub: sub
   - name: Garage Door
+    aspect: "4:3"
     host: 10.0.0.21
     channel: 4
     mainCodec: h264

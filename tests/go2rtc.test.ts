@@ -17,6 +17,7 @@ function createCameraConfig(
     cameras: [
       {
         name: "Front Door",
+        aspect: "16:9",
         host: "192.168.1.100",
         channel,
         mainCodec,

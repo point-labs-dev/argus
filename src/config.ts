@@ -9,8 +9,11 @@ const streamProfilesSchema = z.object({
   sub: z.string().trim().min(1, "cameras[].streams.sub is required"),
 });
 
+export const cameraAspectSchema = z.enum(["16:9", "4:3"]);
+
 const cameraSchema = z.object({
   name: z.string().trim().min(1, "cameras[].name is required"),
+  aspect: cameraAspectSchema,
   host: z.string().trim().min(1, "cameras[].host is required"),
   channel: z
     .number()
@@ -67,6 +70,7 @@ const argusConfigSchema = z.object({
   }),
 });
 
+export type CameraAspect = z.infer<typeof cameraAspectSchema>;
 export type CameraTransport = z.infer<typeof transportSchema>;
 export type ArgusConfig = z.infer<typeof argusConfigSchema>;
 export type CameraConfig = ArgusConfig["cameras"][number];
