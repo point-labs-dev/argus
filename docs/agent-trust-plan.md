@@ -4,7 +4,15 @@ Agents copy the file they opened. For live view that file is a firmware diary, a
 
 Peter lands every later PR. This document does not open those PRs, does not merge, and does not deploy. Leave the Mini alone. Leave notification timing alone.
 
-The later program runs `pstack/skills/poteto-mode/playbooks/autopilot-stack.md`. PR-shape, PR-ci, PR-prose, and PR-verify wait until Peter says to start.
+The later program runs `pstack/skills/poteto-mode/playbooks/autopilot-stack.md`. Peter approved the three defaults on 10/16 and asked for the ranked plan as separate pull requests. Each implementation branch starts at current `main`. They are not a stack, and this document does not gain their commits. Merge order stays PR-shape, then PR-ci, then PR-prose, then PR-verify. Peter lands them. No owner merges.
+
+PR-shape and PR-ci both edit `tests/homekit.test.ts`. Merge PR-shape first, then rebase PR-ci onto that result. The stream-setup version of that test is the one to keep, replayed with any type fix that still applies.
+
+`tsconfig.json` stays the emit program, `rootDir` `src`. Including `tests/**/*.ts` there fails with `TS6059`. PR-ci adds `tsconfig.check.json`, which extends the emit config, sets `rootDir` to `.`, emits nothing, and includes `src` and `tests`. The workflow runs both `npx tsc -p tsconfig.json --noEmit` and `npx tsc -p tsconfig.check.json --noEmit`.
+
+PR-prose keeps `LATENCY.md`, `TESTING.md`, and `TELEMETRY-QUICK-REF.md`. Those are the alert-latency notes. The firmware diary deletion stays on PR-shape. A prose branch cut from `main` still contains that diary, and its test does not claim otherwise.
+
+PR-verify names `tests/hap-setup-contract.test.ts` and `scripts/firmware-census.mjs` as the drives. Those files are not on `main`. The skill's own test runs the doctor and the optional-property probe, which exist on that branch.
 
 ## How to read this
 
@@ -33,10 +41,10 @@ Re-read the execution playbook from trunk. Audit the operation against it and fi
 ### Spawn owners
 
 - [ ] Spawn one owner per PR. Each owner builds, pushes, opens a ready PR, and stops at merge-ready. Peter lands it.
-- [ ] Follow this dependency graph. Start dependent work only after its parent merges.
+- [ ] Follow this dependency graph for merge order. Peter required each implementation branch to start at current `main` instead of waiting for its parent to merge.
   - [ ] PR-shape is first and branches from `main`.
-  - [ ] PR-ci and PR-prose both start after PR-shape merges. They are independent of each other.
-  - [ ] PR-verify starts after PR-ci merges.
+  - [ ] PR-ci and PR-prose are next. They do not depend on each other's files. Rebase PR-ci after PR-shape because both edit the HomeKit tests.
+  - [ ] PR-verify is last. Its drives name the contract test and the census, which land in the earlier pull requests.
 - [ ] Hold the file boundaries. PR-shape touches stream setup, camera config, and the homekit tests. It does not touch `src/timing.ts` or `src/recording.ts`. PR-ci touches the workflow and the test files that fail `tsc`. PR-prose touches root markdown and `docs/invariants.md`. PR-verify touches `.cursor/skills/verify-argus/`.
 - [ ] Hold the review gate. PR-shape changes the audio-off answer and the camera config a future deploy will parse. It waits for Peter's review in chat with screenshots and a video before merge. The other three PRs do not change a Home session.
 
@@ -136,7 +144,7 @@ Each live lane runs on its own cloud VM at the PR head. `control-cli` is not ins
 
 - [ ] Create `.github/workflows/ci.yml`.
 - [ ] Edit the test files that fail `tsc` once `tests/**/*.ts` is included. Measured set is `tests/homekit.test.ts`, `tests/go2rtc-api-secrets.test.ts`, `tests/install-launchd.test.ts`, `tests/recording.test.ts`, `tests/snapshot-cache.test.ts`, and `tests/stream-health.test.ts`.
-- [ ] Edit `tsconfig.json` so the CI program typechecks `src` and `tests`.
+- [ ] Leave `tsconfig.json` as the emit program. Add `tsconfig.check.json` so the CI program typechecks `src` and `tests` without moving `dist/`.
 - [ ] Create `scripts/firmware-census.mjs` from the prototype rule. Do not import `src/timing.ts`.
 
 **Build.**
@@ -364,13 +372,13 @@ The prototype folder on this draft branch is not an implementation. Later PRs re
 
 ## Appendix E. Questions for Peter
 
-These are the calls a local run cannot settle. The default is what later owners should build unless you say otherwise.
+Peter approved all three defaults on 10/16. The opened pull requests follow them.
 
-The firmware gate fails a bump when the ladder, profiles, and codecs are unchanged. That marks 12 of the 15 PR 3 steps, plus the bumps in PR 5 and PR 6. A bump that changes the ladder still passes, which includes the `1.3.12` step whose field note says Home kept asking for 720p anyway. Tell me if you still want a bump when the advertisement is unchanged.
+The firmware gate fails a bump when the ladder, profiles, and codecs are unchanged. That marks 12 of the 15 PR 3 steps, plus the bumps in PR 5 and PR 6. A bump that changes the ladder still passes, which includes the `1.3.12` step whose field note says Home kept asking for 720p anyway.
 
-`aspect` becomes required on every camera, and a missing field fails config parse. The name set is deleted in that same PR. The Mini is not restarted here. The next deploy you approve will refuse to boot until that yaml has `aspect`. Tell me if you want the four current names to keep working until you have edited the Mini yaml yourself.
+`aspect` becomes required on every camera, and a missing field fails config parse. The name set is deleted in that same PR. The Mini is not restarted here. The next deploy Peter approves will refuse to boot until that yaml has `aspect`. The stream-setup pull request lists the key and the value for each camera.
 
-The prose PR deletes root markdown files that are one-off field fixes or deploy checklists, and it keeps `README.md`, `SPEC.md`, `LEARNINGS.md`, `PROJECT.md`, `progress/`, `scenarios/`, and `docs/`. Tell me the name of any root note you still follow and it stays.
+The prose PR deletes root markdown files that are one-off field fixes or deploy checklists, and it keeps `README.md`, `SPEC.md`, `LEARNINGS.md`, `PROJECT.md`, `progress/`, `scenarios/`, and `docs/`. It also keeps `LATENCY.md`, `TESTING.md`, and `TELEMETRY-QUICK-REF.md`, because those are the alert-latency notes and this program does not touch that work.
 
 ## Appendix F. Links and reading list
 
