@@ -4,15 +4,17 @@ Agents copy the file they opened. For live view that file is a firmware diary, a
 
 Peter lands every later PR. This document does not open those PRs, does not merge, and does not deploy. Leave the Mini alone. Leave notification timing alone.
 
-The later program runs `pstack/skills/poteto-mode/playbooks/autopilot-stack.md`. Peter approved the three defaults on 10/16 and asked for the ranked plan as separate pull requests. Each implementation branch starts at current `main`. They are not a stack, and this document does not gain their commits. Merge order stays PR-shape, then PR-ci, then PR-prose, then PR-verify. Peter lands them. No owner merges.
+The later program runs `pstack/skills/poteto-mode/playbooks/autopilot-stack.md`. Peter approved the three defaults on 10/16. The implementation pull requests are a stack so the check runs on every head before anything merges. PR-shape is the base and targets `main`. PR-ci, PR-prose, and PR-verify target the PR-shape branch. This document does not gain their commits. Merge order stays PR-shape, then PR-ci, then PR-prose, then PR-verify. Peter lands them. No owner merges.
 
-PR-shape and PR-ci both edit `tests/homekit.test.ts`. Merge PR-shape first, then rebase PR-ci onto that result. The stream-setup version of that test is the one to keep, replayed with any type fix that still applies.
+PR-shape carries the base workflow: ffmpeg, the go2rtc binary the loopback test already expects, `npx tsc -p tsconfig.json --noEmit`, and `npx vitest run`. The runner has no ffmpeg. Without it the crop checks throw `ENOENT`, and `scripts/install-launchd.sh` exits 1 with empty stderr because `command -v ffmpeg` fails under `set -e` before the plist is written. PR-ci adds the census step and `npx tsc -p tsconfig.check.json --noEmit` on top of that same workflow. PR-prose and PR-verify do not edit the workflow. They run the base check.
 
-`tsconfig.json` stays the emit program, `rootDir` `src`. Including `tests/**/*.ts` there fails with `TS6059`. PR-ci adds `tsconfig.check.json`, which extends the emit config, sets `rootDir` to `.`, emits nothing, and includes `src` and `tests`. The workflow runs both `npx tsc -p tsconfig.json --noEmit` and `npx tsc -p tsconfig.check.json --noEmit`.
+PR-shape and PR-ci both edit `tests/homekit.test.ts`. PR-ci is rebased on PR-shape. The stream-setup version of that test is the one kept, with the type fixes that still apply.
 
-PR-prose keeps `LATENCY.md`, `TESTING.md`, and `TELEMETRY-QUICK-REF.md`. Those are the alert-latency notes. The firmware diary deletion stays on PR-shape. A prose branch cut from `main` still contains that diary, and its test does not claim otherwise.
+`tsconfig.json` stays the emit program, `rootDir` `src`. Including `tests/**/*.ts` there fails with `TS6059`. PR-ci adds `tsconfig.check.json`, which extends the emit config, sets `rootDir` to `.`, emits nothing, and includes `src` and `tests`.
 
-PR-verify names `tests/hap-setup-contract.test.ts` and `scripts/firmware-census.mjs` as the drives. Those files are not on `main`. The skill's own test runs the doctor and the optional-property probe, which exist on that branch.
+PR-prose keeps `LATENCY.md`, `TESTING.md`, and `TELEMETRY-QUICK-REF.md`. Those are the alert-latency notes. The firmware diary deletion stays on PR-shape.
+
+PR-verify names `tests/hap-setup-contract.test.ts` and `scripts/firmware-census.mjs` as the drives. The contract test is on PR-shape. The census script is on PR-ci. The skill's own test runs the doctor and the optional-property probe.
 
 ## How to read this
 
@@ -41,10 +43,10 @@ Re-read the execution playbook from trunk. Audit the operation against it and fi
 ### Spawn owners
 
 - [ ] Spawn one owner per PR. Each owner builds, pushes, opens a ready PR, and stops at merge-ready. Peter lands it.
-- [ ] Follow this dependency graph for merge order. Peter required each implementation branch to start at current `main` instead of waiting for its parent to merge.
-  - [ ] PR-shape is first and branches from `main`.
-  - [ ] PR-ci and PR-prose are next. They do not depend on each other's files. Rebase PR-ci after PR-shape because both edit the HomeKit tests.
-  - [ ] PR-verify is last. Its drives name the contract test and the census, which land in the earlier pull requests.
+- [ ] Follow this dependency graph for merge order. The opened pull requests are stacked on PR-shape so each head contains the workflow.
+  - [ ] PR-shape is first, branches from `main`, and carries the base workflow.
+  - [ ] PR-ci and PR-prose target PR-shape. PR-ci adds the census steps. PR-prose does not edit the workflow.
+  - [ ] PR-verify targets PR-shape and runs the base check. Its drives name the contract test and the census, which land in the earlier pull requests.
 - [ ] Hold the file boundaries. PR-shape touches stream setup, camera config, and the homekit tests. It does not touch `src/timing.ts` or `src/recording.ts`. PR-ci touches the workflow and the test files that fail `tsc`. PR-prose touches root markdown and `docs/invariants.md`. PR-verify touches `.cursor/skills/verify-argus/`.
 - [ ] Hold the review gate. PR-shape changes the audio-off answer and the camera config a future deploy will parse. It waits for Peter's review in chat with screenshots and a video before merge. The other three PRs do not change a Home session.
 
