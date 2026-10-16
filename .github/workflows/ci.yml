@@ -1,0 +1,35 @@
+name: ci
+
+on:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: Install go2rtc
+        run: |
+          mkdir -p /tmp/argus-go2rtc
+          curl -fsSL -o /tmp/argus-go2rtc/go2rtc https://github.com/AlexxIT/go2rtc/releases/download/v1.9.14/go2rtc_linux_amd64
+          chmod +x /tmp/argus-go2rtc/go2rtc
+
+      - name: Typecheck src
+        run: npx tsc -p tsconfig.json --noEmit
+
+      - name: Test
+        run: npx vitest run
