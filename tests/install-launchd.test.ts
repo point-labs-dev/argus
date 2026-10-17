@@ -9,7 +9,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import path from "node:path";
+import * as path from "node:path";
 import { describe, expect, it } from "vitest";
 
 const CANONICAL_DAEMON_PLIST = "/Library/LaunchDaemons/dev.point-labs.argus.plist";
@@ -192,7 +192,7 @@ describe("install-launchd daemon plist", () => {
       expect(env.ARGUS_INSTALL_RENDER_ONLY).toBeUndefined();
       expect(env.ARGUS_INSTALL_ROOT).toBeUndefined();
       expect(env.ARGUS_AGENT_PLIST).toBeUndefined();
-      expect(env.PATH.split(":")[0]).toBe(path.dirname(process.execPath));
+      expect(env.PATH?.split(":")[0]).toBe(path.dirname(process.execPath));
       expect(existsSync(launchctlLog)).toBe(false);
       expect(existsSync(CRED_FILE)).toBe(false);
     } finally {

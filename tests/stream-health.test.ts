@@ -1,7 +1,7 @@
 import { execFileSync, spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import path from "node:path";
+import * as path from "node:path";
 import { beforeAll, describe, expect, it } from "vitest";
 
 const PASSWORD = "fixture-camera-secret-do-not-print";

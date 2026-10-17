@@ -153,7 +153,9 @@ describe("buildRecordingOptions", () => {
   it("offers fragmented MP4, the required resolutions, and AAC-LC audio", () => {
     const opts = buildRecordingOptions();
     expect(opts.prebufferLength).toBeGreaterThanOrEqual(4000);
-    expect(opts.mediaContainerConfiguration.type).toBe(0); // FRAGMENTED_MP4
+    const container = opts.mediaContainerConfiguration;
+    const containerType = Array.isArray(container) ? container[0]?.type : container.type;
+    expect(containerType).toBe(0);
     const resolutions = opts.video.resolutions.map((r) => `${r[0]}x${r[1]}`);
     expect(resolutions).toContain("1920x1080");
     expect(resolutions).toContain("1280x720");

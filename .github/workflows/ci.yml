@@ -33,5 +33,13 @@ jobs:
       - name: Typecheck src
         run: npx tsc -p tsconfig.json --noEmit
 
+      - name: Typecheck src and tests
+        run: npx tsc -p tsconfig.check.json --noEmit
+
       - name: Test
         run: npx vitest run
+
+      - name: Firmware census
+        env:
+          CENSUS_BASE: ${{ github.event.pull_request.base.sha }}
+        run: node scripts/firmware-census.mjs
