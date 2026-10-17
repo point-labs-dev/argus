@@ -4,7 +4,7 @@ Agents copy the file they opened. For live view that file is a firmware diary, a
 
 Peter lands every later PR. This document does not open those PRs, does not merge, and does not deploy. Leave the Mini alone. Leave notification timing alone.
 
-The later program runs `pstack/skills/poteto-mode/playbooks/autopilot-stack.md`. Peter approved the three defaults on 10/16. The implementation pull requests are a stack so the check runs on every head before anything merges. PR-shape is the base and targets `main`. PR-ci, PR-prose, and PR-verify target the PR-shape branch. This document does not gain their commits. Merge order stays PR-shape, then PR-ci, then PR-prose, then PR-verify. Peter lands them. No owner merges.
+The later program runs `pstack/skills/poteto-mode/playbooks/autopilot-stack.md`. Peter approved the three defaults on 10/16. The implementation pull requests are a stack so the check runs on every head before anything merges. PR-shape is the base and targets `main`. Outside QA on 10/17 split the Home session changes out of PR-shape. PR-shape requires `aspect` and stays behavior-neutral otherwise. A separate behavior-change pull request, for Peter's review, omits audio from the prepareStream answer when audio is off, returns from a duplicate prepareStream without calling the HAP callback, and requires delegate aspect. That pull request targets PR-shape. PR-ci targets the behavior pull request. PR-prose targets PR-ci. PR-verify targets PR-prose. This document does not gain their commits. Merge order is PR-shape, then the behavior pull request, then PR-ci, then PR-prose, then PR-verify. Peter lands them. No owner merges.
 
 PR-shape carries the base workflow: ffmpeg, the go2rtc binary the loopback test already expects, `npx tsc -p tsconfig.json --noEmit`, and `npx vitest run`. The runner has no ffmpeg. Without it the crop checks throw `ENOENT`, and `scripts/install-launchd.sh` exits 1 with empty stderr because `command -v ffmpeg` fails under `set -e` before the plist is written. PR-ci adds the census step and `npx tsc -p tsconfig.check.json --noEmit` on top of that same workflow. PR-prose and PR-verify do not edit the workflow. They run the base check.
 
@@ -14,7 +14,9 @@ PR-shape and PR-ci both edit `tests/homekit.test.ts`. PR-ci is rebased on PR-sha
 
 PR-prose keeps `LATENCY.md`, `TESTING.md`, and `TELEMETRY-QUICK-REF.md`. Those are the alert-latency notes. The firmware diary deletion stays on PR-shape.
 
-PR-verify names `tests/hap-setup-contract.test.ts` and `scripts/firmware-census.mjs` as the drives. The contract test is on PR-shape. The census script is on PR-ci. The skill's own test runs the doctor and the optional-property probe.
+PR-verify names `tests/hap-setup-contract.test.ts` and `scripts/firmware-census.mjs` as the drives. The contract test is on PR-shape. The audio-off answer and the required delegate are on the behavior pull request. The census script is on PR-ci, and PR-verify depends on that pull request. The skill's own test runs the doctor and the optional-property probe. The doctor checks camera aspect and that audio-off does not still advertise a codec. The timing check uses a temp copy and does not edit `src/timing.ts`.
+
+Home Manager's read-only `ffprobe` on the Mini at about 8:00 PM ET on 2026-10-16 is the aspect list. Credentials stay redacted. Garage Door, Backyard, and Backyard Right are `4:3` (main 2560x1920). Backyard Left is `16:9` (main 3840x2160). Front L and Front R are `16:9` (main 4512x2512). Doorbell is `4:3`, inferred and unverified, because it was unreachable. The record is `docs/camera-health.md` and `docs/aspect-migration.md` on PR-shape. Garage Door's main in that record is 2560x1920.
 
 ## How to read this
 
@@ -43,12 +45,13 @@ Re-read the execution playbook from trunk. Audit the operation against it and fi
 ### Spawn owners
 
 - [ ] Spawn one owner per PR. Each owner builds, pushes, opens a ready PR, and stops at merge-ready. Peter lands it.
-- [ ] Follow this dependency graph for merge order. The opened pull requests are stacked on PR-shape so each head contains the workflow.
-  - [ ] PR-shape is first, branches from `main`, and carries the base workflow.
-  - [ ] PR-ci and PR-prose target PR-shape. PR-ci adds the census steps. PR-prose does not edit the workflow.
-  - [ ] PR-verify targets PR-shape and runs the base check. Its drives name the contract test and the census, which land in the earlier pull requests.
-- [ ] Hold the file boundaries. PR-shape touches stream setup, camera config, and the homekit tests. It does not touch `src/timing.ts` or `src/recording.ts`. PR-ci touches the workflow and the test files that fail `tsc`. PR-prose touches root markdown and `docs/invariants.md`. PR-verify touches `.cursor/skills/verify-argus/`.
-- [ ] Hold the review gate. PR-shape changes the audio-off answer and the camera config a future deploy will parse. It waits for Peter's review in chat with screenshots and a video before merge. The other three PRs do not change a Home session.
+- [ ] Follow this dependency graph for merge order. The opened pull requests are a stack so each head contains the workflow.
+  - [ ] PR-shape is first, branches from `main`, and carries the base workflow. It requires aspect and does not change the prepareStream answer.
+  - [ ] The behavior pull request targets PR-shape. It is the audio-off answer, the duplicate prepareStream, and required delegate aspect.
+  - [ ] PR-ci targets the behavior pull request and adds the census steps. PR-prose targets PR-ci and does not edit the workflow.
+  - [ ] PR-verify targets PR-prose. Its census drive depends on PR-ci.
+- [ ] Hold the file boundaries. PR-shape touches stream setup, camera config, and the homekit tests. It does not touch `src/timing.ts` or `src/recording.ts`. The behavior pull request touches the prepareStream answer and the delegate options. PR-ci touches the workflow and the test files that fail `tsc`. PR-prose touches root markdown and `docs/invariants.md`. PR-verify touches `.cursor/skills/verify-argus/`.
+- [ ] Hold the review gate. PR-shape changes the camera config a future deploy will parse. The behavior pull request changes a Home session and waits for Peter's review before merge. The other three PRs do not change a Home session.
 
 ### PR mechanics, for every PR
 
@@ -364,7 +367,7 @@ Splitting types and module boundaries into two PRs was rejected. The answer buil
 
 PR-shape can change a future boot. Required `aspect` makes a Mini yaml without that field fail parse. This plan does not deploy, so the running Mini stays on its current build. The risk lands only when Peter deploys a build that includes PR-shape. Appendix E states the default and the override.
 
-PR-shape audio-off omission matches `hap-nodejs` `0.14.3` only when the codec list is empty, because that is when the library sets video-only mode. If audio is advertised and the response omits audio, the library throws. The owner must keep those two sides together. The happy path stays audio-on.
+The behavior pull request's audio-off omission matches `hap-nodejs` `0.14.3` only when the codec list is empty, because that is when the library sets video-only mode. If audio is advertised and the response omits audio, the library throws. The owner must keep those two sides together. The happy path stays audio-on. PR-shape still returns audio when audio is off.
 
 PR-ci's widened `tsc` fails today with 18 errors. The PR includes those fixes. They are type fixes in tests, and the owner must not change assertions just to silence a code.
 
@@ -378,7 +381,7 @@ Peter approved all three defaults on 10/16. The opened pull requests follow them
 
 The firmware gate fails a bump when the ladder, profiles, and codecs are unchanged. That marks 12 of the 15 PR 3 steps, plus the bumps in PR 5 and PR 6. A bump that changes the ladder still passes, which includes the `1.3.12` step whose field note says Home kept asking for 720p anyway.
 
-`aspect` becomes required on every camera, and a missing field fails config parse. The name set is deleted in that same PR. The Mini is not restarted here. The next deploy Peter approves will refuse to boot until that yaml has `aspect`. The stream-setup pull request lists the key and the value for each camera.
+`aspect` becomes required on every camera, and a missing field fails config parse. The name set is deleted in that same PR. The Mini is not restarted here. The next deploy Peter approves will refuse to boot until that yaml has `aspect`. The stream-setup pull request lists the key and the value for each camera from the 2026-10-16 `ffprobe`. Doorbell stays `4:3` and is marked unverified.
 
 The prose PR deletes root markdown files that are one-off field fixes or deploy checklists, and it keeps `README.md`, `SPEC.md`, `LEARNINGS.md`, `PROJECT.md`, `progress/`, `scenarios/`, and `docs/`. It also keeps `LATENCY.md`, `TESTING.md`, and `TELEMETRY-QUICK-REF.md`, because those are the alert-latency notes and this program does not touch that work.
 
