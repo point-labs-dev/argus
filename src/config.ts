@@ -27,6 +27,10 @@ const cameraSchema = z.object({
   password: z.string().min(1, "cameras[].password is required"),
   transport: transportSchema,
   streams: streamProfilesSchema,
+  // Off when omitted. GetAiState then stays on `host`. When set, only GetAiState
+  // uses this host, on channel 0, with this camera's username and password.
+  // Video and GetMdState stay on `host`.
+  directAiHost: z.string().trim().min(1, "cameras[].directAiHost must not be empty").optional(),
 });
 
 const retentionSchema = z.object({

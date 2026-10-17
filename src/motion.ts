@@ -1,7 +1,10 @@
 import type { CameraConfig } from "./config.js";
-import { ReolinkClient } from "./reolink.js";
+import { ReolinkClient, type ReolinkClientOptions } from "./reolink.js";
 import { emitTelemetry } from "./telemetry.js";
 import { emitTiming } from "./timing.js";
+
+/** Standalone cameras report AI on channel 0. The NVR channel stays on GetMdState. */
+const DIRECT_AI_CHANNEL = 0;
 
 // Polls each camera's Reolink motion state and reports edges (on/off) with a
 // cooldown, so a brief gap in detection doesn't flap the HomeKit motion sensor.
@@ -16,11 +19,15 @@ export interface MotionMonitorOptions {
   fetch?: typeof fetch;
   now?: () => number;
   onError?: (cameraName: string, error: Error) => void;
+  /** Test seam. Production uses `new ReolinkClient`. */
+  createClient?: (options: ReolinkClientOptions) => ReolinkClient;
 }
 
 interface CameraState {
   camera: CameraConfig;
   client: ReolinkClient;
+  /** Present only when cameras[].directAiHost is set. GetAiState only. */
+  directAi: ReolinkClient | undefined;
   detected: boolean;
   lastMotionAt: number;
 }
@@ -43,18 +50,23 @@ export class MotionMonitor {
     this.cooldownMs = options.cooldownMs ?? 30_000;
     this.now = options.now ?? (() => Date.now());
     this.onError = options.onError;
-    this.states = cameras.map((camera) => ({
-      camera,
-      client: new ReolinkClient({
-        host: camera.host,
+    const createClient = options.createClient ?? ((clientOptions: ReolinkClientOptions) => new ReolinkClient(clientOptions));
+    this.states = cameras.map((camera) => {
+      const shared = {
         username: camera.username,
         password: camera.password,
         ...(options.fetch ? { fetch: options.fetch } : {}),
         ...(options.now ? { now: options.now } : {}),
-      }),
-      detected: false,
-      lastMotionAt: 0,
-    }));
+      };
+      const directAiHost = camera.directAiHost;
+      return {
+        camera,
+        client: createClient({ host: camera.host, ...shared }),
+        directAi: directAiHost === undefined ? undefined : createClient({ host: directAiHost, ...shared }),
+        detected: false,
+        lastMotionAt: 0,
+      };
+    });
   }
 
   public start(): void {
@@ -84,10 +96,20 @@ export class MotionMonitor {
     }
   }
 
+  private async readActive(state: CameraState): Promise<boolean> {
+    if (!state.directAi) {
+      return state.client.getMotionState(state.camera.channel);
+    }
+    if (await state.client.getMdState(state.camera.channel)) {
+      return true;
+    }
+    return state.directAi.getAiState(DIRECT_AI_CHANNEL);
+  }
+
   private async pollCamera(state: CameraState): Promise<void> {
     let active: boolean;
     try {
-      active = await state.client.getMotionState(state.camera.channel);
+      active = await this.readActive(state);
     } catch (error) {
       this.onError?.(state.camera.name, error instanceof Error ? error : new Error(String(error)));
       return;
