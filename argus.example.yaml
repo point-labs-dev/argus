@@ -13,8 +13,10 @@ cameras:
   # and docs/aspect-migration.md). Copy these into argus.yaml before the next deploy.
   #   Garage Door: "4:3"       main 2560x1920, sub 640x480
   #   Backyard: "4:3"          main 2560x1920 ~18.8fps, sub 640x480 15fps
-  #   Backyard Right: "4:3"    main 2560x1920 25fps, sub 640x480
-  #   Doorbell: "4:3"          unverified — DHCP unreachable, not measured; inferred
+  #   Backyard Right: "4:3"    size not settled. 2026-10-16 summary says
+  #                            2560x1920 / 640x480. attempt-005 and LEARNINGS say
+  #                            NVR add-on, 896x512 sub, 12MP HEVC main.
+  #   Doorbell: "4:3"          inferred, not measured. DHCP unreachable.
   #   Backyard Left: "16:9"    main 3840x2160 hevc, sub 640x360
   #   Front L: "16:9"          main 4512x2512 hevc 25fps, sub 896x512
   #   Front R: "16:9"          main 4512x2512 hevc 25fps, sub 896x512
@@ -37,10 +39,10 @@ cameras:
     aspect: "16:9"          # measured 4512x2512 main, 896x512 sub. "16:9" pads. "4:3" crops.
     host: 192.168.1.113     # the NVR's IP
     channel: 2              # NVR channel (RTSP path becomes h264Preview_03_*)
-    mainCodec: h264         # the TRUE codec of the channel's main stream — probe it!
-                            # 12MP D-series channels encode HEVC: set h265 (the NVR
-                            # path name stays h264Preview_*, but FLV main must be
-                            # skipped or the stream delivers nothing)
+    mainCodec: h265         # progress/attempt-003.md: Front L's main is HEVC
+                            # (hevc 4512x2512 on the h264Preview path). h264 sent
+                            # the FLV main first and the recording source hung.
+                            # The path name stays h264Preview_*; FLV main is skipped.
     username: admin
     password: change-me
     transport: auto

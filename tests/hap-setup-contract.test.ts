@@ -193,6 +193,47 @@ describe("HAP setup contract", () => {
     delegate.handleStreamRequest({ type: "stop", sessionID: "garage-wire" } as never, () => {});
   });
 
+  it("wires a parsed 16:9 camera into an 854x480 pad", async () => {
+    const camera = parseArgusConfig(configBody("16:9", "Front L")).cameras[0];
+    if (!camera) throw new Error("missing camera");
+    const spawnFn = vi.fn(() => Object.assign(new EventEmitter(), { kill: vi.fn() }));
+    const { delegate } = createCameraAccessory(
+      camera,
+      "rtsp://127.0.0.1:8554/front-l-sub",
+      "rtsp://127.0.0.1:8554/front-l",
+      cache(),
+      {
+        spawnFn: spawnFn as never,
+        verbose: false,
+        mainStreamUrl: "rtsp://127.0.0.1:8554/front-l",
+      },
+    );
+    const ladder = buildCameraControllerOptions(delegate).streamingOptions.video.resolutions.map(
+      (row) => `${row[0]}x${row[1]}`,
+    );
+    expect(ladder).toEqual(["854x480", "640x480", "640x360"]);
+    await new Promise<void>((resolve, reject) => {
+      delegate.prepareStream(streamRequest("front-l-wire"), (error) => (error ? reject(error) : resolve()));
+    });
+    await new Promise<void>((resolve, reject) => {
+      delegate.handleStreamRequest(
+        {
+          type: "start",
+          sessionID: "front-l-wire",
+          video: { pt: 99, max_bit_rate: 132, fps: 30, mtu: 1378, profile: 0, level: 2, width: 854, height: 480 },
+          audio: { pt: 110, sample_rate: 24, max_bit_rate: 24, codec: AudioStreamingCodecType.AAC_ELD },
+        } as never,
+        (error) => (error ? reject(error) : resolve()),
+      );
+    });
+    const args = (spawnFn as unknown as { mock: { calls: [string, string[]][] } }).mock.calls[0]?.[1];
+    if (!args) throw new Error("ffmpeg was not spawned");
+    const vf = args[args.indexOf("-vf") + 1];
+    expect(vf).toContain("pad=854:480");
+    expect(vf).not.toContain("crop=");
+    delegate.handleStreamRequest({ type: "stop", sessionID: "front-l-wire" } as never, () => {});
+  });
+
   it("advertises from aspect, not from the camera name", () => {
     const wideGarage = new ArgusStreamingDelegate("Garage Door", "rtsp://x", cache(), { aspect: "16:9" });
     const wide = buildCameraControllerOptions(wideGarage).streamingOptions.video.resolutions.map(

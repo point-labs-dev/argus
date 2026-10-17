@@ -68,13 +68,26 @@ Home Manager ran a read-only `ffprobe` on the Mini at about 8:00 PM ET on 2026-1
 |---|---|---|---|
 | Garage Door | 2560x1920, h264 High, AAC-LC 16k | 640x480 | 4:3 |
 | Backyard | 2560x1920, about 18.8 fps | 640x480, 15 fps | 4:3 |
-| Backyard Right | 2560x1920, 25 fps | 640x480 | 4:3 |
+| Backyard Right | not settled. Summary said 2560x1920, 25 fps. attempt-005 says 12MP HEVC | not settled. Summary said 640x480. attempt-005 and LEARNINGS say 896x512 | 4:3 from the 2026-10-16 summary only |
 | Backyard Left | 3840x2160, hevc Main, `h265Preview` path | 640x360 | 16:9 |
 | Front L | 4512x2512, hevc Main, 25 fps | 896x512 (1.75) | 16:9 from the main |
 | Front R | 4512x2512, hevc Main, 25 fps | 896x512 (1.75) | 16:9 from the main |
-| Doorbell | not measured, DHCP unreachable | not measured | 4:3 inferred, unverified |
+| Doorbell | not measured | not measured | 4:3 inferred, not measured |
 
-Garage Door's main is 2560x1920. The stream-check sample above uses that size. Backyard Right's 2560x1920 main is the reading that settles the older notes about that camera.
+Garage Door's main is 2560x1920. The stream-check sample above uses that size.
+
+Backyard Right is not settled. The 2026-10-16 summary row said main 2560x1920 at 25 fps and sub 640x480. `progress/attempt-005.md` (2026-06-12) says Front L, Front R, and Backyard Right are NVR add-on cameras whose probed sub is 896x512 and whose main is 12MP HEVC. `LEARNINGS.md` (2026-06-11) says the NVR ext/sub map is 896x512 for 16:9 and 896x672 for 4:3, and that on NVR channels ext and sub are the same stream. The aspect value in `docs/aspect-migration.md` stays the summary's `4:3` until the raw probe below is filled in. The summary is not a substitute for that probe.
+
+Doorbell did not answer. Its `4:3` is inferred and was not measured.
+
+## Raw ffprobe
+
+Home Manager will paste the redacted `ffprobe -show_streams` output here. This file does not contain that output.
+
+```text
+# placeholder: redacted ffprobe -show_streams
+# Home Manager supplies this. Do not invent stream lines.
+```
 
 ## LaunchAgent or LaunchDaemon
 
