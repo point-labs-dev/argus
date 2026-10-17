@@ -28,6 +28,7 @@ function createConfig(apiPort: number): ArgusConfig {
     cameras: [
       {
         name: "Front Door",
+        aspect: "16:9",
         host: "192.0.2.1",
         channel: 0,
         username: "fixture-user",

@@ -158,6 +158,7 @@ describe("timing call sites", () => {
     const config = parseArgusConfig({
       cameras: [{
         name: "Garage Door",
+        aspect: "4:3",
         host: "10.0.0.7",
         channel: 0,
         mainCodec: "h264",
@@ -251,6 +252,7 @@ describe("timing call sites", () => {
     const config = parseArgusConfig({
       cameras: [{
         name: "Garage Door",
+        aspect: "4:3",
         host: "10.0.0.7",
         channel: 0,
         mainCodec: "h264",
@@ -275,7 +277,7 @@ describe("timing call sites", () => {
       "Garage Door",
       "rtsp://admin:s3cret-pass@10.0.0.8/sub",
       cache,
-      { spawnFn, verbose: false },
+      { spawnFn, verbose: false, aspect: "4:3" },
     );
 
     const text = await captureTiming(async () => {

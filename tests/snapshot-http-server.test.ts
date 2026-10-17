@@ -15,6 +15,7 @@ function createConfig() {
     cameras: [
       {
         name: "Front Door",
+        aspect: "16:9",
         host: "192.168.1.100",
         channel: 0,
         username: "user",
@@ -27,6 +28,7 @@ function createConfig() {
       },
       {
         name: "Backyard Right",
+        aspect: "4:3",
         host: "192.168.1.101",
         channel: 1,
         username: "user",

@@ -8,6 +8,7 @@ const PASSWORD = "fixture-camera-secret-do-not-print";
 
 const CONFIG = `cameras:
   - name: Backyard Left
+    aspect: "16:9"
     host: 192.0.2.10
     channel: 0
     username: admin
@@ -17,6 +18,7 @@ const CONFIG = `cameras:
       main: main
       sub: sub
   - name: Front L
+    aspect: "16:9"
     host: 192.0.2.11
     channel: 2
     username: admin

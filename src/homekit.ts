@@ -81,7 +81,7 @@ import {
   uuid,
 } from "hap-nodejs";
 
-import type { CameraConfig } from "./config.js";
+import type { CameraAspect, CameraConfig } from "./config.js";
 import { ArgusRecordingDelegate, buildRecordingOptions } from "./recording.js";
 import type { SnapshotCache, SnapshotProfile } from "./snapshot-cache.js";
 import { emitTelemetry } from "./telemetry.js";
@@ -110,17 +110,6 @@ export interface SrtpParameters {
   /** base64 of the 16-byte key + 14-byte salt that FFmpeg encrypts the outbound stream with. */
   videoParams: string;
   audioParams: string;
-}
-
-const FOUR_BY_THREE_CAMERAS = new Set([
-  "Garage Door",
-  "Backyard",
-  "Doorbell",
-  "Backyard Right",
-]);
-
-export function isFourByThreeCamera(cameraName: string): boolean {
-  return FOUR_BY_THREE_CAMERAS.has(cameraName);
 }
 
 export function redactFfmpegArgsForLog(args: readonly string[]): string {
@@ -176,8 +165,8 @@ export interface LiveFfmpegInput {
     level: string;
     srtpParams: string;
   };
-  cropToFill?: boolean;
-    audio: {
+  aspect: CameraAspect;
+  audio: {
       port: number;
       localRtcpPort: number;
       ssrc: number;
@@ -286,7 +275,7 @@ export function buildLiveFfmpegArgs(input: LiveFfmpegInput, includeAudio = true)
           "-pix_fmt", "yuv420p",
           "-color_range", "tv",
           "-r", String(video.fps),
-          "-vf", input.cropToFill
+          "-vf", input.aspect === "4:3"
             ? `scale=${boxWidth}:${boxHeight}:force_original_aspect_ratio=increase:force_divisible_by=2,crop=${boxWidth}:${boxHeight},setsar=1`
             : `scale=${boxWidth}:${boxHeight}:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=${boxWidth}:${boxHeight}:(ow-iw)/2:(oh-ih)/2`,
           "-bf", "0",
@@ -508,6 +497,8 @@ export interface StreamingDelegateOptions {
   bindAddress?: string;
   /** Injectable spawn for tests. */
   spawnFn?: typeof spawn;
+  /** Crop (`4:3`) or pad (`16:9`). Defaults to `16:9` when a caller builds a delegate directly. */
+  aspect?: CameraAspect;
 }
 
 /**
@@ -523,6 +514,7 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
   private readonly ffmpegPath: string;
   private readonly verbose: boolean;
   private readonly includeAudio: boolean;
+  public readonly aspect: CameraAspect;
   private readonly videoMode: "copy" | "transcode";
   private readonly mainStreamUrl?: string;
   private readonly bindAddress?: string;
@@ -539,6 +531,7 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
     this.ffmpegPath = options.ffmpegPath ?? "ffmpeg";
     this.verbose = options.verbose ?? true;
     this.includeAudio = options.includeAudio ?? true;
+    this.aspect = options.aspect ?? "16:9";
     this.videoMode = options.videoMode ?? "transcode";
     if (options.mainStreamUrl !== undefined) this.mainStreamUrl = options.mainStreamUrl;
     if (options.bindAddress !== undefined) this.bindAddress = options.bindAddress;
@@ -649,7 +642,7 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
           srtp_salt: request.audio.srtp_salt,
         },
       };
-      
+
       answer(undefined, response);
     } catch (error) {
       answer(error instanceof Error ? error : new Error(String(error)));
@@ -838,7 +831,7 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
       inputUrl: plan.policy.source.streamUrl,
       targetAddress: prepared.targetAddress,
       videoMode: this.videoMode,
-      ...(isFourByThreeCamera(this.cameraName) ? { cropToFill: true } : {}),
+      aspect: this.aspect,
       video: {
         port: prepared.video.port,
         localRtcpPort: prepared.video.localRtcpPort,
@@ -1073,7 +1066,7 @@ export function buildCameraControllerOptions(
     [480, 270, 30],
     [320, 240, 15],
   ];
-  const fourByThree = isFourByThreeCamera(delegate.cameraName);
+  const fourByThree = delegate.aspect === "4:3";
   const resolutions: [number, number, number][] =
     videoMode === "copy" && liveResolution
       ? [[liveResolution.width, liveResolution.height, 30]]
@@ -1126,170 +1119,6 @@ export function buildCameraControllerOptions(
   };
 }
 
-/**
- * Advertised accessory firmware version — the controller cache-buster. iOS
- * pins camera streaming profiles hard: a manual configVersion bump alone did
- * NOT make a paired iPhone re-read the resolution list (measured 2026-06-12:
- * c#=8 visible in mDNS for 12h, phone still requested the long-removed
- * 640x360). Controllers DO refresh accessory metadata on a firmware update,
- * and HAP-NodeJS auto-bumps c# when this increases (it tracks
- * lastFirmwareVersion in AccessoryInfo for exactly that). BUMP THIS whenever
- * the advertised streaming configuration changes.
- * 
- * 2026-10-02 (1.3.0): Video-only interim path. A/V sync attempts failed.
- * Video-only unlocks picture. ARGUS_AUDIO=0 needs firmware bump for iOS
- * to honor video-only (empty codecs).
- * 
- * 2026-10-02 (1.3.1): Force Baseline H.264 profile. Changed advertised profiles
- * from [BASELINE, MAIN, HIGH] to [BASELINE] only. Field evidence: High with
- * dump_extra → "No Response"; forcing Baseline as Home-friendly unlock path.
- * Firmware bump required: iOS caches profile list, won't re-read without it.
- * 
- * 2026-10-02 (1.3.2): Fix video-only prepareStream response. In video-only mode,
- * omit audio from prepareStream response so Home doesn't wait for audio packets
- * that will never arrive. This was causing "No Response" despite healthy video.
- * Also add flush_packets and max_delay for immediate RTP transmission.
- * 
- * 2026-10-02 (1.3.3): Fix RTCP keepalive for HomeKit stream liveness. Changed
- * ffmpeg SRTP URL from localrtcpport to localrtpport. HomeKit requires RTCP
- * packets to keep streams alive (30-second timeout). localrtcpport alone left
- * RTP on a random port, breaking RTCP correlation. Field evidence: video-only
- * streams ran exactly 30s (~900 frames) then "No Response" — HomeKit's RTCP
- * timeout. Same root cause as Home Assistant PR #99989 and Ring issue #479.
- * FIELD TEST RESULT (2026-10-02 ~05:20 ET): Fix did NOT unlock picture.
- * 
- * 2026-10-02 (1.3.4): Remove localrtpport for bidirectional RTCP. The localrtpport
- * parameter bound the port we told HomeKit we're listening on (prepareStream response),
- * preventing HomeKit from sending RTCP back to us. Removed localrtpport entirely,
- * following homebridge-camera-ffmpeg pattern (let ffmpeg choose random source ports).
- * This allows proper bidirectional RTCP communication. Field hypothesis: HomeKit
- * expects to send Receiver Reports / NACKs back and kills streams when it can't.
- * FIELD TEST RESULT (2026-10-02 ~05:35 ET): Fix did NOT unlock picture.
- * 
- * 2026-10-02 (1.3.5): Complete camera-ffmpeg return-port pattern + CBR encoding.
- * PRIMARY: Node dgram binds advertised prepareStream video/audio return ports and
- * handles incoming RTCP from Home (Receiver Reports, NACKs). 1.3.4 had clean SRTP
- * URL but no socket owner → Home's RTCP targeted dead port. Field evidence: route
- * lookup + UDP probe → en0 (dual-NIC weakened); still no picture. Switch encoder
- * from CRF+maxrate to CBR (-b:v) matching camera-ffmpeg/HA stacks. Belt-and-suspenders:
- * localaddr pins ffmpeg egress to HAP-advertised IP; prepareStream addressOverride.
- * FIELD TEST RESULT (2026-10-02 ~10:51 ET): iOS Home shows "No Response" but logs
- * from BEFORE restart (10:33) show old pkt_size=564 + video-only. Suspected: iOS
- * cached accessory as video-only from earlier firmware; needs cache refresh.
- * 
- * 2026-10-02 (1.3.6): Force iOS cache refresh for audio advertisement. Firmware bump
- * triggers iOS to re-query accessory capabilities. Previous deploys set ARGUS_AUDIO=1
- * but iOS negotiated video-only (cached metadata from video-only test builds). This
- * bump + accessory info change forces re-read of audio codec advertisement.
- * FIELD TEST RESULT (2026-10-02 ~11:02 ET): Firmware bump alone did NOT unlock. Field
- * logs show "This callback function has already been called" in prepareStreamAsync →
- * no live_session_start → "No Response". Root cause: async error after callback.
- * 
- * 2026-10-02 (1.3.7): Fix prepareStreamAsync double-callback race. prepareStreamAsync
- * called HAP callback on success (line 588), but if async error (e.g., delayed promise
- * rejection from reserveUdpPort) occurred afterward, catch block called callback again
- * → HAP-NodeJS "already called" guard → prepareStream fails → no session → "No Response".
- * Fix: Guard callback with answered flag (pattern from spawnLive). Prevents double-call
- * even if async errors fire after initial success. Field evidence: KeepAlive restart
- * concurrent with Home open likely triggered the race.
- * FIELD TEST RESULT (2026-10-02 ~11:18 ET): 1.3.7 fixed double-callback but NO
- * live_session_start still. HAP warning: "Setup Endpoints didn't respond at all" +
- * "was slow to respond". Root cause: answered flag correct but callback never invoked.
- * 
- * 2026-10-02 (1.3.8): Fix Setup Endpoints callback never-called paths. Two bugs:
- * (1) reserveUdpPort() can hang forever if socket bind/close callbacks stall under
- * load (HEVC/HKSV noise) → prepareStreamAsync awaits forever → HAP callback never
- * invoked → "didn't respond at all". Fix: 2s timeout on reserveUdpPort rejects promise
- * → catch block fires → callback(error) properly invoked. (2) answer() guard had silent
- * path: if called with (undefined, undefined), neither if branch fires → callback never
- * called. Fix: else clause invokes callback(error) explaining the logic bug. Together
- * these ensure HAP callback ALWAYS fires (success, error, or timeout) within 2s.
- * FIELD TEST RESULT (2026-10-02 ~11:37 ET): 1.3.8 timeout/guard did NOT fix hang.
- * "Setup Endpoints didn't respond" still appears. Critically: timeout NEVER logged in
- * field → reserveUdpPort completes within 2s → hang is elsewhere. Root cause clarified:
- * Setup Endpoints hang is NEW (Oct 1.3.7-1.3.8 only) — zero prior OpenClaw docs before
- * this line. June working path had NO callback guard. Theory: guard/wrapper itself blocks.
- * 
- * 2026-10-02 (1.3.9): Revert to pre-1.3.7 direct callback pattern. Root cause: 1.3.7-1.3.8
- * callback guard/timeout introduced the Setup Endpoints hang (NEW bug, not in June working
- * code or firmware 1.3.6). Reverting to firmware 1.3.6 prepareStreamAsync pattern: direct
- * callback invocation in try/catch, NO answered flag guard, NO reserveUdpPort timeout.
- * June 2026 (917bc8e) had this simple pattern + Garage Door confirmed working. Matches
- * historical proven HAP live path: controller SRTP key/salt echoed, simple callback semantics.
- * FIELD TEST RESULT (2026-10-02 ~11:54 ET): Process CRASHED exit 1. Double-callback error
- * returned in HKSV path → HAP-NodeJS throws → process dies → MacBook click hit dead/restarting
- * process → instant "No Response". Reverting guard brought back the race that 1.3.7 fixed.
- * 
- * 2026-10-02 (1.3.10): Guard + June simple pattern. Root cause: need BOTH (1) callback guard
- * to prevent double-call crash AND (2) June simple logic without complex spreads/conditionals
- * that might throw. 1.3.7-1.3.8 had guard but complex response building (addressOverride spread,
- * conditional audio, resolveSrtpTargetAddress) that likely threw before reaching callback →
- * Setup Endpoints silent. 1.3.9 had simple logic but no guard → double-callback crash. Fix:
- * restore guard (answered flag with logging) + keep June 917bc8e simple pattern (always audio,
- * plain targetAddress, no spreads). Theory: simple code reaches callback; guard prevents crash.
- * FIELD TEST RESULT (2026-10-02 ~12:04 ET): prepareStream/once-safe WORKS! live_session_start,
- * AAC-eld 24kHz negotiated, pkt_size=1316, RTCP bound. Then crash: getaddrinfo ENOTFOUND en0.
- * Root cause: socket.bind(port, "en0") tries DNS lookup on interface name → ENOTFOUND.
- * 
- * 2026-10-02 (1.3.11): Resolve interface names to IP addresses. Root cause: socket.bind() second
- * parameter must be IP address (e.g. "10.0.0.46"), NOT interface name (e.g. "en0"). Node.js
- * dgram.bind(port, address) treats address as hostname and does DNS getaddrinfo → ENOTFOUND if
- * given interface name. Fix: getHapBindAddress() now validates ARGUS_HAP_BIND; if it looks like
- * interface name (not dotted-decimal IP), resolves to IP via networkInterfaces()[name]. Field
- * evidence: "addr en0" in logs → socket.bind(port, "en0") → DNS lookup → ENOTFOUND → exit 1.
- * Preserves 1.3.10 once-safe guard + June simple pattern that proved AAC-eld/1316/live_session_start.
- * FIELD TEST RESULT (2026-10-02 ~12:13 ET): Crash/ENOTFOUND FIXED! PID stable, Bound RTCP with IP,
- * live_session_start, first_frame +1.3s, AAC-eld, pkt_size=1316, clean encode on Mini. BUT MacBook
- * Home still "No Response" after 16-20s spinner. Root cause: post-negotiate Mac accept failure —
- * 1280x720@30 negotiated but Home never unlocks. RTCP bidirectional BROKEN: one video pkt at +0.5s,
- * NO audio RTCP, nothing after first_frame. Home waits ~30s then kills session. This is the June
- * WiFi spinner problem (c5b368c working: cap 640x480; then Garage Door 854x480).
- * 
- * 2026-10-02 (1.3.12): Cap live resolution for WiFi accept (June working pattern). Root cause:
- * MacBook Home negotiates 1280x720@30 but never unlocks picture despite healthy encode/first_frame/
- * AAC-eld. RTCP starvation observed: one video return pkt, no audio RTCP, nothing after first_frame
- * → Home waits 30s → kills session → "No Response". June working path (c5b368c) capped resolution
- * at 640x480 for WiFi reliability, then Garage Door at 854x480. Theory: 720p over WiFi to MacBook
- * exceeds Home's accept threshold for RTCP/delivery; caps force lower bandwidth negotiation. Fix:
- * buildCameraControllerOptions now defaults to "wifi" ladder [854x480, 640x480, 640x360] instead
- * of "hires" [1920x1080, 1280x720]. ARGUS_LIVE_LADDER env var overrides: "hires" (pre-Oct behavior),
- * "wifi" (default Oct+), "compat" (full ladder down to 320x240). Preserves once-safe + iface→IP.
- * FIELD TEST RESULT (2026-10-02 ~12:30 ET): wifi ladder default was INSUFFICIENT. Despite code
- * change + FirmwareRevision bump + configVersion bump (Garage 21→23), MacBook Backyard STILL
- * negotiated 1280x720@30 (three sessions all 720p). Home cached stream configs ignore new ladder.
- * Sessions aborted faster (+2.3s / +1.3s / +0.4s SIGKILL vs 1.3.11 ~30s). WiFi ladder not effective.
- * 
- * 2026-10-02 (1.3.13): Force resolution clamp in startStream (defensive cap). Root cause: changing
- * buildCameraControllerOptions wifiSet default insufficient — Home's cached stream configs still
- * advertise hires, ignore new ladder. MacBook continues negotiating 1280x720 despite code changes.
- * Defensive fix: cap resolution in handleStreamRequest START even when Home asks 720p. Force
- * maxWidth=854 (June Garage Door working pattern) regardless of negotiation. ARGUS_LIVE_CAP env
- * var overrides (default 854). Logs show "asked=1280x720 CAPPED→854x480" when clamping. Ensures
- * encode never exceeds WiFi accept threshold even if Home cached stale high-res capabilities.
- * 
- * 2026-10-02 (1.3.14): Restore LAN bitrate floors + preserve 1.3.13 unlocks (PRIMARY QUALITY FIX).
- * - Restored d094a53 LAN floors: 720p→2000k, 1080p→3000k, tiles→600k (vs 1.3.13's 299k mush)
- * - Preserves 1.3.13 unlocks: AAC-ELD, once-safe prepareStream, getHapBindAddress, wifi ladder, localaddr RTCP
- * - Sharpness delta: 600k@854×480 >> 299k@854×480 (1.3.13 soft video + choppy audio)
- * - Requires ARGUS_LIVE_MAIN_SOURCE=1 in Mini plist (standalone ≥720p from main stream)
- * - CAP=854 is temporary safety; target stage: hires ladder + raise/remove CAP (not clamp-as-product)
- * 
- * 2026-10-03 (1.3.15): Live quality + fast start. Four verified-in-code fixes:
- * (1) Source selection now follows the PRE-cap ask (planLiveSession): with CAP=854 the
- *     old >=1280 post-cap check made MAIN unreachable even with ARGUS_LIVE_MAIN_SOURCE=1,
- *     so full-screen upscaled the <=640-wide sub (the 1.3.14 softness; True Backyard
- *     never left backyard-sub). Asks >640 wide now source MAIN when granted; tiles stay sub.
- * (2) RECONFIGURE applies the same cap+plan as START (it previously bypassed the cap —
- *     a 720p upgrade encoded the uncapped envelope the cap exists to prevent).
- * (3) RTCP silence no longer forceStops sessions: field shows Home paints with at most
- *     ONE receiver report, so the lone packet armed a 30s timer that killed healthy
- *     sessions. Return sockets stay bound (+ bind errors no longer crash the process,
- *     + video/audio RTCP ports reserved as a pair so they can't collide).
- * (4) HKSV fragments deliver the moment they complete (hold-one-back removed: init
- *     segment +4.3s→+0.04s, first video +8.3s→+4.2s, measured) and recording input
- *     analysis drops 1s→200ms. New hksv_first_fragment telemetry for field measurement.
- * No advertised-config change (ladder/profiles/audio identical to 1.3.14).
- */
 export const ARGUS_FIRMWARE_REVISION = "1.3.16";
 
 export interface CameraAccessoryHandle {
@@ -1323,7 +1152,10 @@ export function createCameraAccessory(
   // Whether live ≥720p sessions may source the main restream is the caller's call
   // (serve grants it to standalone cameras only — the NVR mains' 4s GOP + 12MP
   // HEVC decode cannot meet the live start-time bar; recording still uses them).
-  const delegate = new ArgusStreamingDelegate(camera.name, liveUrl, snapshots, options);
+  const delegate = new ArgusStreamingDelegate(camera.name, liveUrl, snapshots, {
+    ...options,
+    aspect: camera.aspect,
+  });
   // HKSV recording delegate records the full-res MAIN stream on motion.
   const recordingDelegate = new ArgusRecordingDelegate(camera.name, mainUrl, {
     ...(options.ffmpegPath ? { ffmpegPath: options.ffmpegPath } : {}),

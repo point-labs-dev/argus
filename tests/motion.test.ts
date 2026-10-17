@@ -24,7 +24,7 @@ function fakeReolink(getState: () => number) {
 
 function oneCameraConfig() {
   return parseArgusConfig({
-    cameras: [{ name: "Garage Door", host: "10.0.0.7", channel: 0, mainCodec: "h264",
+    cameras: [{ name: "Garage Door", aspect: "4:3", host: "10.0.0.7", channel: 0, mainCodec: "h264",
       username: "admin", password: "x", transport: "auto", streams: { main: "main", sub: "sub" } }],
     recording: { path: "./rec", retention: { continuous: 3, motion: 7, alerts: 30 } },
     homekit: { pin: "123-45-678" },

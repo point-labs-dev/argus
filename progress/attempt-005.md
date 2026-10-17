@@ -45,17 +45,24 @@ quality fix was also the latest start-time win. Sender-side start is now
 sub-second across all tiers.
 
 ## The NVR question (Peter asked: do the 3 have to go through it?)
-Yes — hardware, not configuration. Front L, Front R, Backyard Right are
+Yes — hardware, not configuration. Front L, Front R, and Backyard Right are
 Reolink "add-on" (NVR-kit, D-series) cameras: no UID, no direct RTSP/HTTP
 network identity (verified 2026-06-10: empty-UID signature + subnet sweep
-found no direct IPs). The NVR is irreducibly their source, and its limits are
-their ceiling: 896x512 sub @1024k max (probed), keyframe every 4s (gop
-stripped), mains 12MP HEVC — so their full-screen is an upscaled 896 and
-always ~2–4s slower to start. **The unification path is replacing those 3
-with standalone Reolink models (RLC-5xx/8xx class, anything with a UID);**
-the NVR can still RECORD them as IP channels afterwards, same as the plan for
-the other 4. Until then, expect the front cameras + Backyard Right to look a
-tier below the standalone four.
+found no direct IPs). The NVR is irreducibly their source.
+
+This note originally gave all three the same ceiling: an 896x512 sub and a
+12MP HEVC main. That mixed channels. The 2026-10-16 `ffprobe -show_streams`
+key fields (raw file held by Home Manager) put the 4512x2512 HEVC 25 fps main
+and the 896x512 sub on Front L and Front R (`Preview_03` and `Preview_04`).
+Backyard Right is the D500 on `h264Preview_07` channel 6: main 2560x1920 h264
+at 25 fps, sub 640x480. Front L and Front R full-screen still upscales an
+896-wide sub. Backyard Right's sub is 640x480.
+
+**The unification path is replacing those 3 with standalone Reolink models
+(RLC-5xx/8xx class, anything with a UID);** the NVR can still RECORD them as
+IP channels afterwards, same as the plan for the other 4. Until then, expect
+the front cameras to look a tier below the standalone four because their live
+view upscales the 896 sub.
 
 ## Watch items
 - 4K/12MP main stills every ~15s: bigger HomeKit snapshot payloads (0.5–1.3MB

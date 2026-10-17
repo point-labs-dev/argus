@@ -107,8 +107,12 @@ fallback; RTSP path style by device class) instead of today's one-size bare-URL 
   rejects what the table offers). Measure with ffprobe, don't trust ranges.
 - **Stream map:** ext/balanced = 896x512 (16:9) / 896x672 (4:3), ~2.0s keyframes,
   NOT API-configurable, FLV-only on standalone cams; fluent = ≤640x480,
-  configurable. On NVR channels ext==sub. go2rtc `-sub` (FLV-ext first) is
-  therefore 896-wide everywhere — above the old 640x480 cap for free.
+  configurable. On NVR channels ext==sub. The 2026-06-11 note said go2rtc
+  `-sub` is 896-wide on every NVR channel. That mixed channels. The 2026-10-16
+  `ffprobe -show_streams` key fields (raw file held by Home Manager) put the
+  4512x2512 HEVC main and the 896x512 sub on Front L and Front R (`Preview_03`
+  and `Preview_04`). Backyard Right, the D500 on `h264Preview_07` channel 6,
+  is 2560x1920 h264 at 25 fps with a 640x480 sub.
 - **go2rtc `preload:` (v1.9.14+) is the warm-stream answer.** Producers otherwise
   die with their last consumer and every live tap pays a 1–3s cold camera
   connect. With preload + gop tuning + 0.2s FFmpeg input analysis (copy mode),

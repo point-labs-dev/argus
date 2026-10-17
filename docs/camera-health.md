@@ -29,7 +29,7 @@ Stdout looks like:
 
 ```text
 stream_count=14
-garage-door	UP	h264,2560,1440
+garage-door	UP	h264,2560,1920
 garage-door-sub	UP	h264,640,480
 …
 up_count=14
@@ -59,6 +59,82 @@ Home Manager ran the read-only check on the Mini against `git b1de4c4` (firmware
 | Backyard Right | NVR RLN8-410 channel, recorded 24/7 | up |
 
 Expect 14 go2rtc names if those seven names are unchanged: `garage-door` and `garage-door-sub`, and the same `name` / `name-sub` pair for the other six (lowercase, spaces become hyphens). A different `argus.yaml` produces different names. The script prints the live names.
+
+## Measured frames (2026-10-16)
+
+Home Manager ran a read-only `ffprobe -show_streams` on the Mini on 2026-10-16, with Peter's OK. Credentials stay redacted. Audio on every stream below is AAC-LC 16k. The raw file is held by Home Manager. This note records the key fields only.
+
+| Camera | Main | Sub | Aspect |
+|---|---|---|---|
+| Garage Door | 2560x1920, AAC-LC 16k | 640x480, AAC-LC 16k | 4:3 |
+| Doorbell (Reolink Video Doorbell PoE) | 2560x1920, h264 High, 20 fps, AAC-LC 16k. Measured | 640x480, AAC-LC 16k. Measured | 4:3 |
+| Backyard (RLC-520A) | 2560x1920, AAC-LC 16k | 640x480, AAC-LC 16k | 4:3 |
+| Backyard Right (D500, NVR `h264Preview_07`, ch6) | 2560x1920, h264, 25 fps, AAC-LC 16k | 640x480, AAC-LC 16k | 4:3 |
+| Backyard Left | 3840x2160, HEVC, AAC-LC 16k | 640x360, AAC-LC 16k | 16:9 |
+| Front L (`Preview_03`) | 4512x2512, HEVC, 25 fps, AAC-LC 16k | 896x512, AAC-LC 16k | 16:9 |
+| Front R (`Preview_04`) | 4512x2512, HEVC, 25 fps, AAC-LC 16k | 896x512, AAC-LC 16k | 16:9 |
+
+Garage Door's main is 2560x1920. The stream-check sample above uses that size.
+
+The 12MP HEVC main and 896x512 sub belong to Front L and Front R (`Preview_03` and `Preview_04`). An earlier note had put that pair on Backyard Right. That was a channel mix-up. Backyard Right is the D500 on `h264Preview_07` channel 6: 2560x1920 h264 at 25 fps, sub 640x480. `progress/attempt-005.md` and `LEARNINGS.md` are corrected to say that.
+
+Doorbell is a Reolink Video Doorbell PoE. It was measured at 4:3.
+
+### Garage Door main
+
+2560x1920. Aspect 4:3. AAC-LC 16k.
+
+### Garage Door sub
+
+640x480. AAC-LC 16k.
+
+### Doorbell main
+
+Reolink Video Doorbell PoE. 2560x1920, h264 High, 20 fps. Aspect 4:3. AAC-LC 16k. Measured.
+
+### Doorbell sub
+
+640x480. AAC-LC 16k. Measured.
+
+### Backyard main
+
+RLC-520A. 2560x1920. Aspect 4:3. AAC-LC 16k.
+
+### Backyard sub
+
+640x480. AAC-LC 16k.
+
+### Backyard Right main
+
+D500. NVR `h264Preview_07`, channel 6. 2560x1920, h264, 25 fps. Aspect 4:3. AAC-LC 16k.
+
+### Backyard Right sub
+
+640x480. AAC-LC 16k.
+
+### Backyard Left main
+
+3840x2160, HEVC. Aspect 16:9. AAC-LC 16k.
+
+### Backyard Left sub
+
+640x360. AAC-LC 16k.
+
+### Front L main
+
+`Preview_03`. 4512x2512, HEVC, 25 fps. Aspect 16:9. AAC-LC 16k.
+
+### Front L sub
+
+896x512. AAC-LC 16k.
+
+### Front R main
+
+`Preview_04`. 4512x2512, HEVC, 25 fps. Aspect 16:9. AAC-LC 16k.
+
+### Front R sub
+
+896x512. AAC-LC 16k.
 
 ## LaunchAgent or LaunchDaemon
 

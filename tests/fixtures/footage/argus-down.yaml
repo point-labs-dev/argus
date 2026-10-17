@@ -1,5 +1,6 @@
 cameras:
   - name: Backyard
+    aspect: "4:3"
     host: 10.0.0.8
     channel: 0
     mainCodec: h264
