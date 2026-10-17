@@ -2,8 +2,13 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 cd "$ROOT"
-if git diff --name-only origin/main -- src/timing.ts | grep -q .; then
+TIMING_FILE="${ARGUS_TIMING_FILE:-src/timing.ts}"
+if ! git show origin/main:src/timing.ts | cmp -s - "$TIMING_FILE"; then
   echo "doctor=fail timing.ts differs from origin/main"
+  exit 1
+fi
+if ! node .cursor/skills/verify-argus/check-cameras.mjs; then
+  echo "doctor=fail camera config"
   exit 1
 fi
 npx tsc -p tsconfig.json --noEmit
