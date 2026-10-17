@@ -48,7 +48,7 @@ function withTelemetry(run: () => void): string[] {
 
 describe("buildRecordingFfmpegArgs", () => {
   it("produces ONE fMP4 output with BOTH video and audio (no -an/-vn)", () => {
-    const args = buildRecordingFfmpegArgs("rtsp://127.0.0.1:8554/garage-door", recordingConfig());
+    const args = buildRecordingFfmpegArgs("rtsp://127.0.0.1:8554/garage-door", recordingConfig(), "16:9");
     const joined = args.join(" ");
 
     // The classic bug: -an + -vn on a single output yields an empty mux ("Invalid argument").
@@ -62,7 +62,7 @@ describe("buildRecordingFfmpegArgs", () => {
   });
 
   it("maps the negotiated profile/level/resolution and fragment keyframes", () => {
-    const joined = buildRecordingFfmpegArgs("rtsp://x/main", recordingConfig()).join(" ");
+    const joined = buildRecordingFfmpegArgs("rtsp://x/main", recordingConfig(), "16:9").join(" ");
     expect(joined).toContain("-profile:v high"); // profile 2
     expect(joined).toContain("-level 4.0"); // level 2
     expect(joined).toContain("scale=1280:720");
@@ -72,7 +72,7 @@ describe("buildRecordingFfmpegArgs", () => {
   });
 
   it("caps input analysis at the measured 200ms floor (recording-start latency)", () => {
-    const joined = buildRecordingFfmpegArgs("rtsp://x/main", recordingConfig()).join(" ");
+    const joined = buildRecordingFfmpegArgs("rtsp://x/main", recordingConfig(), "16:9").join(" ");
     expect(joined).toContain("-analyzeduration 200000");
     expect(joined).toContain("-probesize 500000");
   });
@@ -109,7 +109,7 @@ describe("ArgusRecordingDelegate", () => {
     const stdout = new PassThrough();
     const fakeProc = Object.assign(new EventEmitter(), { stdout, stderr: new PassThrough(), kill: vi.fn() });
     const spawnFn = vi.fn(() => fakeProc) as unknown as typeof import("node:child_process").spawn;
-    const delegate = new ArgusRecordingDelegate("Cam", "rtsp://x/main", { spawnFn, verbose: false });
+    const delegate = new ArgusRecordingDelegate("Cam", "rtsp://x/main", { spawnFn, verbose: false, aspect: "16:9" });
     delegate.updateRecordingConfiguration(recordingConfig() as never);
 
     stdout.write(mp4Box("ftyp", Buffer.from("isom")));
@@ -136,7 +136,7 @@ describe("ArgusRecordingDelegate", () => {
     const stdout = new PassThrough();
     const fakeProc = Object.assign(new EventEmitter(), { stdout, stderr: new PassThrough(), kill: vi.fn() });
     const spawnFn = vi.fn(() => fakeProc) as unknown as typeof import("node:child_process").spawn;
-    const delegate = new ArgusRecordingDelegate("Cam", "rtsp://x/main", { spawnFn, verbose: false });
+    const delegate = new ArgusRecordingDelegate("Cam", "rtsp://x/main", { spawnFn, verbose: false, aspect: "16:9" });
     delegate.updateRecordingConfiguration(recordingConfig() as never);
 
     const t0 = Date.now();
@@ -163,7 +163,7 @@ describe("ArgusRecordingDelegate", () => {
     const stdout = new PassThrough();
     const fakeProc = Object.assign(new EventEmitter(), { stdout, stderr: new PassThrough(), kill: vi.fn() });
     const spawnFn = vi.fn(() => fakeProc) as unknown as typeof import("node:child_process").spawn;
-    const delegate = new ArgusRecordingDelegate("Cam", "rtsp://x/main", { spawnFn, verbose: false });
+    const delegate = new ArgusRecordingDelegate("Cam", "rtsp://x/main", { spawnFn, verbose: false, aspect: "16:9" });
     delegate.updateRecordingConfiguration(recordingConfig() as never);
 
     const t0 = Date.now();
@@ -201,9 +201,9 @@ describe("ArgusRecordingDelegate", () => {
   it("pads ffmpeg output when the delegate is constructed with 4:3", async () => {
     const stdout = new PassThrough();
     const fakeProc = Object.assign(new EventEmitter(), { stdout, stderr: new PassThrough(), kill: vi.fn() });
-    const spawnFn = vi.fn(() => fakeProc) as unknown as typeof import("node:child_process").spawn;
+    const spawnFn = vi.fn((..._args: unknown[]) => fakeProc);
     const delegate = new ArgusRecordingDelegate("Backyard", "rtsp://127.0.0.1:8554/backyard", {
-      spawnFn,
+      spawnFn: spawnFn as unknown as typeof import("node:child_process").spawn,
       verbose: false,
       aspect: "4:3",
     });
@@ -211,8 +211,8 @@ describe("ArgusRecordingDelegate", () => {
 
     const generator = delegate.handleRecordingStreamRequest(1);
     const pending = generator.next();
-    const args = spawnFn.mock.calls[0]?.[1] as string[];
-    expect(videoFilter(args)).toBe(PAD_1920);
+    const args = spawnFn.mock.calls[0]?.[1] as string[] | undefined;
+    expect(videoFilter(args ?? [])).toBe(PAD_1920);
     stdout.end();
     await generator.return(undefined);
     await pending.catch(() => undefined);

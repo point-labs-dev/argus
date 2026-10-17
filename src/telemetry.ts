@@ -18,7 +18,9 @@ export type TelemetryEventType =
   | "live_session_first_frame"
   | "hksv_recording_start"
   | "hksv_first_fragment"
-  | "hksv_recording_stop";
+  | "hksv_recording_stop"
+  | "hksv_recording_close"
+  | "hksv_recording_active";
 
 export interface TelemetryEvent {
   timestamp: number;

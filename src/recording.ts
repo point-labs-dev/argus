@@ -13,9 +13,11 @@ import {
   VideoCodecType,
 } from "hap-nodejs";
 
+import type { CameraAspect } from "./config.js";
 import { readFragmentedMp4 } from "./mp4.js";
 import { emitTelemetry } from "./telemetry.js";
 import { emitTiming } from "./timing.js";
+import { buildAspectScaleFilter } from "./video-filter.js";
 
 const PROFILE_TO_X264: Record<number, string> = {
   [H264Profile.BASELINE]: "baseline",
@@ -35,6 +37,70 @@ const SAMPLERATE_TO_HZ: Record<number, number> = {
   [AudioRecordingSamplerate.KHZ_44_1]: 44100,
   [AudioRecordingSamplerate.KHZ_48]: 48000,
 };
+
+/** HAP HDSProtocolSpecificErrorReason values, logged as short stable names. */
+const CLOSE_REASON_NAMES: Readonly<Record<number, string>> = {
+  0: "normal",
+  1: "not_allowed",
+  2: "busy",
+  3: "cancelled",
+  4: "unsupported",
+  5: "unexpected_failure",
+  6: "timeout",
+  7: "bad_data",
+  8: "protocol_error",
+  9: "invalid_configuration",
+};
+
+const SECRET_REASON = /srtp|password|rtsp:\/\/|token/i;
+
+function scalarCloseReason(value: unknown): string | undefined {
+  if (typeof value === "string") return value;
+  if (typeof value === "boolean") return value ? "true" : "false";
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return CLOSE_REASON_NAMES[value] ?? String(value);
+  }
+  return undefined;
+}
+
+function closeReasonText(reason: unknown): string {
+  if (reason == null) return "connection_closed";
+  const scalar = scalarCloseReason(reason);
+  if (scalar !== undefined) return scalar;
+  if (reason instanceof Error) {
+    const fromCode = scalarCloseReason((reason as { code?: unknown }).code);
+    if (fromCode !== undefined) return fromCode;
+    return reason.message || reason.name || "error";
+  }
+  if (typeof reason === "object") {
+    const record = reason as Record<string, unknown>;
+    const fromCode = scalarCloseReason(record.code);
+    if (fromCode !== undefined) return fromCode;
+    const fromReason = scalarCloseReason(record.reason);
+    if (fromReason !== undefined) return fromReason;
+    if (typeof record.name === "string" && record.name.length > 0) return record.name;
+    return "object";
+  }
+  return "unknown";
+}
+
+/** Short close reason safe for stderr. Never returns secrets or the raw object. */
+function sanitizeRecordingCloseReason(reason: unknown): string {
+  try {
+    const text = closeReasonText(reason);
+    if (text.length > 200 || SECRET_REASON.test(text)) return "redacted";
+    return text;
+  } catch {
+    return "redacted";
+  }
+}
+
+function requireAspect(aspect: unknown, label: string): CameraAspect {
+  if (aspect !== "16:9" && aspect !== "4:3") {
+    throw new Error(`${label} requires aspect "16:9" or "4:3"`);
+  }
+  return aspect;
+}
 
 /** Recording options Argus offers to HomeKit (resolutions cover the required set). */
 export function buildRecordingOptions(): CameraRecordingOptions {
@@ -79,7 +145,12 @@ export function buildRecordingOptions(): CameraRecordingOptions {
  * view, recording uses the full-res MAIN stream (transcoded H.264 + AAC-LC), with
  * keyframes aligned to the fragment length so each fragment starts on an IDR.
  */
-export function buildRecordingFfmpegArgs(mainUrl: string, config: CameraRecordingConfiguration): string[] {
+export function buildRecordingFfmpegArgs(
+  mainUrl: string,
+  config: CameraRecordingConfiguration,
+  aspect: CameraAspect,
+): string[] {
+  const sourceAspect = requireAspect(aspect, "buildRecordingFfmpegArgs");
   const [width, height, fps] = config.videoCodec.resolution;
   const params = config.videoCodec.parameters;
   const profile = PROFILE_TO_X264[params.profile] ?? "high";
@@ -110,7 +181,13 @@ export function buildRecordingFfmpegArgs(mainUrl: string, config: CameraRecordin
     "-pix_fmt", "yuv420p",
     "-color_range", "tv",
     "-r", String(fps),
-    "-vf", `scale=${width}:${height}`,
+    "-vf", buildAspectScaleFilter({
+      width,
+      height,
+      aspect: sourceAspect,
+      fit: "pad",
+      bareScaleWhenMatched: true,
+    }),
     "-b:v", `${params.bitRate}k`,
     "-maxrate", `${params.bitRate}k`,
     "-bufsize", `${2 * params.bitRate}k`,
@@ -133,6 +210,7 @@ export interface RecordingDelegateOptions {
   ffmpegPath?: string;
   verbose?: boolean;
   spawnFn?: typeof spawn;
+  aspect: CameraAspect;
 }
 
 /**
@@ -148,19 +226,23 @@ export class ArgusRecordingDelegate implements CameraRecordingDelegate {
   private readonly ffmpegPath: string;
   private readonly verbose: boolean;
   private readonly spawnFn: typeof spawn;
+  private readonly aspect: CameraAspect;
 
   public constructor(
     private readonly cameraName: string,
     private readonly mainUrl: string,
-    options: RecordingDelegateOptions = {},
+    options: RecordingDelegateOptions,
   ) {
+    this.aspect = requireAspect(options?.aspect, "ArgusRecordingDelegate");
     this.ffmpegPath = options.ffmpegPath ?? "ffmpeg";
     this.verbose = options.verbose ?? true;
     this.spawnFn = options.spawnFn ?? spawn;
   }
 
   public updateRecordingActive(active: boolean): void {
+    if (this.active === active) return;
     this.active = active;
+    emitTelemetry(this.cameraName, "hksv_recording_active", { active });
   }
 
   public updateRecordingConfiguration(configuration: CameraRecordingConfiguration | undefined): void {
@@ -179,7 +261,7 @@ export class ArgusRecordingDelegate implements CameraRecordingDelegate {
     });
     emitTiming({ stage: "recording_start", camera: this.cameraName, streamId });
 
-    const args = buildRecordingFfmpegArgs(this.mainUrl, config);
+    const args = buildRecordingFfmpegArgs(this.mainUrl, config, this.aspect);
     if (this.verbose) {
       process.stderr.write(`[argus ${this.cameraName}] HKSV recording ${config.videoCodec.resolution.join("x")} -> ffmpeg ${args.join(" ")}\n`);
     }
@@ -220,8 +302,15 @@ export class ArgusRecordingDelegate implements CameraRecordingDelegate {
     }
   }
 
-  public closeRecordingStream(streamId: number, _reason: unknown): void {
-    this.processes.get(streamId)?.kill("SIGKILL");
-    this.processes.delete(streamId);
+  public closeRecordingStream(streamId: number, reason: unknown): void {
+    try {
+      this.processes.get(streamId)?.kill("SIGKILL");
+      this.processes.delete(streamId);
+    } finally {
+      emitTelemetry(this.cameraName, "hksv_recording_close", {
+        streamId,
+        reason: sanitizeRecordingCloseReason(reason),
+      });
+    }
   }
 }
