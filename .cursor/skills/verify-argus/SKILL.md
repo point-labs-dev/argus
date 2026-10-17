@@ -25,7 +25,7 @@ Ready when that command exits 0. Teardown is nothing, because the command exits 
 
 Run `bash .cursor/skills/verify-argus/doctor.sh` from the repo root.
 
-Ready output ends with `doctor=ok` and `mini=not-contacted`. The script exits 1 when the timing file differs from `origin/main:src/timing.ts`. `ARGUS_TIMING_FILE` selects that file and defaults to `src/timing.ts`. It checks `argus.example.yaml` for `aspect` on every camera (`ARGUS_DOCTOR_CONFIG` selects another file) and checks that audio-off advertises no codecs and omits audio from the prepareStream answer (`ARGUS_HOMEKIT_FILE` selects the source, default `src/homekit.ts`). It runs `npx tsc -p tsconfig.json --noEmit`. It does not open a remote shell, reboot, or install a LaunchAgent.
+Ready output ends with `doctor=ok` and `mini=not-contacted`. The script exits 1 when the timing file differs from `origin/main:src/timing.ts`. `ARGUS_TIMING_FILE` selects that file and defaults to `src/timing.ts`. It checks `argus.example.yaml` for `aspect` on every camera (`ARGUS_DOCTOR_CONFIG` selects another file). It runs `npx tsc -p tsconfig.json --noEmit`. It does not open a remote shell, reboot, or install a LaunchAgent. The audio-off answer check lands with the behavior-change pull request.
 
 ## Drive
 
