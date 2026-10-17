@@ -4,7 +4,7 @@ Agents copy the file they opened. For live view that file is a firmware diary, a
 
 Peter lands every later PR. This document does not open those PRs, does not merge, and does not deploy. Leave the Mini alone. Leave notification timing alone.
 
-The later program runs `pstack/skills/poteto-mode/playbooks/autopilot-stack.md`. Peter approved the three defaults on 10/16. The implementation pull requests are a stack so the check runs on every head before anything merges. PR-shape is the base and targets `main`. Outside QA on 10/17 split the Home session changes out of PR-shape. PR-shape requires `aspect` and stays behavior-neutral otherwise. A separate behavior-change pull request, for Peter's review, omits audio from the prepareStream answer when audio is off, returns from a duplicate prepareStream without calling the HAP callback, and requires delegate aspect. That pull request targets PR-shape. PR-ci targets the behavior pull request. PR-prose targets PR-ci. PR-verify targets PR-prose. This document does not gain their commits. Merge order is PR-shape, then the behavior pull request, then PR-ci, then PR-prose, then PR-verify. Peter lands them. No owner merges.
+The later program runs `pstack/skills/poteto-mode/playbooks/autopilot-stack.md`. Peter approved the three defaults on 10/16. The implementation pull requests are a stack so the check runs on every head before anything merges. PR-shape is the base and targets `main`. Outside QA on 10/17 split the Home session changes out of PR-shape. PR-shape requires `aspect` and stays behavior-neutral otherwise. PR-ci, PR-prose, and PR-verify stay behavior-neutral too, and each one passes CI without the behavior pull request. A separate behavior-change pull request, for Peter's review, omits audio from the prepareStream answer when audio is off, returns from a duplicate prepareStream without calling the HAP callback, and requires delegate aspect. That pull request targets PR-verify and is last. PR-ci targets PR-shape. PR-prose targets PR-ci. PR-verify targets PR-prose. This document does not gain their commits. Merge order is PR-shape, then PR-ci, then PR-prose, then PR-verify, then the behavior pull request. Peter lands them. No owner merges. PR-ci must not target the behavior branch: GitHub marks that pull request merged when the behavior branch contains the census commit, and a merged pull request does not reopen. The behavior branch's own commit is the behavior change.
 
 PR-shape carries the base workflow: ffmpeg, the go2rtc binary the loopback test already expects, `npx tsc -p tsconfig.json --noEmit`, and `npx vitest run`. The runner has no ffmpeg. Without it the crop checks throw `ENOENT`, and `scripts/install-launchd.sh` exits 1 with empty stderr because `command -v ffmpeg` fails under `set -e` before the plist is written. PR-ci adds the census step and `npx tsc -p tsconfig.check.json --noEmit` on top of that same workflow. PR-prose and PR-verify do not edit the workflow. They run the base check.
 
@@ -14,7 +14,7 @@ PR-shape and PR-ci both edit `tests/homekit.test.ts`. PR-ci is rebased on PR-sha
 
 PR-prose keeps `LATENCY.md`, `TESTING.md`, and `TELEMETRY-QUICK-REF.md`. Those are the alert-latency notes. The firmware diary deletion stays on PR-shape.
 
-PR-verify names `tests/hap-setup-contract.test.ts` and `scripts/firmware-census.mjs` as the drives. The contract test is on PR-shape. The audio-off answer and the required delegate are on the behavior pull request. The census script is on PR-ci, and PR-verify depends on that pull request. The skill's own test runs the doctor and the optional-property probe. The doctor checks camera aspect and that audio-off does not still advertise a codec. The timing check uses a temp copy and does not edit `src/timing.ts`.
+PR-verify names `tests/hap-setup-contract.test.ts` and `scripts/firmware-census.mjs` as the drives. The contract test is on PR-shape, and on that head audio stays on the answer. The audio-off answer, the required delegate, and the audio-off doctor check are on the behavior pull request. The census script is on PR-ci, and PR-verify depends on that pull request. The skill's own test runs the doctor and the optional-property probe. The doctor on PR-verify checks camera aspect. The timing check uses a temp copy and does not edit `src/timing.ts`.
 
 Home Manager's read-only `ffprobe` on the Mini at about 8:00 PM ET on 2026-10-16 is the aspect list. Credentials stay redacted. Garage Door, Backyard, and Backyard Right are `4:3` (main 2560x1920). Backyard Left is `16:9` (main 3840x2160). Front L and Front R are `16:9` (main 4512x2512). Doorbell is `4:3`, inferred and unverified, because it was unreachable. The record is `docs/camera-health.md` and `docs/aspect-migration.md` on PR-shape. Garage Door's main in that record is 2560x1920.
 
@@ -46,12 +46,12 @@ Re-read the execution playbook from trunk. Audit the operation against it and fi
 
 - [ ] Spawn one owner per PR. Each owner builds, pushes, opens a ready PR, and stops at merge-ready. Peter lands it.
 - [ ] Follow this dependency graph for merge order. The opened pull requests are a stack so each head contains the workflow.
-  - [ ] PR-shape is first, branches from `main`, and carries the base workflow. It requires aspect and does not change the prepareStream answer.
-  - [ ] The behavior pull request targets PR-shape. It is the audio-off answer, the duplicate prepareStream, and required delegate aspect.
-  - [ ] PR-ci targets the behavior pull request and adds the census steps. PR-prose targets PR-ci and does not edit the workflow.
-  - [ ] PR-verify targets PR-prose. Its census drive depends on PR-ci.
-- [ ] Hold the file boundaries. PR-shape touches stream setup, camera config, and the homekit tests. It does not touch `src/timing.ts` or `src/recording.ts`. The behavior pull request touches the prepareStream answer and the delegate options. PR-ci touches the workflow and the test files that fail `tsc`. PR-prose touches root markdown and `docs/invariants.md`. PR-verify touches `.cursor/skills/verify-argus/`.
-- [ ] Hold the review gate. PR-shape changes the camera config a future deploy will parse. The behavior pull request changes a Home session and waits for Peter's review before merge. The other three PRs do not change a Home session.
+  - [ ] PR-shape is first, branches from `main`, and carries the base workflow. It requires aspect and leaves the prepareStream answer as it is on main.
+  - [ ] PR-ci targets PR-shape and adds the census steps. PR-prose targets PR-ci and does not edit the workflow.
+  - [ ] PR-verify targets PR-prose. Its census drive depends on PR-ci. Its doctor checks aspect.
+  - [ ] The behavior pull request targets PR-verify and is last. It is the audio-off answer, the duplicate prepareStream, required delegate aspect, and the audio-off doctor check.
+- [ ] Hold the file boundaries. PR-shape touches stream setup, camera config, and the homekit tests. It does not touch `src/timing.ts` or `src/recording.ts`. PR-ci touches the workflow and the test files that fail `tsc`. PR-prose touches root markdown and `docs/invariants.md`. PR-verify touches `.cursor/skills/verify-argus/` and checks aspect. The behavior pull request touches the prepareStream answer, the delegate options, and the audio-off doctor check.
+- [ ] Hold the review gate. PR-shape changes the camera config a future deploy will parse. The behavior pull request changes a Home session and waits for Peter's review before merge. PR-ci, PR-prose, and PR-verify do not change a Home session.
 
 ### PR mechanics, for every PR
 
@@ -79,7 +79,7 @@ Each live lane runs on its own cloud VM at the PR head. `control-cli` is not ins
 
 ## Make illegal stream setups unrepresentable, PR-shape
 
-**Depends on.** None.
+**Depends on.** None. The opened pull request requires aspect and leaves the prepareStream answer as it is on main. `prepareAnswer`, the audio-off omission, the duplicate prepareStream return, and required delegate aspect are the behavior pull request, last in the merge order.
 
 **Files.**
 
@@ -200,7 +200,7 @@ Each live lane runs on its own cloud VM at the PR head. `control-cli` is not ins
 
 ## Delete the stale deploy notes, PR-prose
 
-**Depends on.** PR-shape.
+**Depends on.** PR-ci.
 
 **Files.**
 
@@ -255,7 +255,7 @@ Each live lane runs on its own cloud VM at the PR head. `control-cli` is not ins
 
 ## Add the field-check skill, PR-verify
 
-**Depends on.** PR-ci.
+**Depends on.** PR-prose. The census drive still comes from PR-ci. The audio-off doctor check is on the behavior pull request, which targets this one.
 
 **Files.**
 
@@ -346,7 +346,7 @@ Rank is by how often the miss repeated and by field rounds lost. Count is what t
 | 3 | Double `prepareStream` callback | 4 commits (`1.3.7` through `1.3.10`), 3 failed field notes, then a crash on the revert | [1.3.7](https://github.com/point-labs-dev/argus/commit/6117635239cb0e5bdcbd877160fe877967a1d99e), [1.3.9](https://github.com/point-labs-dev/argus/commit/56045dd342d8c18909dc233ca8b769dd43e9f067) | PR-shape makes the test call the answer twice. The guard already returns false on the second call |
 | 4 | MAIN source parked, then unreachable under the cap | Park commit, then the cap bug fixed in PR 6. The parked comment is still in `src/serve.ts` | [park](https://github.com/point-labs-dev/argus/commit/b559f7e5bee95319d0402753e363ae7783f3c0b5), [PR 6](https://github.com/point-labs-dev/argus/pull/6) | PR-shape deletes the parked comment. The policy test already encodes the pre-cap rule |
 | 5 | Four by three picture padded into a sixteen by nine box | Pad commit on PR 3, pillarbox seen in the field, crop landed in [PR 18](https://github.com/point-labs-dev/argus/pull/18). The default filter and the pad test still teach pad for every aspect | [pad](https://github.com/point-labs-dev/argus/commit/3568b2c8927fc3206783d8bce344b57dec53ad31), `tests/homekit.test.ts` pad case | PR-shape replaces the name set and the `cropToFill` flag with required `aspect` |
-| 6 | HAP answer does not match the packets ffmpeg sends, and a first frame is treated as paint | SRTP key fix [9cd9271](https://github.com/point-labs-dev/argus/commit/9cd927197d2f0fba0b2a83e3a27dd13226f4a2b1). Video-only ports [01dee81396](https://github.com/point-labs-dev/argus/commit/01dee8139693f1da2c0eba27b940afd80413631e). Diary field note for `1.3.11` has a first frame and still no picture. Audio-off still returns audio today | Contract JSON `audio_off_has_audio` true and `audio_off_ffmpeg_has_audio_codec` false | PR-shape `prepareAnswer`. PR-prose and PR-verify say the log line is not the picture |
+| 6 | HAP answer does not match the packets ffmpeg sends, and a first frame is treated as paint | SRTP key fix [9cd9271](https://github.com/point-labs-dev/argus/commit/9cd927197d2f0fba0b2a83e3a27dd13226f4a2b1). Video-only ports [01dee81396](https://github.com/point-labs-dev/argus/commit/01dee8139693f1da2c0eba27b940afd80413631e). Diary field note for `1.3.11` has a first frame and still no picture. Audio-off still returns audio today | Contract JSON `audio_off_has_audio` true and `audio_off_ffmpeg_has_audio_codec` false | The behavior pull request's `prepareAnswer`, last in the merge order. PR-prose and PR-verify say the log line is not the picture |
 | 7 | `exactOptionalPropertyTypes` break, with tests outside `tsc` | One Mini build break, `TS2412` and `TS2375`, in [1813f77](https://github.com/point-labs-dev/argus/commit/1813f771f120f2644b16ffb20fe0564be96a4cf5). The bad pattern exits 2 with `TS2375` now. Widening `tsc` to tests prints 18 errors | Probe JSON and the temporary `tsc` run | PR-ci keeps the flag, typechecks tests, and runs `tsc` in GitHub Actions. The repo has no `.github` workflow today |
 
 Ten `FIELD TEST RESULT` lines sit in the comment above `ARGUS_FIRMWARE_REVISION` in `src/homekit.ts`. They are the field rounds for rank 1 through rank 3 on 2026-10-02. GitHub review threads exist on [PR 2](https://github.com/point-labs-dev/argus/pull/2#pullrequestreview-5374141402) and [PR 3](https://github.com/point-labs-dev/argus/pull/3#pullrequestreview-5378799534). Both are signed as QA reviews. PRs 4 through 19 have no review bodies. PR 2 had no CI to trust, and the repo still has no `.github` workflow.
