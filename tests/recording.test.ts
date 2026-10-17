@@ -13,14 +13,37 @@ function mp4Box(type: string, payload: Buffer): Buffer {
 }
 
 // A CameraRecordingConfiguration as HomeKit would select it (enum values inlined).
-function recordingConfig() {
+function recordingConfig(resolution: [number, number, number] = [1280, 720, 30]) {
   return {
     prebufferLength: 4000,
     eventTriggerTypes: [1],
     mediaContainerConfiguration: { type: 0, fragmentLength: 4000 },
-    videoCodec: { type: 0, parameters: { profile: 2, level: 2, bitRate: 2000, iFrameInterval: 4000 }, resolution: [1280, 720, 30] },
+    videoCodec: { type: 0, parameters: { profile: 2, level: 2, bitRate: 2000, iFrameInterval: 4000 }, resolution },
     audioCodec: { type: 0, bitrate: 64, samplerate: 3, audioChannels: 1 },
   } as never;
+}
+
+function videoFilter(args: string[]): string {
+  const index = args.indexOf("-vf");
+  return index >= 0 ? (args[index + 1] ?? "") : "";
+}
+
+const PAD_1920 =
+  "scale=1920:1080:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=1920:1080:(ow-iw)/2:(oh-ih)/2";
+
+function withTelemetry(run: () => void): string[] {
+  const lines: string[] = [];
+  const original = process.stderr.write;
+  process.stderr.write = ((chunk: string | Uint8Array) => {
+    lines.push(Buffer.isBuffer(chunk) ? chunk.toString("utf8") : String(chunk));
+    return true;
+  }) as typeof process.stderr.write;
+  try {
+    run();
+  } finally {
+    process.stderr.write = original;
+  }
+  return lines.filter((line) => line.includes("ARGUS_TELEMETRY"));
 }
 
 describe("buildRecordingFfmpegArgs", () => {
@@ -52,6 +75,29 @@ describe("buildRecordingFfmpegArgs", () => {
     const joined = buildRecordingFfmpegArgs("rtsp://x/main", recordingConfig()).join(" ");
     expect(joined).toContain("-analyzeduration 200000");
     expect(joined).toContain("-probesize 500000");
+  });
+
+  it("pads a 4:3 camera recorded at 1920x1080 instead of stretching it", () => {
+    const vf = videoFilter(
+      buildRecordingFfmpegArgs("rtsp://127.0.0.1:8554/backyard", recordingConfig([1920, 1080, 30]), "4:3"),
+    );
+    expect(vf).not.toBe("scale=1920:1080");
+    expect(vf).not.toContain("crop=");
+    expect(vf).toBe(PAD_1920);
+  });
+
+  it("keeps a 16:9 camera recorded at 1920x1080 on the bare scale filter", () => {
+    const vf = videoFilter(
+      buildRecordingFfmpegArgs("rtsp://127.0.0.1:8554/front-l", recordingConfig([1920, 1080, 30]), "16:9"),
+    );
+    expect(vf).toBe("scale=1920:1080");
+  });
+
+  it("keeps a matching 4:3 box on the bare scale filter", () => {
+    const vf = videoFilter(
+      buildRecordingFfmpegArgs("rtsp://127.0.0.1:8554/backyard", recordingConfig([640, 480, 30]), "4:3"),
+    );
+    expect(vf).toBe("scale=640:480");
   });
 });
 
@@ -146,6 +192,101 @@ describe("ArgusRecordingDelegate", () => {
     expect(fragmentLatency).toBeLessThan(4500);
     expect(packet?.data.toString("ascii", 4, 8)).toBe("moof");
     expect(packet?.isLast).toBe(false);
+  });
+
+  it("rejects a recording delegate that has no aspect", () => {
+    expect(() => new ArgusRecordingDelegate("Cam", "rtsp://x/main", {} as never)).toThrow(/aspect/);
+  });
+
+  it("pads ffmpeg output when the delegate is constructed with 4:3", async () => {
+    const stdout = new PassThrough();
+    const fakeProc = Object.assign(new EventEmitter(), { stdout, stderr: new PassThrough(), kill: vi.fn() });
+    const spawnFn = vi.fn(() => fakeProc) as unknown as typeof import("node:child_process").spawn;
+    const delegate = new ArgusRecordingDelegate("Backyard", "rtsp://127.0.0.1:8554/backyard", {
+      spawnFn,
+      verbose: false,
+      aspect: "4:3",
+    });
+    delegate.updateRecordingConfiguration(recordingConfig([1920, 1080, 30]));
+
+    const generator = delegate.handleRecordingStreamRequest(1);
+    const pending = generator.next();
+    const args = spawnFn.mock.calls[0]?.[1] as string[];
+    expect(videoFilter(args)).toBe(PAD_1920);
+    stdout.end();
+    await generator.return(undefined);
+    await pending.catch(() => undefined);
+  });
+});
+
+describe("recording hub telemetry", () => {
+  function delegate() {
+    return new ArgusRecordingDelegate("Backyard", "rtsp://127.0.0.1:8554/backyard", {
+      verbose: false,
+      aspect: "4:3",
+    });
+  }
+
+  it("emits a normal close reason", () => {
+    const lines = withTelemetry(() => delegate().closeRecordingStream(3, "normal"));
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain("normal");
+  });
+
+  it("does not copy an srtp close reason into the telemetry line", () => {
+    const secret = "session srtp_key material";
+    const lines = withTelemetry(() => delegate().closeRecordingStream(4, secret));
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).not.toContain("srtp");
+    expect(lines[0]).not.toContain(secret);
+    expect(lines[0]).toContain("redacted");
+  });
+
+  it("logs an object close reason as its code", () => {
+    const lines = withTelemetry(() =>
+      delegate().closeRecordingStream(5, { code: "cancelled", detail: "srtp session dump" }),
+    );
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain("cancelled");
+    expect(lines[0]).not.toContain("srtp");
+    expect(lines[0]).not.toContain("dump");
+  });
+
+  it("redacts an overlong close reason", () => {
+    const raw = `hub-${"x".repeat(220)}`;
+    const lines = withTelemetry(() => delegate().closeRecordingStream(9, raw));
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain("redacted");
+    expect(lines[0]).not.toContain(raw);
+  });
+
+  it("emits recording-active only when the boolean changes", () => {
+    const camera = delegate();
+    const first = withTelemetry(() => {
+      camera.updateRecordingActive(true);
+      camera.updateRecordingActive(true);
+    });
+    expect(first).toHaveLength(1);
+    expect(first[0]).toContain("true");
+
+    const second = withTelemetry(() => camera.updateRecordingActive(false));
+    expect(second).toHaveLength(1);
+    expect(second[0]).toContain("false");
+    expect(second[0]).not.toContain("true");
+  });
+
+  it("does not throw when telemetry cannot be written", () => {
+    const camera = delegate();
+    const original = process.stderr.write;
+    process.stderr.write = (() => {
+      throw new Error("stderr failed");
+    }) as typeof process.stderr.write;
+    try {
+      expect(() => camera.closeRecordingStream(1, "normal")).not.toThrow();
+      expect(() => camera.updateRecordingActive(true)).not.toThrow();
+    } finally {
+      process.stderr.write = original;
+    }
   });
 });
 
