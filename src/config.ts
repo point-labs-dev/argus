@@ -11,6 +11,26 @@ const streamProfilesSchema = z.object({
 
 export const cameraAspectSchema = z.enum(["16:9", "4:3"]);
 
+const DIRECT_AI_PORT = /^(?:[1-9]\d{0,3}|[1-5]\d{4}|6[0-4]\d{3}|65[0-4]\d{2}|655[0-2]\d|6553[0-5])$/;
+const DIRECT_AI_IPV4 = /^(?:(?:25[0-5]|2[0-4]\d|[01]?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d?\d)$/;
+const DIRECT_AI_NAME = /^(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)(?:\.(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?))*$/;
+
+/** Host, or host:port. No scheme, path, userinfo, or whitespace. */
+function isDirectAiHost(value: string): boolean {
+  if (value.length === 0 || /\s/.test(value)) return false;
+  if (value.includes("://") || value.includes("/") || value.includes("@") || value.includes("?") || value.includes("#")) {
+    return false;
+  }
+  const colon = value.lastIndexOf(":");
+  let hostname = value;
+  if (colon !== -1) {
+    hostname = value.slice(0, colon);
+    if (!DIRECT_AI_PORT.test(value.slice(colon + 1))) return false;
+  }
+  if (/^\d+(?:\.\d+){3}$/.test(hostname)) return DIRECT_AI_IPV4.test(hostname);
+  return DIRECT_AI_NAME.test(hostname);
+}
+
 const cameraSchema = z.object({
   name: z.string().trim().min(1, "cameras[].name is required"),
   aspect: cameraAspectSchema,
@@ -29,8 +49,11 @@ const cameraSchema = z.object({
   streams: streamProfilesSchema,
   // Off when omitted. GetAiState then stays on `host`. When set, only GetAiState
   // uses this host, on channel 0, with this camera's username and password.
-  // Video and GetMdState stay on `host`.
-  directAiHost: z.string().trim().min(1, "cameras[].directAiHost must not be empty").optional(),
+  // Video and GetMdState stay on `host`. A host with an optional port only.
+  directAiHost: z
+    .string()
+    .refine(isDirectAiHost, "cameras[].directAiHost must be a host with an optional port")
+    .optional(),
 });
 
 const retentionSchema = z.object({

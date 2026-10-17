@@ -2,11 +2,13 @@ import { describe, expect, it, vi } from "vitest";
 
 import { parseArgusConfig } from "../src/config.js";
 import { buildHttpFlvUrl, buildRtspUrl } from "../src/go2rtc.js";
-import { MotionMonitor } from "../src/motion.js";
+import { MotionMonitor, writeMotionPollError } from "../src/motion.js";
 import { ReolinkClient, type ReolinkClientOptions } from "../src/reolink.js";
 
 const NVR_HOST = "nvr.invalid";
 const DIRECT_HOST = "direct.invalid";
+const DIRECT_USER = "direct-user";
+const DIRECT_PASSWORD = "direct-secret";
 
 function jsonResponse(payload: unknown): Response {
   return { ok: true, status: 200, json: async () => payload } as unknown as Response;
@@ -19,8 +21,8 @@ function configWith(directAiHost?: string) {
     host: NVR_HOST,
     channel: 2,
     mainCodec: "h265",
-    username: "admin",
-    password: "x",
+    username: DIRECT_USER,
+    password: DIRECT_PASSWORD,
     transport: "auto",
     streams: { main: "main", sub: "sub" },
   };
@@ -122,6 +124,11 @@ describe("direct AI poll", () => {
       expect(JSON.parse(aiBody)[0].param.channel).toBe(0);
       expect(JSON.parse(mdBody)[0].param.channel).toBe(2);
       expect(calls.some((call) => call.url.includes(DIRECT_HOST) && call.url.includes("cmd=GetMdState"))).toBe(false);
+      const directLogin = calls.find((call) => call.url.includes(DIRECT_HOST) && call.url.includes("cmd=Login"));
+      expect(JSON.parse(directLogin?.body ?? "[]")[0].param.User).toEqual({
+        userName: DIRECT_USER,
+        password: DIRECT_PASSWORD,
+      });
     });
   });
 
@@ -139,6 +146,317 @@ describe("direct AI poll", () => {
       expect(hostsOf(calls, "GetMdState")).toEqual([NVR_HOST]);
       expect(hostsOf(calls, "GetAiState")).toEqual([NVR_HOST]);
       expect(calls.some((call) => call.url.includes(DIRECT_HOST))).toBe(false);
+      const camera = configWith().cameras[0]!;
+      expect(camera.channel).toBe(2);
+      const aiBody = calls.find((call) => call.url.includes("cmd=GetAiState"))?.body ?? "";
+      const mdBody = calls.find((call) => call.url.includes("cmd=GetMdState"))?.body ?? "";
+      expect(JSON.parse(aiBody)[0].param.channel).toBe(camera.channel);
+      expect(JSON.parse(mdBody)[0].param.channel).toBe(camera.channel);
     });
+  });
+
+  it("logs in again and retries once when GetAiState returns rspCode -6", async () => {
+    await withNoSockets(async () => {
+      let directLogins = 0;
+      let aiCalls = 0;
+      const fetchFn = vi.fn(async (input: string | URL | Request) => {
+        const url = String(input);
+        if (url.includes(DIRECT_HOST) && url.includes("cmd=Login")) {
+          directLogins += 1;
+          return jsonResponse([{ cmd: "Login", code: 0, value: { Token: { name: `direct-${directLogins}`, leaseTime: 3600 } } }]);
+        }
+        if (url.includes("cmd=Login")) {
+          return jsonResponse([{ cmd: "Login", code: 0, value: { Token: { name: "nvr", leaseTime: 3600 } } }]);
+        }
+        if (url.includes("cmd=GetMdState")) {
+          return jsonResponse([{ cmd: "GetMdState", code: 0, value: { state: 0 } }]);
+        }
+        if (url.includes("cmd=GetAiState")) {
+          aiCalls += 1;
+          if (aiCalls === 1) {
+            return jsonResponse([{ cmd: "GetAiState", code: 1, error: { detail: "please login first", rspCode: -6 } }]);
+          }
+          return jsonResponse([{
+            cmd: "GetAiState",
+            code: 0,
+            value: { people: { alarm_state: 1, support: 1 }, vehicle: { alarm_state: 0 }, dog_cat: { alarm_state: 0 } },
+          }]);
+        }
+        return jsonResponse([{ cmd: "?", code: 1, error: { detail: "unknown", rspCode: -99 } }]);
+      }) as unknown as typeof fetch;
+      const events: boolean[] = [];
+      const errors: string[] = [];
+      const monitor = new MotionMonitor(
+        configWith(DIRECT_HOST).cameras,
+        (_name, detected) => events.push(detected),
+        { fetch: fetchFn, onError: (_name, error) => errors.push(error.message) },
+      );
+      await monitor.pollOnce();
+      expect(events).toEqual([true]);
+      expect(errors).toEqual([]);
+      expect(directLogins).toBe(2);
+      expect(aiCalls).toBe(2);
+    });
+  });
+
+  it("does not cache a transient rspCode as unsupported and recovers", async () => {
+    await withNoSockets(async () => {
+      let aiCalls = 0;
+      const fetchFn = vi.fn(async (input: string | URL | Request) => {
+        const url = String(input);
+        if (url.includes("cmd=Login")) {
+          return jsonResponse([{ cmd: "Login", code: 0, value: { Token: { name: "tok", leaseTime: 3600 } } }]);
+        }
+        if (url.includes("cmd=GetMdState")) {
+          return jsonResponse([{ cmd: "GetMdState", code: 0, value: { state: 0 } }]);
+        }
+        if (url.includes("cmd=GetAiState")) {
+          aiCalls += 1;
+          if (aiCalls === 1) {
+            return jsonResponse([{ cmd: "GetAiState", code: 1, error: { detail: "busy", rspCode: -5 } }]);
+          }
+          return jsonResponse([{
+            cmd: "GetAiState",
+            code: 0,
+            value: { people: { alarm_state: 1, support: 1 }, vehicle: { alarm_state: 0 }, dog_cat: { alarm_state: 0 } },
+          }]);
+        }
+        return jsonResponse([{ cmd: "?", code: 1, error: { detail: "unknown", rspCode: -99 } }]);
+      }) as unknown as typeof fetch;
+      const events: boolean[] = [];
+      const errors: string[] = [];
+      const monitor = new MotionMonitor(
+        configWith(DIRECT_HOST).cameras,
+        (_name, detected) => events.push(detected),
+        { fetch: fetchFn, onError: (_name, error) => errors.push(error.message) },
+      );
+      await monitor.pollOnce();
+      expect(events).toEqual([]);
+      expect(errors).toHaveLength(1);
+      expect(aiCalls).toBe(1);
+      await monitor.pollOnce();
+      expect(events).toEqual([true]);
+      expect(aiCalls).toBe(2);
+    });
+  });
+
+  it("remembers rspCode -99 as unsupported without raising", async () => {
+    await withNoSockets(async () => {
+      let aiCalls = 0;
+      const fetchFn = vi.fn(async (input: string | URL | Request) => {
+        const url = String(input);
+        if (url.includes("cmd=Login")) {
+          return jsonResponse([{ cmd: "Login", code: 0, value: { Token: { name: "tok", leaseTime: 3600 } } }]);
+        }
+        if (url.includes("cmd=GetMdState")) {
+          return jsonResponse([{ cmd: "GetMdState", code: 0, value: { state: 0 } }]);
+        }
+        if (url.includes("cmd=GetAiState")) {
+          aiCalls += 1;
+          return jsonResponse([{ cmd: "GetAiState", code: 1, error: { detail: "not support", rspCode: -99 } }]);
+        }
+        return jsonResponse([{ cmd: "?", code: 1, error: { detail: "unknown", rspCode: -99 } }]);
+      }) as unknown as typeof fetch;
+      const events: boolean[] = [];
+      const errors: string[] = [];
+      const monitor = new MotionMonitor(
+        configWith(DIRECT_HOST).cameras,
+        (_name, detected) => events.push(detected),
+        { fetch: fetchFn, onError: (_name, error) => errors.push(error.message) },
+      );
+      await monitor.pollOnce();
+      await monitor.pollOnce();
+      expect(events).toEqual([]);
+      expect(errors).toEqual([]);
+      expect(aiCalls).toBe(1);
+    });
+  });
+
+  it("does not let a timed-out direct host block the other cameras", async () => {
+    await withNoSockets(async () => {
+      const stallHost = "stall.invalid";
+      const garageHost = "garage.invalid";
+      let aborted = false;
+      const calls: string[] = [];
+      const fetchFn = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+        const url = String(input);
+        calls.push(url);
+        if (url.includes(stallHost)) {
+          await new Promise((_resolve, reject) => {
+            const signal = init?.signal;
+            if (!signal) return;
+            const fail = (): void => {
+              aborted = true;
+              const reason = signal.reason;
+              reject(reason instanceof Error ? reason : new Error("aborted"));
+            };
+            if (signal.aborted) fail();
+            else signal.addEventListener("abort", fail, { once: true });
+          });
+          return jsonResponse([]);
+        }
+        if (url.includes("cmd=Login")) {
+          return jsonResponse([{ cmd: "Login", code: 0, value: { Token: { name: "tok", leaseTime: 3600 } } }]);
+        }
+        if (url.includes("cmd=GetMdState")) {
+          const state = url.includes(garageHost) ? 1 : 0;
+          return jsonResponse([{ cmd: "GetMdState", code: 0, value: { state } }]);
+        }
+        return jsonResponse([{ cmd: "?", code: 1, error: { detail: "unknown", rspCode: -99 } }]);
+      }) as unknown as typeof fetch;
+      const config = parseArgusConfig({
+        cameras: [
+          {
+            name: "Front L",
+            aspect: "16:9",
+            host: NVR_HOST,
+            channel: 2,
+            mainCodec: "h265",
+            username: DIRECT_USER,
+            password: DIRECT_PASSWORD,
+            transport: "auto",
+            streams: { main: "main", sub: "sub" },
+            directAiHost: stallHost,
+          },
+          {
+            name: "Garage",
+            aspect: "4:3",
+            host: garageHost,
+            channel: 0,
+            mainCodec: "h264",
+            username: DIRECT_USER,
+            password: DIRECT_PASSWORD,
+            transport: "auto",
+            streams: { main: "main", sub: "sub" },
+          },
+        ],
+        recording: { path: "./rec", retention: { continuous: 3, motion: 7, alerts: 30 } },
+        homekit: { pin: "123-45-678" },
+        go2rtc: { binary: "./go2rtc", api_port: 1984 },
+        server: { port: 8080 },
+      });
+      const events: Array<[string, boolean]> = [];
+      const monitor = new MotionMonitor(config.cameras, (name, detected) => events.push([name, detected]), {
+        createClient: (options) => new ReolinkClient({ ...options, requestTimeoutMs: 40 }),
+        fetch: fetchFn,
+      });
+      const started = Date.now();
+      await monitor.pollOnce();
+      expect(Date.now() - started).toBeLessThan(1_000);
+      expect(events).toContainEqual(["Garage", true]);
+      expect(calls.some((url) => url.includes(garageHost) && url.includes("cmd=GetMdState"))).toBe(true);
+      expect(aborted).toBe(true);
+    });
+  }, 2_000);
+
+  it("clears a direct-host error through the cooldown and backs off the log", async () => {
+    await withNoSockets(async () => {
+      let failDirect = false;
+      let clock = 0;
+      const fetchFn = vi.fn(async (input: string | URL | Request) => {
+        const url = String(input);
+        if (failDirect && url.includes(DIRECT_HOST)) {
+          throw new Error("direct host down");
+        }
+        if (url.includes("cmd=Login")) {
+          return jsonResponse([{ cmd: "Login", code: 0, value: { Token: { name: "tok", leaseTime: 3600 } } }]);
+        }
+        if (url.includes("cmd=GetMdState")) {
+          return jsonResponse([{ cmd: "GetMdState", code: 0, value: { state: 0 } }]);
+        }
+        if (url.includes("cmd=GetAiState")) {
+          return jsonResponse([{
+            cmd: "GetAiState",
+            code: 0,
+            value: { people: { alarm_state: 1, support: 1 }, vehicle: { alarm_state: 0 }, dog_cat: { alarm_state: 0 } },
+          }]);
+        }
+        return jsonResponse([{ cmd: "?", code: 1, error: { detail: "unknown", rspCode: -99 } }]);
+      }) as unknown as typeof fetch;
+      const events: Array<[string, boolean]> = [];
+      const errors: string[] = [];
+      const monitor = new MotionMonitor(
+        configWith(DIRECT_HOST).cameras,
+        (name, detected) => events.push([name, detected]),
+        {
+          fetch: fetchFn,
+          now: () => clock,
+          cooldownMs: 30_000,
+          onError: (_name, error) => errors.push(error.message),
+        },
+      );
+      await monitor.pollOnce();
+      expect(events).toEqual([["Front L", true]]);
+      failDirect = true;
+      clock = 1_000;
+      await monitor.pollOnce();
+      clock = 2_000;
+      await monitor.pollOnce();
+      clock = 3_000;
+      await monitor.pollOnce();
+      expect(events).toEqual([["Front L", true]]);
+      expect(errors).toHaveLength(1);
+      clock = 31_000;
+      await monitor.pollOnce();
+      expect(events).toEqual([["Front L", true], ["Front L", false]]);
+    });
+  });
+
+  it("rejects a scheme, a path, userinfo, and whitespace in directAiHost", () => {
+    const rejected = [
+      "http://10.0.0.8",
+      "https://cam.local:80",
+      "10.0.0.8/cgi-bin",
+      "cam.local/path",
+      "admin:secret@10.0.0.8",
+      "admin@10.0.0.8",
+      " 10.0.0.8",
+      "10.0.0.8 ",
+      "10.0.0.8\t",
+      "ho st.local",
+    ];
+    for (const host of rejected) {
+      expect(() => configWith(host), host).toThrow(/directAiHost must be a host/i);
+    }
+    for (const host of ["10.0.0.8", "10.0.0.8:80", "cam.local", "cam.local:9000"]) {
+      expect(configWith(host).cameras[0]?.directAiHost, host).toBe(host);
+    }
+  });
+
+  it("does not write a credential-bearing host string to stderr", async () => {
+    const secret = "s3cret-token";
+    const badHost = `admin:${secret}@direct.invalid`;
+    const written: string[] = [];
+    const spy = vi.spyOn(process.stderr, "write").mockImplementation((chunk) => {
+      written.push(String(chunk));
+      return true;
+    });
+    try {
+      await withNoSockets(async () => {
+        try {
+          configWith(badHost);
+        } catch (error) {
+          process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
+        }
+        const camera = {
+          ...configWith("10.0.0.8").cameras[0]!,
+          directAiHost: badHost,
+        };
+        const fetchFn = vi.fn(async () => {
+          throw new Error(`connect failed for ${badHost}`);
+        }) as unknown as typeof fetch;
+        const monitor = new MotionMonitor([camera], () => {}, {
+          fetch: fetchFn,
+          onError: writeMotionPollError,
+        });
+        await monitor.pollOnce();
+      });
+    } finally {
+      spy.mockRestore();
+    }
+    const stderr = written.join("");
+    expect(stderr).toContain("motion poll error");
+    expect(stderr).not.toContain(badHost);
+    expect(stderr).not.toContain(secret);
   });
 });

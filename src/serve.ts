@@ -11,7 +11,7 @@ import { loadArgusConfig, type ArgusConfig } from "./config.js";
 import { buildGo2RtcStreamNames } from "./go2rtc.js";
 import { startGo2Rtc, type Go2RtcSupervisor } from "./go2rtc-supervisor.js";
 import { createCameraAccessory, getHapBindAddress } from "./homekit.js";
-import { MotionMonitor } from "./motion.js";
+import { MotionMonitor, writeMotionPollError } from "./motion.js";
 import { parseJpegDimensions, SnapshotCache } from "./snapshot-cache.js";
 import { emitTelemetry } from "./telemetry.js";
 
@@ -169,7 +169,7 @@ export async function startArgusServer(config: ArgusConfig, configDir = process.
         });
       }
     },
-    { onError: (cameraName, error) => process.stderr.write(`[argus ${cameraName}] motion poll error: ${error.message}\n`) },
+    { onError: writeMotionPollError },
   );
   motion.start();
 

@@ -18,7 +18,7 @@ function fakeReolink(getState: () => number) {
     if (url.includes("cmd=GetMdState")) {
       return jsonResponse([{ cmd: "GetMdState", code: 0, value: { state: getState() } }]);
     }
-    return jsonResponse([{ cmd: "?", code: 1, error: { detail: "unknown" } }]);
+    return jsonResponse([{ cmd: "?", code: 1, error: { detail: "unknown", rspCode: -99 } }]);
   }) as unknown as typeof fetch;
 }
 

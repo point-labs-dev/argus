@@ -5,6 +5,7 @@ import * as path from "node:path";
 
 import { ConfigError, loadArgusConfig } from "./config.js";
 import { generateGo2RtcYaml } from "./go2rtc.js";
+import { redactCredentialHosts } from "./reolink.js";
 
 interface CliOptions {
   configPath: string;
@@ -120,14 +121,14 @@ function isNodeErrorWithCode(error: unknown, code: string): error is NodeJS.Errn
 
 function formatError(error: unknown): string {
   if (error instanceof ConfigError) {
-    return error.message;
+    return redactCredentialHosts(error.message);
   }
 
   if (error instanceof Error) {
-    return error.message;
+    return redactCredentialHosts(error.message);
   }
 
-  return String(error);
+  return redactCredentialHosts(String(error));
 }
 
 export async function run(argv: string[]): Promise<void> {

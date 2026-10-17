@@ -1,10 +1,18 @@
 import type { CameraConfig } from "./config.js";
-import { ReolinkClient, type ReolinkClientOptions } from "./reolink.js";
+import { ReolinkClient, redactCredentialHosts, type ReolinkClientOptions } from "./reolink.js";
 import { emitTelemetry } from "./telemetry.js";
 import { emitTiming } from "./timing.js";
 
 /** Standalone cameras report AI on channel 0. The NVR channel stays on GetMdState. */
 const DIRECT_AI_CHANNEL = 0;
+/** First repeat of a poll error waits this long. Then the delay doubles. */
+const ERROR_LOG_BACKOFF_START_MS = 5_000;
+const ERROR_LOG_BACKOFF_MAX_MS = 60_000;
+
+/** stderr line for a motion poll failure. Userinfo in the message is removed. */
+export function writeMotionPollError(cameraName: string, error: Error): void {
+  process.stderr.write(`[argus ${cameraName}] motion poll error: ${redactCredentialHosts(error.message)}\n`);
+}
 
 // Polls each camera's Reolink motion state and reports edges (on/off) with a
 // cooldown, so a brief gap in detection doesn't flap the HomeKit motion sensor.
@@ -30,6 +38,10 @@ interface CameraState {
   directAi: ReolinkClient | undefined;
   detected: boolean;
   lastMotionAt: number;
+  /** Delay before another poll error for this camera may be logged. */
+  errorBackoffMs: number;
+  /** Earliest `now()` at which the next poll error may be logged. 0 logs immediately. */
+  nextErrorLogAt: number;
 }
 
 export class MotionMonitor {
@@ -65,6 +77,8 @@ export class MotionMonitor {
         directAi: directAiHost === undefined ? undefined : createClient({ host: directAiHost, ...shared }),
         detected: false,
         lastMotionAt: 0,
+        errorBackoffMs: 0,
+        nextErrorLogAt: 0,
       };
     });
   }
@@ -106,13 +120,27 @@ export class MotionMonitor {
     return state.directAi.getAiState(DIRECT_AI_CHANNEL);
   }
 
+  private reportPollError(state: CameraState, error: Error): void {
+    const now = this.now();
+    if (state.nextErrorLogAt !== 0 && now < state.nextErrorLogAt) {
+      return;
+    }
+    this.onError?.(state.camera.name, error);
+    const delay = state.errorBackoffMs === 0
+      ? ERROR_LOG_BACKOFF_START_MS
+      : Math.min(state.errorBackoffMs * 2, ERROR_LOG_BACKOFF_MAX_MS);
+    state.errorBackoffMs = delay;
+    state.nextErrorLogAt = now + delay;
+  }
+
   private async pollCamera(state: CameraState): Promise<void> {
-    let active: boolean;
+    let active = false;
     try {
       active = await this.readActive(state);
+      state.errorBackoffMs = 0;
+      state.nextErrorLogAt = 0;
     } catch (error) {
-      this.onError?.(state.camera.name, error instanceof Error ? error : new Error(String(error)));
-      return;
+      this.reportPollError(state, error instanceof Error ? error : new Error(String(error)));
     }
 
     const now = this.now();

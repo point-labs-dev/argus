@@ -2,6 +2,16 @@
 // uniformly for standalone cameras (host = camera IP, channel 0) and NVR-fronted
 // cameras (host = NVR IP, channel N). Verified against both on 2026-06-10.
 
+/** One stalled camera must not hold the motion poll for every other camera. */
+const REQUEST_TIMEOUT_MS = 5_000;
+
+/** Drop userinfo so a host string cannot carry a password into a log line. */
+export function redactCredentialHosts(text: string): string {
+  return text
+    .replace(/[^\s/:@]+:[^\s/@]*@[^\s/]+/g, (match) => match.slice(match.lastIndexOf("@") + 1))
+    .replace(/[^\s/:@]+@[^\s/]+/g, (match) => match.slice(match.lastIndexOf("@") + 1));
+}
+
 export interface ReolinkClientOptions {
   host: string;
   username: string;
@@ -10,6 +20,8 @@ export interface ReolinkClientOptions {
   fetch?: typeof fetch;
   /** Clock injectable for tests. */
   now?: () => number;
+  /** Per-request AbortSignal timeout in ms. Defaults to 5 seconds. Injectable for tests. */
+  requestTimeoutMs?: number;
 }
 
 interface ReolinkResponse {
@@ -48,31 +60,37 @@ export class ReolinkClient {
     this.now = options.now ?? (() => Date.now());
   }
 
+  private fail(message: string): never {
+    throw new ReolinkError(redactCredentialHosts(message));
+  }
+
   private async call(cmd: string, param: Record<string, unknown>, token?: string): Promise<ReolinkResponse> {
     const query = token ? `?cmd=${cmd}&token=${token}` : `?cmd=${cmd}`;
     const url = `http://${this.options.host}/cgi-bin/api.cgi${query}`;
     const body = JSON.stringify([{ cmd, action: 0, param }]);
+    const timeoutMs = this.options.requestTimeoutMs ?? REQUEST_TIMEOUT_MS;
     let response: Response;
     try {
       response = await this.fetchFn(url, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body,
+        signal: AbortSignal.timeout(timeoutMs),
       });
     } catch (error) {
       // undici reports transport failures as a generic "fetch failed" — surface
       // the cause (ECONNREFUSED, EHOSTUNREACH, ETIMEDOUT…) or debugging is blind.
       const cause = (error as { cause?: { code?: string; message?: string } }).cause;
       const detail = cause?.code ?? cause?.message ?? (error instanceof Error ? error.message : String(error));
-      throw new ReolinkError(`${cmd} on ${this.options.host} fetch failed: ${detail}`);
+      this.fail(`${cmd} on ${this.options.host} fetch failed: ${detail}`);
     }
     if (!response.ok) {
-      throw new ReolinkError(`${cmd} on ${this.options.host} failed: HTTP ${response.status}`);
+      this.fail(`${cmd} on ${this.options.host} failed: HTTP ${response.status}`);
     }
     const parsed = (await response.json()) as ReolinkResponse[];
     const first = parsed[0];
     if (!first) {
-      throw new ReolinkError(`${cmd} on ${this.options.host}: empty response`);
+      this.fail(`${cmd} on ${this.options.host}: empty response`);
     }
     return first;
   }
@@ -86,11 +104,11 @@ export class ReolinkClient {
       User: { userName: this.options.username, password: this.options.password },
     });
     if (result.code !== 0 || !result.value) {
-      throw new ReolinkError(`Login on ${this.options.host} failed: ${result.error?.detail ?? `code ${result.code}`}`);
+      this.fail(`Login on ${this.options.host} failed: ${result.error?.detail ?? `code ${result.code}`}`);
     }
     const tokenInfo = result.value["Token"] as { name?: string; leaseTime?: number } | undefined;
     if (!tokenInfo?.name) {
-      throw new ReolinkError(`Login on ${this.options.host}: no token in response`);
+      this.fail(`Login on ${this.options.host}: no token in response`);
     }
     this.token = tokenInfo.name;
     // Refresh a minute before the lease actually expires.
@@ -113,24 +131,34 @@ export class ReolinkClient {
       md = await this.call("GetMdState", { channel }, token);
     }
     if (md.code !== 0 || !md.value) {
-      throw new ReolinkError(`GetMdState ch${channel} on ${this.options.host} failed: ${md.error?.detail ?? `code ${md.code}`}`);
+      this.fail(`GetMdState ch${channel} on ${this.options.host} failed: ${md.error?.detail ?? `code ${md.code}`}`);
     }
     return md.value["state"] === 1;
   }
 
   /**
-   * AI person/vehicle/animal alarm (GetAiState). Probed once; an unsupported
-   * response (NVR rspCode -99) is remembered and later calls skip the request.
+   * AI person/vehicle/animal alarm (GetAiState).
+   * rspCode -6 (expired token): log in again and retry this request once.
+   * rspCode -99: this host does not support GetAiState; later calls skip the request.
+   * Any other failure is thrown so the poll can surface it.
    */
   public async getAiState(channel: number): Promise<boolean> {
     if (this.aiSupported === false) {
       return false;
     }
-    const token = await this.ensureToken();
-    const ai = await this.call("GetAiState", { channel }, token);
-    if (ai.code !== 0 || !ai.value) {
+    let token = await this.ensureToken();
+    let ai = await this.call("GetAiState", { channel }, token);
+    if (ai.code !== 0 && ai.error?.rspCode === -6) {
+      this.token = undefined;
+      token = await this.ensureToken();
+      ai = await this.call("GetAiState", { channel }, token);
+    }
+    if (ai.code !== 0 && ai.error?.rspCode === -99) {
       this.aiSupported = false;
       return false;
+    }
+    if (ai.code !== 0 || !ai.value) {
+      this.fail(`GetAiState ch${channel} on ${this.options.host} failed: ${ai.error?.detail ?? `code ${ai.code}`}`);
     }
     this.aiSupported = true;
     return (["people", "vehicle", "dog_cat"] as const).some((type) => {
@@ -175,7 +203,7 @@ export class ReolinkClient {
     const token = await this.ensureToken();
     const result = await this.call(cmd, param, token);
     if (result.code !== 0 || result.value === undefined) {
-      throw new ReolinkError(`${cmd} on ${this.options.host} failed: ${result.error?.detail ?? `code ${result.code}`}`);
+      this.fail(`${cmd} on ${this.options.host} failed: ${result.error?.detail ?? `code ${result.code}`}`);
     }
     return result.value;
   }
