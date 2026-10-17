@@ -106,6 +106,20 @@ describe("verify-argus", () => {
     expect(doctor.stdout).toContain("doctor=fail");
   });
 
+  it("does not print doctor=ok when a camera host is removed", () => {
+    const directory = mkdtempSync(join(tmpdir(), "argus-host-"));
+    const config = join(directory, "argus.yaml");
+    writeFileSync(config, readFileSync("argus.example.yaml", "utf8").replace(/^\s*host:.*$/gm, ""));
+    const doctor = spawnSync("bash", [`${SKILL}/doctor.sh`], {
+      encoding: "utf8",
+      env: { ...process.env, ARGUS_DOCTOR_CONFIG: config },
+    });
+    expect(doctor.status).not.toBe(0);
+    expect(doctor.stdout).not.toContain("doctor=ok");
+    expect(doctor.stdout).toContain("doctor=fail");
+    expect(doctor.stdout).toContain("host missing");
+  });
+
   it("keeps the optional-property proof without writing the evidence file", () => {
     const proof = `${SKILL}/evidence/exact-optional.json`;
     const tracked = spawnSync("git", ["ls-files", "--", proof], { encoding: "utf8" });

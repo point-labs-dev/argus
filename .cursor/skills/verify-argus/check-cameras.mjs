@@ -16,10 +16,14 @@ export function cameraConfigProblems(raw) {
     return ["no cameras"];
   }
   cameras.forEach((camera, index) => {
+    const name = camera && camera.name ? camera.name : index;
     const aspect = camera && camera.aspect;
     if (!ASPECTS.has(aspect)) {
-      const name = camera && camera.name ? camera.name : index;
       problems.push(`${name} aspect missing or not 16:9 or 4:3`);
+    }
+    const host = camera && camera.host;
+    if (typeof host !== "string" || host.trim() === "") {
+      problems.push(`${name} host missing`);
     }
   });
   return problems;
