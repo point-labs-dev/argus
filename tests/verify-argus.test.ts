@@ -120,6 +120,40 @@ describe("verify-argus", () => {
     expect(doctor.stdout).toContain("host missing");
   });
 
+  it("does not print doctor=ok when audio-off still advertises a codec", () => {
+    const directory = mkdtempSync(join(tmpdir(), "argus-audio-"));
+    const broken = join(directory, "homekit.ts");
+    const source = readFileSync("src/homekit.ts", "utf8").replace(
+      ": [],",
+      ": [{ type: AudioStreamingCodecType.AAC_ELD, samplerate: AudioStreamingSamplerate.KHZ_24 }],",
+    );
+    writeFileSync(broken, source);
+    const doctor = spawnSync("bash", [`${SKILL}/doctor.sh`], {
+      encoding: "utf8",
+      env: { ...process.env, ARGUS_HOMEKIT_FILE: broken },
+    });
+    expect(doctor.status).not.toBe(0);
+    expect(doctor.stdout).not.toContain("doctor=ok");
+    expect(doctor.stdout).toContain("doctor=fail");
+  });
+
+  it("does not print doctor=ok when the audio-off answer still includes audio", () => {
+    const directory = mkdtempSync(join(tmpdir(), "argus-answer-"));
+    const broken = join(directory, "homekit.ts");
+    const source = readFileSync("src/homekit.ts", "utf8").replace(
+      "prepareAnswer({ includeAudio: false, video: videoLeg })",
+      "prepareAnswer({ includeAudio: false, video: videoLeg, audio: videoLeg })",
+    );
+    writeFileSync(broken, source);
+    const doctor = spawnSync("bash", [`${SKILL}/doctor.sh`], {
+      encoding: "utf8",
+      env: { ...process.env, ARGUS_HOMEKIT_FILE: broken },
+    });
+    expect(doctor.status).not.toBe(0);
+    expect(doctor.stdout).not.toContain("doctor=ok");
+    expect(doctor.stdout).toContain("doctor=fail");
+  });
+
   it("keeps the optional-property proof without writing the evidence file", () => {
     const proof = `${SKILL}/evidence/exact-optional.json`;
     const tracked = spawnSync("git", ["ls-files", "--", proof], { encoding: "utf8" });

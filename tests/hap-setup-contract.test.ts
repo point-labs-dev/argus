@@ -15,6 +15,7 @@ import {
   createCameraAccessory,
   type LiveFfmpegInput,
 } from "../src/homekit.js";
+import { prepareAnswer } from "../src/homekit/prepare-answer.js";
 import { SessionStateMachine } from "../src/homekit/session-state-machine.js";
 import { SnapshotCache } from "../src/snapshot-cache.js";
 
@@ -117,14 +118,8 @@ function sourceLeg(leg: PrepareStreamResponse["video"] | PrepareStreamResponse["
 }
 
 describe("HAP setup contract", () => {
-  it("defaults a delegate with no aspect to 16:9", () => {
-    const delegate = new ArgusStreamingDelegate("Garage Door", "rtsp://x", cache());
-    expect(delegate.aspect).toBe("16:9");
-    expect(buildCameraControllerOptions(delegate).streamingOptions.video.resolutions.map((row) => `${row[0]}x${row[1]}`)).toEqual([
-      "854x480",
-      "640x480",
-      "640x360",
-    ]);
+  it("rejects a delegate that has no aspect", () => {
+    expect(() => new ArgusStreamingDelegate("Garage Door", "rtsp://x", cache(), {} as never)).toThrow(/aspect/);
   });
 
   it("rejects a camera with no aspect and accepts 4:3", () => {
@@ -248,7 +243,7 @@ describe("HAP setup contract", () => {
     expect(buildCameraControllerOptions(squareLeft).streamingOptions.video.resolutions).toEqual([[640, 480, 30]]);
   });
 
-  it("copies the request SRTP key and keeps audio when audio is off", async () => {
+  it("copies the request SRTP key and omits audio when audio is off", async () => {
     const on = await answered(true);
     const onVideo = sourceLeg(on.video);
     const onAudio = sourceLeg(on.audio);
@@ -258,11 +253,31 @@ describe("HAP setup contract", () => {
     expect(onAudio.srtp_salt.equals(Buffer.alloc(14, 0x44))).toBe(true);
 
     const off = await answered(false);
-    expect(off.audio).toBeDefined();
-    expect(sourceLeg(off.audio).srtp_key.equals(Buffer.alloc(16, 0x33))).toBe(true);
+    expect(off.audio).toBeUndefined();
+    expect("audio" in off).toBe(false);
   });
 
-  it("calls the HAP callback for a second prepareStream", async () => {
+  it("returns audio from prepareAnswer only when the session includes audio", () => {
+    const videoKey = Buffer.alloc(16, 1);
+    const videoSalt = Buffer.alloc(14, 2);
+    const audioKey = Buffer.alloc(16, 3);
+    const audioSalt = Buffer.alloc(14, 4);
+    const withAudio = prepareAnswer({
+      includeAudio: true,
+      video: { port: 1, ssrc: 2, srtp_key: videoKey, srtp_salt: videoSalt },
+      audio: { port: 3, ssrc: 4, srtp_key: audioKey, srtp_salt: audioSalt },
+    });
+    const answeredAudio = sourceLeg(withAudio.audio);
+    expect(answeredAudio.srtp_key).toBe(audioKey);
+    const videoOnly = prepareAnswer({
+      includeAudio: false,
+      video: { port: 1, ssrc: 2, srtp_key: videoKey, srtp_salt: videoSalt },
+    });
+    expect(videoOnly.audio).toBeUndefined();
+    expect(sourceLeg(videoOnly.video).srtp_key).toBe(videoKey);
+  });
+
+  it("returns from a duplicate prepareStream without calling the HAP callback", async () => {
     const delegate = new ArgusStreamingDelegate("Garage Door", "rtsp://x", cache(), {
       aspect: "4:3",
       verbose: false,
@@ -270,13 +285,12 @@ describe("HAP setup contract", () => {
     await new Promise<void>((resolve, reject) => {
       delegate.prepareStream(streamRequest("twice"), (error) => (error ? reject(error) : resolve()));
     });
-    await new Promise<void>((resolve, reject) => {
-      const timeout = setTimeout(() => reject(new Error("second prepareStream did not call the HAP callback")), 5000);
-      delegate.prepareStream(streamRequest("twice"), () => {
-        clearTimeout(timeout);
-        resolve();
-      });
+    let calls = 0;
+    delegate.prepareStream(streamRequest("twice"), () => {
+      calls += 1;
     });
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(calls).toBe(0);
   });
 
   it("allows the first prepare answer and rejects the second", () => {
