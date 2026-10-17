@@ -1140,6 +1140,7 @@ export const ARGUS_FIRMWARE_REVISION = "1.3.16";
 export interface CameraAccessoryHandle {
   accessory: Accessory;
   delegate: ArgusStreamingDelegate;
+  recordingDelegate: ArgusRecordingDelegate;
   /** Update the camera's HomeKit MotionSensor (triggers HKSV recording). */
   setMotion: (detected: boolean) => void;
 }
@@ -1176,6 +1177,7 @@ export function createCameraAccessory(
   const recordingDelegate = new ArgusRecordingDelegate(camera.name, mainUrl, {
     ...(options.ffmpegPath ? { ffmpegPath: options.ffmpegPath } : {}),
     ...(options.verbose !== undefined ? { verbose: options.verbose } : {}),
+    ...(options.spawnFn ? { spawnFn: options.spawnFn } : {}),
     aspect: camera.aspect,
   });
   const controller = new CameraController(
@@ -1197,6 +1199,7 @@ export function createCameraAccessory(
   return {
     accessory,
     delegate,
+    recordingDelegate,
     setMotion: (detected: boolean) => {
       if (!motionSensor) return;
       motionSensor.updateCharacteristic(Characteristic.MotionDetected, detected);

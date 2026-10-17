@@ -737,6 +737,31 @@ describe("ArgusStreamingDelegate", () => {
     }
   });
 
+  it("keeps live -vf byte-identical to main", () => {
+    const boxes = [
+      [1920, 1080],
+      [1280, 720],
+      [854, 480],
+      [640, 480],
+      [640, 360],
+      [480, 270],
+      [320, 240],
+      [320, 180],
+    ] as const;
+    const mainFilter = (width: number, height: number, aspect: "16:9" | "4:3"): string =>
+      aspect === "4:3"
+        ? `scale=${width}:${height}:force_original_aspect_ratio=increase:force_divisible_by=2,crop=${width}:${height},setsar=1`
+        : `scale=${width}:${height}:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2`;
+    for (const aspect of ["16:9", "4:3"] as const) {
+      for (const [width, height] of boxes) {
+        const args = buildLiveFfmpegArgs(
+          liveInput({ aspect, video: { ...liveInput().video, width, height } }),
+        );
+        expect(args[args.indexOf("-vf") + 1]).toBe(mainFilter(width, height, aspect));
+      }
+    }
+  });
+
   it("advertises firmware version 1.3.16 so controllers re-read the 4:3 ladder", () => {
     expect(ARGUS_FIRMWARE_REVISION).toBe("1.3.16");
     const config = parseArgusConfig({

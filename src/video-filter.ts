@@ -6,14 +6,8 @@ export interface AspectScaleFilterInput {
   width: number;
   height: number;
   aspect: CameraAspect;
-  /** "crop" is live 4:3. "pad" keeps the whole frame. Recording always passes "pad". */
+  /** "crop" is live 4:3. "pad" keeps the whole frame. */
   fit: AspectFit;
-  /**
-   * Recording sets this. A box with the same aspect as the camera is exactly
-   * `scale=W:H`. Live view leaves it off, so a 16:9 session keeps today's pad
-   * string even when Home's box is already 16:9.
-   */
-  bareScaleWhenMatched?: boolean;
 }
 
 export function boxMatchesCameraAspect(width: number, height: number, aspect: CameraAspect): boolean {
@@ -27,14 +21,11 @@ export function boxMatchesCameraAspect(width: number, height: number, aspect: Ca
 
 /**
  * Shared ffmpeg `-vf` value for a camera frame inside a HomeKit box.
- * Live view and HKSV recording both call this so the crop and pad strings
- * cannot drift. A bare `scale=W:H` stretches a mismatched frame.
+ * Live view calls this for every session. Recording calls it when a 4:3
+ * frame does not already fill the box. A bare `scale=W:H` is not this helper.
  */
 export function buildAspectScaleFilter(input: AspectScaleFilterInput): string {
-  const { width, height, aspect, fit } = input;
-  if (input.bareScaleWhenMatched && boxMatchesCameraAspect(width, height, aspect)) {
-    return `scale=${width}:${height}`;
-  }
+  const { width, height, fit } = input;
   if (fit === "crop") {
     return `scale=${width}:${height}:force_original_aspect_ratio=increase:force_divisible_by=2,crop=${width}:${height},setsar=1`;
   }

@@ -62,7 +62,7 @@ cat argus.log | grep 'ARGUS_TELEMETRY:' | sed 's/^.*ARGUS_TELEMETRY: //' | jq -r
 | `live_session_stop` | User closed view | — |
 | `hksv_recording_start` | Home Hub requested clip | Shortly after motion |
 | `hksv_recording_stop` | HKSV clip complete | — |
-| `hksv_recording_close` | Hub closed the recording stream | Short reason, secrets redacted |
+| `hksv_recording_close` | Hub closed the recording stream | HAP close-reason name, `none`, or `other` |
 | `hksv_recording_active` | Recording-active flag changed | `true` or `false`, once per edge |
 | `motion_cleared` | Motion cooldown expired | 30s after motion stops |
 

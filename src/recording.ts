@@ -1,4 +1,5 @@
 import { type ChildProcess, spawn } from "node:child_process";
+import { createRequire } from "node:module";
 
 import {
   type CameraRecordingConfiguration,
@@ -17,7 +18,9 @@ import type { CameraAspect } from "./config.js";
 import { readFragmentedMp4 } from "./mp4.js";
 import { emitTelemetry } from "./telemetry.js";
 import { emitTiming } from "./timing.js";
-import { buildAspectScaleFilter } from "./video-filter.js";
+import { boxMatchesCameraAspect, buildAspectScaleFilter } from "./video-filter.js";
+
+const require = createRequire(import.meta.url);
 
 const PROFILE_TO_X264: Record<number, string> = {
   [H264Profile.BASELINE]: "baseline",
@@ -38,61 +41,32 @@ const SAMPLERATE_TO_HZ: Record<number, number> = {
   [AudioRecordingSamplerate.KHZ_48]: 48000,
 };
 
-/** HAP HDSProtocolSpecificErrorReason values, logged as short stable names. */
-const CLOSE_REASON_NAMES: Readonly<Record<number, string>> = {
-  0: "normal",
-  1: "not_allowed",
-  2: "busy",
-  3: "cancelled",
-  4: "unsupported",
-  5: "unexpected_failure",
-  6: "timeout",
-  7: "bad_data",
-  8: "protocol_error",
-  9: "invalid_configuration",
-};
+type HapCloseReasonEnum = Record<string, number | string>;
 
-const SECRET_REASON = /srtp|password|rtsp:\/\/|token/i;
-
-function scalarCloseReason(value: unknown): string | undefined {
-  if (typeof value === "string") return value;
-  if (typeof value === "boolean") return value ? "true" : "false";
-  if (typeof value === "number" && Number.isFinite(value)) {
-    return CLOSE_REASON_NAMES[value] ?? String(value);
+/** Names and values of hap-nodejs `HDSProtocolSpecificErrorReason`. Nothing else is logged. */
+function hapCloseReasonTables(): { names: ReadonlySet<string>; byValue: ReadonlyMap<number, string> } {
+  const hap = require("hap-nodejs") as { HDSProtocolSpecificErrorReason: HapCloseReasonEnum };
+  const names = new Set<string>();
+  const byValue = new Map<number, string>();
+  for (const [key, value] of Object.entries(hap.HDSProtocolSpecificErrorReason)) {
+    if (typeof value !== "number") continue;
+    names.add(key);
+    byValue.set(value, key);
   }
-  return undefined;
+  return { names, byValue };
 }
 
-function closeReasonText(reason: unknown): string {
-  if (reason == null) return "connection_closed";
-  const scalar = scalarCloseReason(reason);
-  if (scalar !== undefined) return scalar;
-  if (reason instanceof Error) {
-    const fromCode = scalarCloseReason((reason as { code?: unknown }).code);
-    if (fromCode !== undefined) return fromCode;
-    return reason.message || reason.name || "error";
-  }
-  if (typeof reason === "object") {
-    const record = reason as Record<string, unknown>;
-    const fromCode = scalarCloseReason(record.code);
-    if (fromCode !== undefined) return fromCode;
-    const fromReason = scalarCloseReason(record.reason);
-    if (fromReason !== undefined) return fromReason;
-    if (typeof record.name === "string" && record.name.length > 0) return record.name;
-    return "object";
-  }
-  return "unknown";
-}
+const HAP_CLOSE_REASONS = hapCloseReasonTables();
 
-/** Short close reason safe for stderr. Never returns secrets or the raw object. */
 function sanitizeRecordingCloseReason(reason: unknown): string {
-  try {
-    const text = closeReasonText(reason);
-    if (text.length > 200 || SECRET_REASON.test(text)) return "redacted";
-    return text;
-  } catch {
-    return "redacted";
+  if (reason === undefined) return "none";
+  if (typeof reason === "number") {
+    return HAP_CLOSE_REASONS.byValue.get(reason) ?? "other";
   }
+  if (typeof reason === "string" && HAP_CLOSE_REASONS.names.has(reason)) {
+    return reason;
+  }
+  return "other";
 }
 
 function requireAspect(aspect: unknown, label: string): CameraAspect {
@@ -140,6 +114,13 @@ export function buildRecordingOptions(): CameraRecordingOptions {
   };
 }
 
+function recordingVideoFilter(width: number, height: number, aspect: CameraAspect): string {
+  if (aspect === "16:9" || boxMatchesCameraAspect(width, height, aspect)) {
+    return `scale=${width}:${height}`;
+  }
+  return buildAspectScaleFilter({ width, height, aspect, fit: "pad" });
+}
+
 /**
  * Pure builder for the FFmpeg fragmented-MP4 command HKSV records from. Unlike live
  * view, recording uses the full-res MAIN stream (transcoded H.264 + AAC-LC), with
@@ -150,7 +131,6 @@ export function buildRecordingFfmpegArgs(
   config: CameraRecordingConfiguration,
   aspect: CameraAspect,
 ): string[] {
-  const sourceAspect = requireAspect(aspect, "buildRecordingFfmpegArgs");
   const [width, height, fps] = config.videoCodec.resolution;
   const params = config.videoCodec.parameters;
   const profile = PROFILE_TO_X264[params.profile] ?? "high";
@@ -181,13 +161,7 @@ export function buildRecordingFfmpegArgs(
     "-pix_fmt", "yuv420p",
     "-color_range", "tv",
     "-r", String(fps),
-    "-vf", buildAspectScaleFilter({
-      width,
-      height,
-      aspect: sourceAspect,
-      fit: "pad",
-      bareScaleWhenMatched: true,
-    }),
+    "-vf", recordingVideoFilter(width, height, aspect),
     "-b:v", `${params.bitRate}k`,
     "-maxrate", `${params.bitRate}k`,
     "-bufsize", `${2 * params.bitRate}k`,
