@@ -47,7 +47,7 @@ Re-read the execution playbook from trunk. Audit the operation against it and fi
   - [ ] doorbell after siren.
   - [ ] talk after doorbell.
   - [ ] home-mode after talk.
-  - [ ] night after home-mode. If the IR write values are still unnamed, do not spawn night.
+  - [ ] night after home-mode. Spawn it. The IR write is `SetIrLights` with state `Auto` or `Off`.
 - [ ] Hold the file boundaries. capabilities touches only `src/camera-features.ts`, `src/reolink.ts`, `src/config.ts`, `argus.example.yaml`, and `tests/camera-features.test.ts`. floodlight, siren, doorbell, talk, home-mode, and night touch `src/homekit.ts` only in that order, because they share it. home-mode also touches `src/reolink.ts` for the motion filter. `src/serve.ts` changes only in floodlight and doorbell, where the record has to reach publish. A later PR may edit `tests/camera-features.test.ts` only to replace an expected literal that its own change made false.
 - [ ] Hold the review gate. floodlight, siren, doorbell, talk, home-mode, and night change a Home interaction. They wait for the operator's review in chat with screenshots and a video before merge. capabilities does not.
 
@@ -161,7 +161,7 @@ Each live lane runs on its own cloud VM at the PR head. Apple Home has no `contr
 
 - [ ] When `publishedFeatures` says spotlight, add `Service.Lightbulb` with `Characteristic.On`. When it also says brightness, add `Characteristic.Brightness`.
 - [ ] Front L and Front R are the only cameras whose record says spotlight and brightness. Pass Home's 0 to 100 integer through in the log. If the camera rejects 1 or 100, stop and ask for the range. Do not invent a scale.
-- [ ] The floodlight write command name is not in Home Manager's summary. Stop this PR until that name is supplied. Do not infer it from GetWhiteLed.
+- [ ] Write cmd `SetWhiteLed` to the host Argus already uses for that camera. Front L and Front R use the NVR host. `WhiteLed.channel` is the same 0-based channel `GetMdState` uses. Front L is channel 2. Front R is channel 3. `state` is 1 for on and 0 for off. `bright` is the Home brightness integer. The library accepts 0 through 100. Send `channel` on every write. Send `state` when On changes. Send `bright` when Brightness changes. Do not send `mode`. Do not send `LightingSchedule`. Do not call `set_spotlight`. Do not read GetWhiteLed to decide support. The command shape and the citations are in Appendix F.
 - [ ] On and off are idempotent. A second on while the light is on does not toggle it off.
 
 **You see.**
@@ -184,7 +184,7 @@ Each live lane runs on its own cloud VM at the PR head. Apple Home has no `contr
 - [ ] Lane 3. Turn Front L off. Save `floodlight-lane-3.png`. Pass when the log shows off and the light is off.
 - [ ] Lane 4. Set Front L brightness to 100. Save `floodlight-lane-4.png`. Pass when the log shows 100.
 - [ ] Lane 5. Set Front L brightness to 1. Save `floodlight-lane-5.png`. Pass when the log shows 1. If the camera rejects it, the lane fails and the owner stops.
-- [ ] Lane 6. Turn Front R on, then off. Save `floodlight-lane-6.png`. Pass when both states match the log.
+- [ ] Lane 6. Turn Front R on, then off. Save `floodlight-lane-6.png`. Pass when both states match the log and Front L does not change.
 - [ ] Lane 7. Open Garage Door with a scratch flag forced true. Save `floodlight-lane-7.png`. Pass when Garage Door has no light.
 - [ ] Lane 8. Open the Doorbell and Backyard Left. Save `floodlight-lane-8.png`. Pass when neither has a light.
 - [ ] Lane 9. Open Backyard and Backyard Right. Save `floodlight-lane-9.png`. Pass when neither has a light.
@@ -358,8 +358,8 @@ Each live lane runs on its own cloud VM at the PR head. Apple Home has no `contr
 
 **Build.**
 
-- [ ] When the record says talk and the flag is true, accept HAP return audio and send it on the Doorbell talk path.
-- [ ] The talk command name is not in Home Manager's summary. Stop this PR until that name is supplied. A talk permit flag is not that name.
+- [ ] When the record says talk and the flag is true, set `streamingOptions.audio.twoWayAudio` true for the Doorbell only. hap-nodejs 0.14.3 adds a Speaker service for that flag. Receive the controller audio RTP from the stream session, transcode it to the ADPCM layout `TalkAbility` returns, and send it with the Baichuan talk sequence in neolink `BcCamera.talk`. The camera connection is TCP port 9000. Do not send the samples with an HTTP Set command. Do not send them to the RTSP port. `audioReturnSocket` in `spawnLive` is the return RTCP socket. Leave it on that job.
+- [ ] Read `TalkAbility` at session start. neolink `talk` rejects an audio type other than `adpcm`, and `src/talk/mod.rs` takes the sample rate and block size from that ability. If `TalkAbility` is missing or the audio type is not `adpcm`, close the path, fail the lane, and stop. A talk permit flag is not talk support.
 - [ ] Backyard Left has a speaker and no confirmed talk. Do not open a talk path for it. The speaker stays the siren.
 - [ ] Closing the HAP session closes the talk path. A second session opens a new one.
 
@@ -379,7 +379,7 @@ Each live lane runs on its own cloud VM at the PR head. Apple Home has no `contr
 **Verify, live.** Tests alone are not sufficient verification. A PR is verified only when its unit, live, and perf boxes are all checked. Ten lanes on `grok-4.7-xhigh-fast` at the PR head, per the boot recipe.
 
 - [ ] Lane 1. Regression lane against trunk. Run a Doorbell live view at trunk and head. If trunk lacks the feature, record that and gate return audio plus the end state the user waits for, which is sound at the camera. Save `talk-lane-1.png`. Pass when trunk has no talk path and the head Doorbell does.
-- [ ] Lane 2. Open Doorbell talk and speak. Save `talk-lane-2.png`. Pass when a person at the camera hears the phone, and the lane note says so.
+- [ ] Lane 2. Open Doorbell talk and speak. Save `talk-lane-2.png`. Pass when a person at the camera hears the phone, the lane note says the path was Baichuan on port 9000, and `TalkAbility` audio type was `adpcm`. If the ability is missing or the type is not `adpcm`, the lane fails and the owner stops.
 - [ ] Lane 3. End the view. Save `talk-lane-3.png`. Pass when the log says the talk path closed.
 - [ ] Lane 4. Open a second view and speak. Save `talk-lane-4.png`. Pass when the camera hears the phone again.
 - [ ] Lane 5. Open Backyard Left. Save `talk-lane-5.png`. Pass when it has no talk path.
@@ -487,13 +487,12 @@ Each live lane runs on its own cloud VM at the PR head. Apple Home has no `contr
 - [ ] Edit `src/homekit.ts`.
 - [ ] Create `tests/night-vision.test.ts`.
 - [ ] Do not edit the firmware revision constant.
-- [ ] Do not spawn this PR until the IR off value and the IR write command are named. Until then, night vision stays in the Reolink app.
 
 **Build.**
 
-- [ ] When the record has an explicit off value and the nightVision flag is true, wire `Characteristic.NightVision` on the same `CameraOperatingMode` service home-mode used.
-- [ ] True sends the camera's on or auto value from the ability record. False sends the named off value. Backyard Left's recorded IR mode is auto, so true must not force a color mode.
-- [ ] If the off value is missing, register no setter. Do not publish a switch that snaps back.
+- [ ] When the ability record has IR and the nightVision flag is true, wire `Characteristic.NightVision` on the same `CameraOperatingMode` service home-mode used.
+- [ ] True sends cmd `SetIrLights` with `IrLights.state` `Auto` and `IrLights.channel` set to that camera's channel. False sends `Off` on the same channel. Include `action` 0, matching `set_ir_lights`. Do not send a color mode or an ISP mode. Backyard Left's recorded IR mode is auto, so true sends `Auto`.
+- [ ] Do not read a GetIrLights body to decide support. GetAbility already decided. The command shape is in Appendix F.
 
 **You see.**
 
@@ -502,21 +501,21 @@ Each live lane runs on its own cloud VM at the PR head. Apple Home has no `contr
 
 **Verify, unit.** Tests alone are not sufficient verification. A PR is verified only when its unit, live, and perf boxes are all checked.
 
-- [ ] Mutant. Fixture with off value and flag true. NightVision false expects the off literal. Run `npx vitest run tests/night-vision.test.ts`.
-- [ ] Mutant. Fixture with no off value. Expect no setter.
-- [ ] Mutant. Backyard Left true expects the auto value recorded for that camera.
+- [ ] Mutant. Fixture with IR and flag true. NightVision false expects state `Off`. Run `npx vitest run tests/night-vision.test.ts`.
+- [ ] Mutant. IR ability false. Expect no setter.
+- [ ] Mutant. Backyard Left true expects state `Auto`.
 - [ ] Mutant. Flag false. Expect no IR write when the characteristic would have changed.
 - [ ] Run `npm test` and `npm run build`.
 
 **Verify, live.** Tests alone are not sufficient verification. A PR is verified only when its unit, live, and perf boxes are all checked. Ten lanes on `grok-4.7-xhigh-fast` at the PR head, per the boot recipe.
 
 - [ ] Lane 1. Regression lane against trunk. Run the Doorbell night control at trunk and head. If trunk lacks the feature, record that and gate an IR change plus the end state the user waits for. Save `night-lane-1.png`. Pass when trunk writes no IR and the head writes IR only with the flag on.
-- [ ] Lane 2. Turn Backyard Left night on. Save `night-lane-2.png`. Pass when the log shows the auto value.
-- [ ] Lane 3. Turn Backyard Left night off. Save `night-lane-3.png`. Pass when the log shows the named off value.
-- [ ] Lane 4. Turn the Doorbell night off, then on. Save `night-lane-4.png`. Pass when both log values match the record.
-- [ ] Lane 5. Turn Front L night off, then on. Save `night-lane-5.png`. Pass when both log values match the record.
-- [ ] Lane 6. Turn Garage Door night off, then on. Save `night-lane-6.png`. Pass when both log values match the record.
-- [ ] Lane 7. Repeat for Backyard, Front R, and Backyard Right. Save `night-lane-7.png`. Pass when each log value matches that camera's record.
+- [ ] Lane 2. Turn Backyard Left night on. Save `night-lane-2.png`. Pass when the log shows `Auto` and no color write.
+- [ ] Lane 3. Turn Backyard Left night off. Save `night-lane-3.png`. Pass when the log shows `Off`.
+- [ ] Lane 4. Turn the Doorbell night off, then on. Save `night-lane-4.png`. Pass when off logs `Off` and on logs `Auto`.
+- [ ] Lane 5. Turn Front L night off, then on. Save `night-lane-5.png`. Pass when off logs `Off` and on logs `Auto` on channel 2.
+- [ ] Lane 6. Turn Garage Door night off, then on. Save `night-lane-6.png`. Pass when off logs `Off` and on logs `Auto` on channel 0.
+- [ ] Lane 7. Repeat for Backyard, Front R, and Backyard Right. Save `night-lane-7.png`. Pass when each camera logs `Off` then `Auto` on its own channel, including NVR channels 3 and 6.
 - [ ] Lane 8. Flag false on a scratch camera. Save `night-lane-8.png`. Pass when toggling Home does not write IR.
 - [ ] Lane 9. Turn the Front L floodlight on after the night change. Save `night-lane-9.png`. Pass when the light still works.
 - [ ] Lane 10. Restart. Save `night-lane-10.png`. Pass when NightVision matches the camera and firmware is still `1.3.16`.
@@ -526,7 +525,7 @@ Each live lane runs on its own cloud VM at the PR head. Apple Home has no `contr
 - [ ] Metric. Whether an IR write exists, on trunk and head. On the head, milliseconds from NightVision false to the IR log line.
 - [ ] Probe. Interleave trunk and head. Record the write on both. Time it only on the head.
 - [ ] Baseline. Record the trunk absence first.
-- [ ] Rule. Fail if the IR log line is missing at 2 seconds. The 2 second figure is a budget. Nobody has measured it on this branch. The reason matches the other write budgets. Fail if any write uses a value that was not in the named record. The owner measures the real delay before merge.
+- [ ] Rule. Fail if the IR log line is missing at 2 seconds. The 2 second figure is a budget. Nobody has measured it on this branch. The reason matches the other write budgets. Fail if any write uses a state other than `Auto` or `Off`, or a channel other than that camera's channel. The owner measures the real delay before merge.
 
 **Review gate.** The operator reviews before merge.
 
@@ -539,7 +538,7 @@ Each live lane runs on its own cloud VM at the PR head. Apple Home has no `contr
 - [ ] Root's clean verdict at the exact head SHA.
 - [ ] Bugbot triage done.
 - [ ] Rebased onto current trunk after the verdict, patch-id unchanged.
-- [ ] The root appends this PR to the stack. The operator lands it. The owner does not merge. If this PR was never spawned, the operator lands the stack through home-mode.
+- [ ] The root appends this PR to the stack. The operator lands it. The owner does not merge.
 - [ ] Rollback. Set the nightVision flags false and restart. IR writes stop. The camera keeps whatever IR state it already had. Do not delete `.homekit`.
 
 ## Close the program
@@ -551,23 +550,25 @@ Each live lane runs on its own cloud VM at the PR head. Apple Home has no `contr
 
 No prototype branch exists. A hardware prototype would have to publish to the Mini or SSH to a camera. This plan forbids both until the operator says deploy. The ability questions are not open. Home Manager already ran read-only GetAbility, and Appendix E is that evidence.
 
-These questions stay unproven. No run in this plan can settle them.
+Four operator questions stay open. No run in this plan can settle them. Floodlight, talk, and IR are not in that set. Their defaults come from the public clients in Appendix F. The live lanes still have to show this house accepts the bodies. A rejection fails the lane and the owner stops. That is a field check, and it does not go back to the operator for a command name.
 
-The no-repair path for category 18 is unproven. `progress/attempt-006.md` records a 2026-06-12 measurement. A `c#` bump did not flush the iPhone camera profile. Removing the accessory and pairing it again did. That note also says the Doorbell service wants one re-pair. It does not measure category 18. The default is to try the no-repair path and stop if Home keeps the old category. The operator can instead say to remove and re-pair only the Doorbell.
+Question 1 is re-pair. The no-repair path for category 18 is unproven. `progress/attempt-006.md` records a 2026-06-12 measurement. A `c#` bump did not flush the iPhone camera profile. Removing the accessory and pairing it again did. That note also says the Doorbell service wants one re-pair. It does not measure category 18. The default is to try the no-repair path and stop if Home keeps the old category. The operator can instead say to remove and re-pair only the Doorbell.
 
-The floodlight write command name is unproven. The default is to keep floodlight unspawned until the name is supplied. The operator can send the command name Home Manager already saw.
+Floodlight write is cmd `SetWhiteLed`. `WhiteLed.channel` is the camera channel. `state` is 1 or 0. `bright` is an integer from 0 to 100. This is `set_whiteled` in reolink_aio. The Home Assistant light entity calls that function for on, off, and brightness. Home Assistant maps its 1 to 255 light scale onto 1 to 100 before the call. Home Brightness is already 0 to 100, so Argus passes that integer through. The library comment says the shape is still to be confirmed, and it guesses at `mode`. The code still sends the channel argument. The Home Assistant entity does not send `mode`. `set_spotlight` also rewrites `LightingSchedule` and forces brightness 100. Do not use it. GetWhiteLed is still not a capability test. Field check. Lanes 2 through 6 must show channel 2 moves only Front L and channel 3 moves only Front R, and that brightness 1 and 100 are accepted.
 
-The talk command name is unproven. The same default applies. A talk permit flag is not a substitute.
+Talk audio is Baichuan on TCP port 9000. The neolink README says a camera that uses port 9000 is speaking Baichuan. `sample_config.toml` puts the camera address on that port. `neolink talk` uses that camera connection. `BcCamera.talk` reads `TalkAbility`, requires audio type `adpcm`, then sends the samples. `src/talk/mod.rs` copies the sample rate and block size from `TalkAbility`. The README example still shows `--sample-rate` and `--block-size`. Those flags are absent from `src/talk/cmdline.rs` on master. Do not copy them into Argus. reolink_aio does not send the samples. Its Baichuan client only marks `two_way_audio` after `cmd_id` 10. The Home Assistant reolink integration says 2-way audio is not available there. The same page lists TCP port 9000 among the ports that must stay open. HAP talkback is feasible. hap-nodejs 0.14.3 `twoWayAudio` adds the Speaker service. The talk owner receives the controller audio RTP on the stream session and feeds the neolink talk sequence. The owner confirms that receive socket in hap-nodejs 0.14.3 before coding. `audioReturnSocket` stays the RTCP socket from `spawnLive`. Field check. A person at the Doorbell hears the phone. If `TalkAbility` is missing or the audio type is not `adpcm`, the lane fails and the owner stops. A permit flag still does not enable talk. No other camera opens the port.
 
-The IR off value and IR write command are unproven. The default is to leave night vision in the Reolink app. The operator can send the off value and the command name.
+IR write is cmd `SetIrLights` with `action` 0. `IrLights.channel` is the camera channel. State `Auto` means night vision on. State `Off` means night vision off. This is `set_ir_lights`. `ir_enabled` is true only when the cached state is `Auto`. The night PR stays in the stack. Field check. Lanes 2 through 7 must show `Auto` and `Off` accepted on every camera, including NVR channels 2, 3, and 6. `Auto` on Backyard Left must not be replaced with a color write.
 
-NVR `GetAiState` through the recorder is unproven. The client skips it after one failure. The default is to keep push off and to log `ai_skipped` when the read fails. The operator can ask for a later plan that turns push on. This plan does not turn push on.
+Question 5 is NVR push. `GetAiState` through the recorder is unproven. The client skips it after one failure. The default is to keep push off and to log `ai_skipped` when the read fails. The operator can ask for a later plan that turns push on. This plan does not turn push on.
 
 Front L and Front R are not a guess. Home Manager names them as channels 2 and 3, in that order. `docs/camera-health.md` names Preview_03 and Preview_04 in that same order. `progress/attempt-002.md` names the D1200s as channels 2 and 3, and the D500 as channel 6. Backyard Right is that D500.
 
-The recommended house opt-in, once the blocked names exist, is spotlight on Front L and Front R, siren on Backyard Left and the Doorbell, talk and doorbell on the Doorbell, and privacy on all seven. Night stays off until its values exist. The schema default remains false, so deploying the code changes nothing until the house file opts in. The operator can say to leave privacy off.
+The recommended house opt-in is spotlight on Front L and Front R, siren on Backyard Left and the Doorbell, talk and doorbell on the Doorbell, night vision on all seven, and privacy on all seven. The schema default remains false, so deploying the code changes nothing until the house file opts in.
 
-Ring light stays in the Reolink app. The operator can say to expose on or off as a Switch and accept that keep is dropped.
+Question 7 is privacy. The operator can say to leave privacy off.
+
+Question 6 is the ring light. It stays in the Reolink app. The operator can say to expose on or off as a Switch and accept that keep is dropped.
 
 ## Appendix B. Alternatives rejected
 
@@ -589,7 +590,7 @@ A Switch for the ring light was rejected. The recorded modes are on, off, or kee
 
 A zoom or focus slider was rejected. HAP has no standard zoom or focus characteristic for this camera profile. No camera has PTZ, so there is no PTZ control to reuse.
 
-Publishing NightVision before the off value exists was rejected. A switch that snaps back is worse than leaving IR in the Reolink app.
+Publishing NightVision with a guessed off string was rejected. The off value is the string `Off` from `set_ir_lights`. A switch that sends any other off string is worse than leaving IR in the Reolink app.
 
 ## Appendix C. Risks
 
@@ -607,9 +608,9 @@ Apple Home has no control skill here. Live lanes are manual. That is a risk for 
 
 The siren may clear itself. siren lane 9 records latch or follow. A switch left on while the camera is silent is a defect.
 
-Brightness scale is unknown. floodlight lanes send 1 and 100 and stop on rejection.
+Brightness range in `set_whiteled` is 0 to 100. The library comment still says the shape is to be confirmed. floodlight lanes send 1 and 100 and stop on rejection.
 
-Night write values are unknown. night does not spawn without them.
+Night write values are `Auto` and `Off` on the camera channel. The live lanes are the field check. A rejection stops the owner.
 
 `tests/invariants.test.ts` rejects a new markdown file under `docs`. This plan lives at `plans/camera-controls.md` so that test stays green without a code edit.
 
@@ -636,6 +637,8 @@ Read these before editing.
 Stream shape is already measured. Do not re-probe it. The old backyard restream host mix-up is Home Manager's separate fix. Do not record addresses.
 
 doorbell and talk get `pstack/skills/how/SKILL.md` and `pstack/skills/interrogate/SKILL.md` before their owners call the design done. floodlight and siren get the how skill. The decision trail for each owner follows `pstack/skills/show-me-your-work/SKILL.md`.
+
+The command citations for floodlight, talk, and IR are in Appendix F. Read those files before editing the write path. Do not copy sample addresses or passwords out of the neolink config.
 
 ## Appendix E. Ability matrix
 
@@ -673,11 +676,11 @@ Standalone push was not in the evidence. The program does not read it and does n
 
 | Ability | HomeKit | Cameras | Else |
 | --- | --- | --- | --- |
-| Floodlight on, and brightness | Lightbulb On, and Brightness | Front L, Front R | Reolink app |
+| Floodlight on, and brightness | Lightbulb On and Brightness, written with `SetWhiteLed` | Front L, Front R | Reolink app |
 | Siren | Switch On | Backyard Left on V1, Doorbell on V20 | Reolink app |
-| Talk | HAP return audio on the camera stream | Doorbell | Reolink app |
+| Talk | `twoWayAudio` bridged to Baichuan port 9000 | Doorbell | Reolink app |
 | Button | Category 18, Doorbell service, single press | Doorbell | not present |
-| IR | NightVision boolean | all seven, after the off value is named | Reolink app until then |
+| IR | NightVision boolean, written with `SetIrLights` | all seven, flag default false | Reolink app when the flag is false |
 | Privacy and camera active | CameraOperatingMode ManuallyDisabled and HomeKitCameraActive | all seven, flag default false | unchanged |
 | Person, vehicle, animal | MotionDetected only | types the ability lists | hub labels the clip |
 | Zoom and focus | none | Front L, Front R, Backyard Right | Reolink app |
@@ -693,5 +696,65 @@ Detection command, already run by Home Manager, read-only. Do not run a write. D
 Send cmd GetAbility and action 0, with the same channel parameter `GetMdState` uses. Standalone cameras use channel 0. Front L uses channel 2. Front R uses channel 3. Backyard Right uses channel 6. Read spotlight, siren, talk, BELL, IR, and AI types from that payload only.
 
 Siren writes, later, use V1 on Backyard Left and V20 on the Doorbell. The Set command is the pair of that Get API. Do not cross them.
+
+Floodlight writes use `SetWhiteLed`. The body is the one `set_whiteled` builds when state and brightness are passed and mode is left unset. Channel is present. `mode` is absent. `LightingSchedule` is absent. Front L uses channel 2 on the NVR host. Front R uses channel 3 on that same host. Standalone cameras are not in this write.
+
+```json
+[
+  {
+    "cmd": "SetWhiteLed",
+    "param": {
+      "WhiteLed": {
+        "channel": 2,
+        "state": 1,
+        "bright": 100
+      }
+    }
+  }
+]
+```
+
+Off is the same body with `state` 0. A brightness-only change sends `channel` and `bright` and omits `state`.
+
+IR writes use `SetIrLights`. The body is the one `set_ir_lights` builds. True sends `Auto`. False sends `Off`. The channel is the camera channel. This example is Front L. Standalone cameras use channel 0. Front R uses 3. Backyard Right uses 6.
+
+```json
+[
+  {
+    "cmd": "SetIrLights",
+    "action": 0,
+    "param": {
+      "IrLights": {
+        "channel": 2,
+        "state": "Auto"
+      }
+    }
+  }
+]
+```
+
+Talk has no HTTP body in reolink_aio or in the Home Assistant integration. Follow neolink `BcCamera.talk` on the camera connection. That connection is TCP port 9000. The samples are ADPCM as `TalkAbility` describes them. Do not add a `Set` command for the audio.
+
+Sources for these three defaults.
+
+`https://github.com/starkillerOG/reolink_aio/blob/main/reolink_aio/api.py` holds `set_whiteled`, `set_spotlight`, `set_ir_lights`, and `ir_enabled`.
+
+`https://github.com/home-assistant/core/blob/dev/homeassistant/components/reolink/light.py` calls `set_whiteled` for on, off, and brightness.
+
+`https://github.com/starkillerOG/reolink_aio/blob/main/reolink_aio/baichuan/baichuan.py` marks `two_way_audio` from `cmd_id` 10 and does not send the samples.
+
+`https://github.com/QuantumEntangledAndy/neolink/blob/master/README.md` describes port 9000 as Baichuan and documents `neolink talk`.
+
+`https://github.com/QuantumEntangledAndy/neolink/blob/master/sample_config.toml` sets the camera address port to 9000. Do not copy the sample addresses or passwords.
+
+`https://github.com/QuantumEntangledAndy/neolink/blob/master/crates/core/src/bc_protocol/talk.rs` is `BcCamera.talk`.
+
+`https://github.com/QuantumEntangledAndy/neolink/blob/master/src/talk/mod.rs` copies sample rate and block size from `TalkAbility`.
+
+`https://github.com/QuantumEntangledAndy/neolink/blob/master/src/talk/cmdline.rs` has no sample-rate flag and no block-size flag.
+
+`https://www.home-assistant.io/integrations/reolink/` says 2-way audio is not available in that integration, and lists TCP port 9000 among the ports that must stay open.
+
+`https://github.com/homebridge/HAP-NodeJS/blob/v0.14.3/src/lib/camera/RTPStreamManagement.ts` defines `twoWayAudio`.
 
 Rollback of a flag is the same end state every time. Set that flag false, restart Argus, and leave `.homekit` in place. A second restart stays at the same tiles. A code revert is for when the flag is not enough. Never bump the firmware revision on the way back. Never delete pairings as a rollback. If the Doorbell was re-paired, ask the operator before pairing it again.
