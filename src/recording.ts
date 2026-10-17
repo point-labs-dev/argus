@@ -1,4 +1,5 @@
 import { type ChildProcess, spawn } from "node:child_process";
+import { createRequire } from "node:module";
 
 import {
   type CameraRecordingConfiguration,
@@ -13,9 +14,13 @@ import {
   VideoCodecType,
 } from "hap-nodejs";
 
+import type { CameraAspect } from "./config.js";
 import { readFragmentedMp4 } from "./mp4.js";
 import { emitTelemetry } from "./telemetry.js";
 import { emitTiming } from "./timing.js";
+import { boxMatchesCameraAspect, buildAspectScaleFilter } from "./video-filter.js";
+
+const require = createRequire(import.meta.url);
 
 const PROFILE_TO_X264: Record<number, string> = {
   [H264Profile.BASELINE]: "baseline",
@@ -35,6 +40,41 @@ const SAMPLERATE_TO_HZ: Record<number, number> = {
   [AudioRecordingSamplerate.KHZ_44_1]: 44100,
   [AudioRecordingSamplerate.KHZ_48]: 48000,
 };
+
+type HapCloseReasonEnum = Record<string, number | string>;
+
+/** Names and values of hap-nodejs `HDSProtocolSpecificErrorReason`. Nothing else is logged. */
+function hapCloseReasonTables(): { names: ReadonlySet<string>; byValue: ReadonlyMap<number, string> } {
+  const hap = require("hap-nodejs") as { HDSProtocolSpecificErrorReason: HapCloseReasonEnum };
+  const names = new Set<string>();
+  const byValue = new Map<number, string>();
+  for (const [key, value] of Object.entries(hap.HDSProtocolSpecificErrorReason)) {
+    if (typeof value !== "number") continue;
+    names.add(key);
+    byValue.set(value, key);
+  }
+  return { names, byValue };
+}
+
+const HAP_CLOSE_REASONS = hapCloseReasonTables();
+
+function sanitizeRecordingCloseReason(reason: unknown): string {
+  if (reason === undefined) return "none";
+  if (typeof reason === "number") {
+    return HAP_CLOSE_REASONS.byValue.get(reason) ?? "other";
+  }
+  if (typeof reason === "string" && HAP_CLOSE_REASONS.names.has(reason)) {
+    return reason;
+  }
+  return "other";
+}
+
+function requireAspect(aspect: unknown, label: string): CameraAspect {
+  if (aspect !== "16:9" && aspect !== "4:3") {
+    throw new Error(`${label} requires aspect "16:9" or "4:3"`);
+  }
+  return aspect;
+}
 
 /** Recording options Argus offers to HomeKit (resolutions cover the required set). */
 export function buildRecordingOptions(): CameraRecordingOptions {
@@ -74,12 +114,23 @@ export function buildRecordingOptions(): CameraRecordingOptions {
   };
 }
 
+function recordingVideoFilter(width: number, height: number, aspect: CameraAspect): string {
+  if (aspect === "16:9" || boxMatchesCameraAspect(width, height, aspect)) {
+    return `scale=${width}:${height}`;
+  }
+  return buildAspectScaleFilter({ width, height, aspect, fit: "pad" });
+}
+
 /**
  * Pure builder for the FFmpeg fragmented-MP4 command HKSV records from. Unlike live
  * view, recording uses the full-res MAIN stream (transcoded H.264 + AAC-LC), with
  * keyframes aligned to the fragment length so each fragment starts on an IDR.
  */
-export function buildRecordingFfmpegArgs(mainUrl: string, config: CameraRecordingConfiguration): string[] {
+export function buildRecordingFfmpegArgs(
+  mainUrl: string,
+  config: CameraRecordingConfiguration,
+  aspect: CameraAspect,
+): string[] {
   const [width, height, fps] = config.videoCodec.resolution;
   const params = config.videoCodec.parameters;
   const profile = PROFILE_TO_X264[params.profile] ?? "high";
@@ -110,7 +161,7 @@ export function buildRecordingFfmpegArgs(mainUrl: string, config: CameraRecordin
     "-pix_fmt", "yuv420p",
     "-color_range", "tv",
     "-r", String(fps),
-    "-vf", `scale=${width}:${height}`,
+    "-vf", recordingVideoFilter(width, height, aspect),
     "-b:v", `${params.bitRate}k`,
     "-maxrate", `${params.bitRate}k`,
     "-bufsize", `${2 * params.bitRate}k`,
@@ -133,6 +184,7 @@ export interface RecordingDelegateOptions {
   ffmpegPath?: string;
   verbose?: boolean;
   spawnFn?: typeof spawn;
+  aspect: CameraAspect;
 }
 
 /**
@@ -148,19 +200,23 @@ export class ArgusRecordingDelegate implements CameraRecordingDelegate {
   private readonly ffmpegPath: string;
   private readonly verbose: boolean;
   private readonly spawnFn: typeof spawn;
+  private readonly aspect: CameraAspect;
 
   public constructor(
     private readonly cameraName: string,
     private readonly mainUrl: string,
-    options: RecordingDelegateOptions = {},
+    options: RecordingDelegateOptions,
   ) {
+    this.aspect = requireAspect(options?.aspect, "ArgusRecordingDelegate");
     this.ffmpegPath = options.ffmpegPath ?? "ffmpeg";
     this.verbose = options.verbose ?? true;
     this.spawnFn = options.spawnFn ?? spawn;
   }
 
   public updateRecordingActive(active: boolean): void {
+    if (this.active === active) return;
     this.active = active;
+    emitTelemetry(this.cameraName, "hksv_recording_active", { active });
   }
 
   public updateRecordingConfiguration(configuration: CameraRecordingConfiguration | undefined): void {
@@ -179,7 +235,7 @@ export class ArgusRecordingDelegate implements CameraRecordingDelegate {
     });
     emitTiming({ stage: "recording_start", camera: this.cameraName, streamId });
 
-    const args = buildRecordingFfmpegArgs(this.mainUrl, config);
+    const args = buildRecordingFfmpegArgs(this.mainUrl, config, this.aspect);
     if (this.verbose) {
       process.stderr.write(`[argus ${this.cameraName}] HKSV recording ${config.videoCodec.resolution.join("x")} -> ffmpeg ${args.join(" ")}\n`);
     }
@@ -220,8 +276,15 @@ export class ArgusRecordingDelegate implements CameraRecordingDelegate {
     }
   }
 
-  public closeRecordingStream(streamId: number, _reason: unknown): void {
-    this.processes.get(streamId)?.kill("SIGKILL");
-    this.processes.delete(streamId);
+  public closeRecordingStream(streamId: number, reason: unknown): void {
+    try {
+      this.processes.get(streamId)?.kill("SIGKILL");
+      this.processes.delete(streamId);
+    } finally {
+      emitTelemetry(this.cameraName, "hksv_recording_close", {
+        streamId,
+        reason: sanitizeRecordingCloseReason(reason),
+      });
+    }
   }
 }

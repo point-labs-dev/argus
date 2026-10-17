@@ -84,6 +84,7 @@ import {
 import type { CameraAspect, CameraConfig } from "./config.js";
 import { prepareAnswer } from "./homekit/prepare-answer.js";
 import { ArgusRecordingDelegate, buildRecordingOptions } from "./recording.js";
+import { buildAspectScaleFilter } from "./video-filter.js";
 import type { SnapshotCache, SnapshotProfile } from "./snapshot-cache.js";
 import { emitTelemetry } from "./telemetry.js";
 import { emitTiming } from "./timing.js";
@@ -276,9 +277,12 @@ export function buildLiveFfmpegArgs(input: LiveFfmpegInput, includeAudio = true)
           "-pix_fmt", "yuv420p",
           "-color_range", "tv",
           "-r", String(video.fps),
-          "-vf", input.aspect === "4:3"
-            ? `scale=${boxWidth}:${boxHeight}:force_original_aspect_ratio=increase:force_divisible_by=2,crop=${boxWidth}:${boxHeight},setsar=1`
-            : `scale=${boxWidth}:${boxHeight}:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=${boxWidth}:${boxHeight}:(ow-iw)/2:(oh-ih)/2`,
+          "-vf", buildAspectScaleFilter({
+            width: boxWidth,
+            height: boxHeight,
+            aspect: input.aspect,
+            fit: input.aspect === "4:3" ? "crop" : "pad",
+          }),
           "-bf", "0",
           ...keyframeArgs,
           // CBR-style encoding (camera-ffmpeg pattern): -b:v sets target bitrate.
@@ -1136,6 +1140,7 @@ export const ARGUS_FIRMWARE_REVISION = "1.3.16";
 export interface CameraAccessoryHandle {
   accessory: Accessory;
   delegate: ArgusStreamingDelegate;
+  recordingDelegate: ArgusRecordingDelegate;
   /** Update the camera's HomeKit MotionSensor (triggers HKSV recording). */
   setMotion: (detected: boolean) => void;
 }
@@ -1172,6 +1177,8 @@ export function createCameraAccessory(
   const recordingDelegate = new ArgusRecordingDelegate(camera.name, mainUrl, {
     ...(options.ffmpegPath ? { ffmpegPath: options.ffmpegPath } : {}),
     ...(options.verbose !== undefined ? { verbose: options.verbose } : {}),
+    ...(options.spawnFn ? { spawnFn: options.spawnFn } : {}),
+    aspect: camera.aspect,
   });
   const controller = new CameraController(
     buildCameraControllerOptions(
@@ -1192,6 +1199,7 @@ export function createCameraAccessory(
   return {
     accessory,
     delegate,
+    recordingDelegate,
     setMotion: (detected: boolean) => {
       if (!motionSensor) return;
       motionSensor.updateCharacteristic(Characteristic.MotionDetected, detected);

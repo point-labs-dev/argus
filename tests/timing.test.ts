@@ -214,6 +214,7 @@ describe("timing call sites", () => {
     const delegate = new ArgusRecordingDelegate("Garage Door", "rtsp://admin:s3cret-pass@10.0.0.8/main", {
       spawnFn,
       verbose: false,
+      aspect: "4:3",
     });
     delegate.updateRecordingConfiguration({
       prebufferLength: 4000,

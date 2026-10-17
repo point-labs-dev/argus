@@ -35,7 +35,11 @@ const spawnFn = (bin, args, opts) => {
   return spawn(bin, patched, opts);
 };
 
-const delegate = new ArgusRecordingDelegate("harness", "rtsp://unused", { spawnFn, verbose: false });
+const delegate = new ArgusRecordingDelegate("harness", "rtsp://unused", {
+  spawnFn,
+  verbose: false,
+  aspect: "16:9",
+});
 delegate.updateRecordingConfiguration(config);
 
 const t0 = Date.now();
