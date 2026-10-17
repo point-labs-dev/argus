@@ -11,15 +11,15 @@
 cameras:
   # House aspect values from the 2026-10-16 read-only ffprobe (docs/camera-health.md
   # and docs/aspect-migration.md). Copy these into argus.yaml before the next deploy.
-  #   Garage Door: "4:3"       main 2560x1920, sub 640x480
-  #   Backyard: "4:3"          main 2560x1920 ~18.8fps, sub 640x480 15fps
-  #   Backyard Right: "4:3"    size not settled. 2026-10-16 summary says
-  #                            2560x1920 / 640x480. attempt-005 and LEARNINGS say
-  #                            NVR add-on, 896x512 sub, 12MP HEVC main.
-  #   Doorbell: "4:3"          inferred, not measured. DHCP unreachable.
-  #   Backyard Left: "16:9"    main 3840x2160 hevc, sub 640x360
-  #   Front L: "16:9"          main 4512x2512 hevc 25fps, sub 896x512
-  #   Front R: "16:9"          main 4512x2512 hevc 25fps, sub 896x512
+  #   Garage Door: "4:3"       main 2560x1920, sub 640x480, AAC-LC 16k
+  #   Backyard: "4:3"          RLC-520A. main 2560x1920, sub 640x480, AAC-LC 16k
+  #   Backyard Right: "4:3"    D500, NVR h264Preview_07 ch6. main 2560x1920
+  #                            h264 25fps, sub 640x480, AAC-LC 16k
+  #   Doorbell: "4:3"          Reolink Video Doorbell PoE. measured main
+  #                            2560x1920 h264 High 20fps, sub 640x480, AAC-LC 16k
+  #   Backyard Left: "16:9"    main 3840x2160 HEVC, sub 640x360, AAC-LC 16k
+  #   Front L: "16:9"          Preview_03. main 4512x2512 HEVC 25fps, sub 896x512
+  #   Front R: "16:9"          Preview_04. main 4512x2512 HEVC 25fps, sub 896x512
   # Standalone camera — host is the camera's own IP, channel 0.
   # A 4K model: set mainCodec: h265 so the main stream is served over RTSP.
   - name: "Backyard Left"
@@ -39,10 +39,11 @@ cameras:
     aspect: "16:9"          # measured 4512x2512 main, 896x512 sub. "16:9" pads. "4:3" crops.
     host: 192.168.1.113     # the NVR's IP
     channel: 2              # NVR channel (RTSP path becomes h264Preview_03_*)
-    mainCodec: h265         # progress/attempt-003.md: Front L's main is HEVC
-                            # (hevc 4512x2512 on the h264Preview path). h264 sent
-                            # the FLV main first and the recording source hung.
-                            # The path name stays h264Preview_*; FLV main is skipped.
+    mainCodec: h265         # 2026-10-16 ffprobe: Front L main is 4512x2512 HEVC
+                            # at 25 fps (Preview_03). progress/attempt-003.md:
+                            # h264 sent the FLV main first and the recording
+                            # source hung. The path name stays h264Preview_*;
+                            # FLV main is skipped.
     username: admin
     password: change-me
     transport: auto

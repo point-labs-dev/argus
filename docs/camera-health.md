@@ -62,32 +62,79 @@ Expect 14 go2rtc names if those seven names are unchanged: `garage-door` and `ga
 
 ## Measured frames (2026-10-16)
 
-Home Manager ran a read-only `ffprobe` on the Mini at about 8:00 PM ET on 2026-10-16, with Peter's OK. Credentials stay redacted. Source: that Mini reading. Method: `ffprobe` of the live main and sub streams. Doorbell did not answer.
+Home Manager ran a read-only `ffprobe -show_streams` on the Mini on 2026-10-16, with Peter's OK. Credentials stay redacted. Audio on every stream below is AAC-LC 16k. The raw file is held by Home Manager. This note records the key fields only.
 
 | Camera | Main | Sub | Aspect |
 |---|---|---|---|
-| Garage Door | 2560x1920, h264 High, AAC-LC 16k | 640x480 | 4:3 |
-| Backyard | 2560x1920, about 18.8 fps | 640x480, 15 fps | 4:3 |
-| Backyard Right | not settled. Summary said 2560x1920, 25 fps. attempt-005 says 12MP HEVC | not settled. Summary said 640x480. attempt-005 and LEARNINGS say 896x512 | 4:3 from the 2026-10-16 summary only |
-| Backyard Left | 3840x2160, hevc Main, `h265Preview` path | 640x360 | 16:9 |
-| Front L | 4512x2512, hevc Main, 25 fps | 896x512 (1.75) | 16:9 from the main |
-| Front R | 4512x2512, hevc Main, 25 fps | 896x512 (1.75) | 16:9 from the main |
-| Doorbell | not measured | not measured | 4:3 inferred, not measured |
+| Garage Door | 2560x1920, AAC-LC 16k | 640x480, AAC-LC 16k | 4:3 |
+| Doorbell (Reolink Video Doorbell PoE) | 2560x1920, h264 High, 20 fps, AAC-LC 16k. Measured | 640x480, AAC-LC 16k. Measured | 4:3 |
+| Backyard (RLC-520A) | 2560x1920, AAC-LC 16k | 640x480, AAC-LC 16k | 4:3 |
+| Backyard Right (D500, NVR `h264Preview_07`, ch6) | 2560x1920, h264, 25 fps, AAC-LC 16k | 640x480, AAC-LC 16k | 4:3 |
+| Backyard Left | 3840x2160, HEVC, AAC-LC 16k | 640x360, AAC-LC 16k | 16:9 |
+| Front L (`Preview_03`) | 4512x2512, HEVC, 25 fps, AAC-LC 16k | 896x512, AAC-LC 16k | 16:9 |
+| Front R (`Preview_04`) | 4512x2512, HEVC, 25 fps, AAC-LC 16k | 896x512, AAC-LC 16k | 16:9 |
 
 Garage Door's main is 2560x1920. The stream-check sample above uses that size.
 
-Backyard Right is not settled. The 2026-10-16 summary row said main 2560x1920 at 25 fps and sub 640x480. `progress/attempt-005.md` (2026-06-12) says Front L, Front R, and Backyard Right are NVR add-on cameras whose probed sub is 896x512 and whose main is 12MP HEVC. `LEARNINGS.md` (2026-06-11) says the NVR ext/sub map is 896x512 for 16:9 and 896x672 for 4:3, and that on NVR channels ext and sub are the same stream. The aspect value in `docs/aspect-migration.md` stays the summary's `4:3` until the raw probe below is filled in. The summary is not a substitute for that probe.
+The 12MP HEVC main and 896x512 sub belong to Front L and Front R (`Preview_03` and `Preview_04`). An earlier note had put that pair on Backyard Right. That was a channel mix-up. Backyard Right is the D500 on `h264Preview_07` channel 6: 2560x1920 h264 at 25 fps, sub 640x480. `progress/attempt-005.md` and `LEARNINGS.md` are corrected to say that.
 
-Doorbell did not answer. Its `4:3` is inferred and was not measured.
+Doorbell is a Reolink Video Doorbell PoE. It was measured at 4:3.
 
-## Raw ffprobe
+### Garage Door main
 
-Home Manager will paste the redacted `ffprobe -show_streams` output here. This file does not contain that output.
+2560x1920. Aspect 4:3. AAC-LC 16k.
 
-```text
-# placeholder: redacted ffprobe -show_streams
-# Home Manager supplies this. Do not invent stream lines.
-```
+### Garage Door sub
+
+640x480. AAC-LC 16k.
+
+### Doorbell main
+
+Reolink Video Doorbell PoE. 2560x1920, h264 High, 20 fps. Aspect 4:3. AAC-LC 16k. Measured.
+
+### Doorbell sub
+
+640x480. AAC-LC 16k. Measured.
+
+### Backyard main
+
+RLC-520A. 2560x1920. Aspect 4:3. AAC-LC 16k.
+
+### Backyard sub
+
+640x480. AAC-LC 16k.
+
+### Backyard Right main
+
+D500. NVR `h264Preview_07`, channel 6. 2560x1920, h264, 25 fps. Aspect 4:3. AAC-LC 16k.
+
+### Backyard Right sub
+
+640x480. AAC-LC 16k.
+
+### Backyard Left main
+
+3840x2160, HEVC. Aspect 16:9. AAC-LC 16k.
+
+### Backyard Left sub
+
+640x360. AAC-LC 16k.
+
+### Front L main
+
+`Preview_03`. 4512x2512, HEVC, 25 fps. Aspect 16:9. AAC-LC 16k.
+
+### Front L sub
+
+896x512. AAC-LC 16k.
+
+### Front R main
+
+`Preview_04`. 4512x2512, HEVC, 25 fps. Aspect 16:9. AAC-LC 16k.
+
+### Front R sub
+
+896x512. AAC-LC 16k.
 
 ## LaunchAgent or LaunchDaemon
 
