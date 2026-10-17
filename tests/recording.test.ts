@@ -139,6 +139,13 @@ describe("buildRecordingFfmpegArgs", () => {
     );
     expect(vf).toBe("scale=640:480");
   });
+
+  it("throws when aspect is missing or bogus instead of padding", () => {
+    const url = "rtsp://x/main";
+    const config = recordingConfig([1920, 1080, 30]);
+    expect(() => buildRecordingFfmpegArgs(url, config, undefined as never)).toThrow(/aspect/);
+    expect(() => buildRecordingFfmpegArgs(url, config, "1:1" as never)).toThrow(/aspect/);
+  });
 });
 
 describe("ArgusRecordingDelegate", () => {
@@ -334,6 +341,19 @@ describe("recording hub telemetry", () => {
     const lines = withTelemetry(() => delegate().closeRecordingStream(3, undefined));
     expect(lines).toHaveLength(1);
     expect(telemetryReason(lines[0] ?? "")).toBe("none");
+  });
+
+  it("logs other for close reason 42 and for digit strings 0 through 9", () => {
+    const streamId = 12;
+    const numeric = withTelemetry(() => delegate().closeRecordingStream(streamId, 42));
+    expect(numeric).toHaveLength(1);
+    expect(telemetryReason(numeric[0] ?? "")).toBe("other");
+
+    for (const digit of ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]) {
+      const lines = withTelemetry(() => delegate().closeRecordingStream(streamId, digit));
+      expect(lines).toHaveLength(1);
+      expect(telemetryReason(lines[0] ?? "")).toBe("other");
+    }
   });
 
   it("does not copy an uppercase SRTP close reason into the telemetry line", () => {
