@@ -4,12 +4,19 @@
 
 /** One stalled camera must not hold the motion poll for every other camera. */
 const REQUEST_TIMEOUT_MS = 5_000;
+/** Failed Login waits this long before another attempt. Then the delay doubles. */
+const LOGIN_BACKOFF_START_MS = 5_000;
+const LOGIN_BACKOFF_MAX_MS = 60_000;
 
-/** Drop userinfo so a host string cannot carry a password into a log line. */
+/**
+ * Drop URL userinfo so a host string cannot carry a password into a log line.
+ * `user:password@host` and `scheme://userinfo@host` are stripped.
+ * A bare `user@host` (an email, or `x@y`) is left alone.
+ */
 export function redactCredentialHosts(text: string): string {
   return text
-    .replace(/[^\s/:@]+:[^\s/@]*@[^\s/]+/g, (match) => match.slice(match.lastIndexOf("@") + 1))
-    .replace(/[^\s/:@]+@[^\s/]+/g, (match) => match.slice(match.lastIndexOf("@") + 1));
+    .replace(/([a-z][a-z0-9+.-]*:\/\/)[^\s/@]+(?::[^\s/@]*)?@/gi, "$1")
+    .replace(/(^|[^A-Za-z0-9])([^\s/:@]+):([^\s/@]*)@/g, "$1");
 }
 
 export interface ReolinkClientOptions {
@@ -50,6 +57,10 @@ export type ReolinkClock = {
 export class ReolinkClient {
   private token: string | undefined;
   private tokenExpiresAt = 0;
+  /** Delay before another Login may be attempted. 0 means the next one is immediate. */
+  private loginBackoffMs = 0;
+  /** Earliest `now()` at which Login may run again. 0 means it is not backing off. */
+  private nextLoginAt = 0;
   /** undefined = not probed; false = GetAiState unsupported here (e.g. via the NVR). */
   private aiSupported: boolean | undefined;
   private readonly fetchFn: typeof fetch;
@@ -95,11 +106,26 @@ export class ReolinkClient {
     return first;
   }
 
-  /** Log in (or reuse a still-valid token) and return it. */
+  /** Log in (or reuse a still-valid token) and return it. Repeated Login failures back off. */
   public async ensureToken(): Promise<string> {
     if (this.token && this.now() < this.tokenExpiresAt) {
       return this.token;
     }
+    if (this.nextLoginAt !== 0 && this.now() < this.nextLoginAt) {
+      this.fail(`Login on ${this.options.host} failed: backing off`);
+    }
+    try {
+      const token = await this.requestToken();
+      this.loginBackoffMs = 0;
+      this.nextLoginAt = 0;
+      return token;
+    } catch (error) {
+      this.scheduleLoginBackoff();
+      throw error;
+    }
+  }
+
+  private async requestToken(): Promise<string> {
     const result = await this.call("Login", {
       User: { userName: this.options.username, password: this.options.password },
     });
@@ -115,6 +141,14 @@ export class ReolinkClient {
     const leaseMs = (tokenInfo.leaseTime ?? 3600) * 1000;
     this.tokenExpiresAt = this.now() + Math.max(leaseMs - 60_000, 30_000);
     return this.token;
+  }
+
+  private scheduleLoginBackoff(): void {
+    const delay = this.loginBackoffMs === 0
+      ? LOGIN_BACKOFF_START_MS
+      : Math.min(this.loginBackoffMs * 2, LOGIN_BACKOFF_MAX_MS);
+    this.loginBackoffMs = delay;
+    this.nextLoginAt = this.now() + delay;
   }
 
   /**

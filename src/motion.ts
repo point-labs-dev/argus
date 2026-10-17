@@ -42,6 +42,10 @@ interface CameraState {
   errorBackoffMs: number;
   /** Earliest `now()` at which the next poll error may be logged. 0 logs immediately. */
   nextErrorLogAt: number;
+  /** This camera's interval. A slow camera must not hold the others. */
+  timer: ReturnType<typeof setInterval> | undefined;
+  /** True while this camera's poll is still running. */
+  inFlight: boolean;
 }
 
 export class MotionMonitor {
@@ -50,8 +54,6 @@ export class MotionMonitor {
   private readonly cooldownMs: number;
   private readonly now: () => number;
   private readonly onError: ((cameraName: string, error: Error) => void) | undefined;
-  private timer: ReturnType<typeof setInterval> | undefined;
-  private polling = false;
 
   public constructor(
     cameras: readonly CameraConfig[],
@@ -79,34 +81,50 @@ export class MotionMonitor {
         lastMotionAt: 0,
         errorBackoffMs: 0,
         nextErrorLogAt: 0,
+        timer: undefined,
+        inFlight: false,
       };
     });
   }
 
   public start(): void {
-    if (this.timer) {
+    if (this.states.some((state) => state.timer !== undefined)) {
       return;
     }
-    this.timer = setInterval(() => void this.pollOnce(), this.pollIntervalMs);
+    for (const state of this.states) {
+      state.timer = setInterval(() => {
+        void this.pollCameraIfIdle(state);
+      }, this.pollIntervalMs);
+    }
   }
 
   public stop(): void {
-    if (this.timer) {
-      clearInterval(this.timer);
-      this.timer = undefined;
+    for (const state of this.states) {
+      if (state.timer !== undefined) {
+        clearInterval(state.timer);
+        state.timer = undefined;
+      }
     }
   }
 
-  /** One poll cycle across all cameras. Exposed for tests; re-entrancy guarded. */
+  /**
+   * Poll every camera that is not already in flight.
+   * Exposed for tests. `start` does not use this: each camera has its own timer,
+   * so one stalled host cannot skip the others' ticks.
+   */
   public async pollOnce(): Promise<void> {
-    if (this.polling) {
+    await Promise.all(this.states.map((state) => this.pollCameraIfIdle(state)));
+  }
+
+  private async pollCameraIfIdle(state: CameraState): Promise<void> {
+    if (state.inFlight) {
       return;
     }
-    this.polling = true;
+    state.inFlight = true;
     try {
-      await Promise.all(this.states.map((state) => this.pollCamera(state)));
+      await this.pollCamera(state);
     } finally {
-      this.polling = false;
+      state.inFlight = false;
     }
   }
 

@@ -15,7 +15,7 @@ const DIRECT_AI_PORT = /^(?:[1-9]\d{0,3}|[1-5]\d{4}|6[0-4]\d{3}|65[0-4]\d{2}|655
 const DIRECT_AI_IPV4 = /^(?:(?:25[0-5]|2[0-4]\d|[01]?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d?\d)$/;
 const DIRECT_AI_NAME = /^(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)(?:\.(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?))*$/;
 
-/** Host, or host:port. No scheme, path, userinfo, or whitespace. */
+/** IPv4 host or hostname, with an optional port. IPv6 is unsupported. No scheme, path, userinfo, or whitespace. */
 function isDirectAiHost(value: string): boolean {
   if (value.length === 0 || /\s/.test(value)) return false;
   if (value.includes("://") || value.includes("/") || value.includes("@") || value.includes("?") || value.includes("#")) {
@@ -52,7 +52,7 @@ const cameraSchema = z.object({
   // Video and GetMdState stay on `host`. A host with an optional port only.
   directAiHost: z
     .string()
-    .refine(isDirectAiHost, "cameras[].directAiHost must be a host with an optional port")
+    .refine(isDirectAiHost, "cameras[].directAiHost must be a host with an optional port; IPv6 is unsupported")
     .optional(),
 });
 

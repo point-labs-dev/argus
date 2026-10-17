@@ -97,7 +97,7 @@ npm test
 
 ### Direct AI poll
 
-NVR channels answer `GetAiState` with rspCode -99, so those cameras stay on basic motion unless `cameras[].directAiHost` is set. When it is set, Argus polls `GetAiState` on that host at channel 0 and uses the camera entry's username and password. Video URLs and `GetMdState` stay on `host`. The value is a host with an optional port (`192.168.1.50` or `192.168.1.50:80`) and rejects a scheme, a path, userinfo, and whitespace. Leave it unset to keep a single client. See the commented example on the NVR camera in `argus.example.yaml`.
+NVR channels answer `GetAiState` with rspCode -99, so those cameras stay on basic motion unless `cameras[].directAiHost` is set. When it is set, Argus polls `GetAiState` on that host at channel 0 and uses the camera entry's username and password. Video URLs and `GetMdState` stay on `host`. The value is a host with an optional port (`192.168.1.50` or `192.168.1.50:80`) and rejects a scheme, a path, userinfo, and whitespace. IPv6 is unsupported. Leave it unset to keep a single client. See the commented example on the NVR camera in `argus.example.yaml`.
 
 ### Alert Latency
 

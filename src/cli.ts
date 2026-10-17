@@ -2,6 +2,7 @@
 
 import { chmod, mkdir, writeFile } from "node:fs/promises";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { ConfigError, loadArgusConfig } from "./config.js";
 import { generateGo2RtcYaml } from "./go2rtc.js";
@@ -119,7 +120,7 @@ function isNodeErrorWithCode(error: unknown, code: string): error is NodeJS.Errn
   return typeof error === "object" && error !== null && "code" in error && error.code === code;
 }
 
-function formatError(error: unknown): string {
+export function formatError(error: unknown): string {
   if (error instanceof ConfigError) {
     return redactCredentialHosts(error.message);
   }
@@ -159,4 +160,14 @@ async function main(): Promise<void> {
   }
 }
 
-void main();
+function invokedAsCli(): boolean {
+  const entry = process.argv[1];
+  if (entry === undefined) {
+    return false;
+  }
+  return path.resolve(entry) === fileURLToPath(import.meta.url);
+}
+
+if (invokedAsCli()) {
+  void main();
+}

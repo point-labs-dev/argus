@@ -53,6 +53,7 @@ cameras:
     # Optional. Poll GetAiState on this camera's own host at channel 0.
     # Video and GetMdState stay on host. A host with an optional port only
     # (192.168.1.50 or 192.168.1.50:80): no scheme, path, userinfo, or whitespace.
+    # IPv6 is unsupported.
     # Leave unset to keep GetAiState on host. Example: directAiHost: 192.168.1.50
 
 recording:
