@@ -1,0 +1,17 @@
+{
+  "prototype": true,
+  "audio_on_callback_calls": 1,
+  "audio_on_error": null,
+  "audio_on_key_echo": true,
+  "audio_on_has_audio": true,
+  "audio_off_callback_calls": 1,
+  "audio_off_has_audio": true,
+  "audio_off_ffmpeg_has_audio_codec": false,
+  "state_machine_first_answer": true,
+  "state_machine_second_answer": false,
+  "double_callback_test_prepare_calls": 1,
+  "filter_crop": "scale=1280:720:force_original_aspect_ratio=increase:force_divisible_by=2,crop=1280:720,setsar=1",
+  "filter_default_pad": "scale=1280:720:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=1280:720:(ow-iw)/2:(oh-ih)/2",
+  "bind_not_an_iface": "172.30.0.2",
+  "bind_dotted": "10.0.0.46"
+}
