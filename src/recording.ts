@@ -131,6 +131,7 @@ export function buildRecordingFfmpegArgs(
   config: CameraRecordingConfiguration,
   aspect: CameraAspect,
 ): string[] {
+  const sourceAspect = requireAspect(aspect, "buildRecordingFfmpegArgs");
   const [width, height, fps] = config.videoCodec.resolution;
   const params = config.videoCodec.parameters;
   const profile = PROFILE_TO_X264[params.profile] ?? "high";
@@ -161,7 +162,7 @@ export function buildRecordingFfmpegArgs(
     "-pix_fmt", "yuv420p",
     "-color_range", "tv",
     "-r", String(fps),
-    "-vf", recordingVideoFilter(width, height, aspect),
+    "-vf", recordingVideoFilter(width, height, sourceAspect),
     "-b:v", `${params.bitRate}k`,
     "-maxrate", `${params.bitRate}k`,
     "-bufsize", `${2 * params.bitRate}k`,
