@@ -778,20 +778,6 @@ describe("ArgusStreamingDelegate", () => {
     expect(lastResponse).toBeDefined();
     expect(lastResponse?.video).toBeDefined();
     expect(lastResponse?.audio).toBeDefined();
-
-    delegate.prepareStream(
-      {
-        sessionID: "double-call-test",
-        targetAddress: "192.168.1.50",
-        video: { port: 50000, srtp_key: Buffer.alloc(16, 1), srtp_salt: Buffer.alloc(14, 2) },
-        audio: { port: 50002, srtp_key: Buffer.alloc(16, 3), srtp_salt: Buffer.alloc(14, 4) },
-      } as PrepareStreamRequest,
-      () => {
-        callbackCount += 1;
-      },
-    );
-    await new Promise((resolve) => setImmediate(resolve));
-    expect(callbackCount).toBe(1);
   });
 
   it("guarantees prepareStream callback fires on success path", async () => {

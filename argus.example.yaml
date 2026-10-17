@@ -9,10 +9,19 @@
 #   - H.264 sub streams work over bare HTTP-FLV; H.265 4K main streams need RTSP.
 #   - FLV channel is 0-based (channelN); RTSP Preview is 1-based (Preview_0{N+1}).
 cameras:
+  # House aspect values from the 2026-10-16 read-only ffprobe (docs/camera-health.md
+  # and docs/aspect-migration.md). Copy these into argus.yaml before the next deploy.
+  #   Garage Door: "4:3"       main 2560x1920, sub 640x480
+  #   Backyard: "4:3"          main 2560x1920 ~18.8fps, sub 640x480 15fps
+  #   Backyard Right: "4:3"    main 2560x1920 25fps, sub 640x480
+  #   Doorbell: "4:3"          unverified — DHCP unreachable, not measured; inferred
+  #   Backyard Left: "16:9"    main 3840x2160 hevc, sub 640x360
+  #   Front L: "16:9"          main 4512x2512 hevc 25fps, sub 896x512
+  #   Front R: "16:9"          main 4512x2512 hevc 25fps, sub 896x512
   # Standalone camera — host is the camera's own IP, channel 0.
   # A 4K model: set mainCodec: h265 so the main stream is served over RTSP.
   - name: "Backyard Left"
-    aspect: "16:9"          # "16:9" pads into Home's box. "4:3" crops into it.
+    aspect: "16:9"          # measured 3840x2160 main, 640x360 sub. "16:9" pads. "4:3" crops.
     host: 192.168.1.105
     channel: 0
     mainCodec: h265         # 4K H.265 main -> RTSP-only; omit/set h264 for 1080p models
@@ -25,7 +34,7 @@ cameras:
 
   # NVR-fronted camera — host is the NVR; channel selects the camera on the NVR.
   - name: "Front L"
-    aspect: "16:9"          # "16:9" pads into Home's box. "4:3" crops into it.
+    aspect: "16:9"          # measured 4512x2512 main, 896x512 sub. "16:9" pads. "4:3" crops.
     host: 192.168.1.113     # the NVR's IP
     channel: 2              # NVR channel (RTSP path becomes h264Preview_03_*)
     mainCodec: h264         # the TRUE codec of the channel's main stream — probe it!

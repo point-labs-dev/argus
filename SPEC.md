@@ -123,6 +123,7 @@ When a camera goes offline:
 cameras:
   - name: "Front Door"
     aspect: "16:9"          # "16:9" pads into Home's box. "4:3" crops into it.
+                            # House argus.yaml edits: docs/aspect-migration.md
     host: 192.168.1.100
     channel: 0              # Reolink zero-based channel for HTTP-FLV; RTSP Preview number is channel + 1
     username: admin

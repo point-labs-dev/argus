@@ -29,7 +29,7 @@ Stdout looks like:
 
 ```text
 stream_count=14
-garage-door	UP	h264,2560,1440
+garage-door	UP	h264,2560,1920
 garage-door-sub	UP	h264,640,480
 …
 up_count=14
@@ -59,6 +59,22 @@ Home Manager ran the read-only check on the Mini against `git b1de4c4` (firmware
 | Backyard Right | NVR RLN8-410 channel, recorded 24/7 | up |
 
 Expect 14 go2rtc names if those seven names are unchanged: `garage-door` and `garage-door-sub`, and the same `name` / `name-sub` pair for the other six (lowercase, spaces become hyphens). A different `argus.yaml` produces different names. The script prints the live names.
+
+## Measured frames (2026-10-16)
+
+Home Manager ran a read-only `ffprobe` on the Mini at about 8:00 PM ET on 2026-10-16, with Peter's OK. Credentials stay redacted. Source: that Mini reading. Method: `ffprobe` of the live main and sub streams. Doorbell did not answer.
+
+| Camera | Main | Sub | Aspect |
+|---|---|---|---|
+| Garage Door | 2560x1920, h264 High, AAC-LC 16k | 640x480 | 4:3 |
+| Backyard | 2560x1920, about 18.8 fps | 640x480, 15 fps | 4:3 |
+| Backyard Right | 2560x1920, 25 fps | 640x480 | 4:3 |
+| Backyard Left | 3840x2160, hevc Main, `h265Preview` path | 640x360 | 16:9 |
+| Front L | 4512x2512, hevc Main, 25 fps | 896x512 (1.75) | 16:9 from the main |
+| Front R | 4512x2512, hevc Main, 25 fps | 896x512 (1.75) | 16:9 from the main |
+| Doorbell | not measured, DHCP unreachable | not measured | 4:3 inferred, unverified |
+
+Garage Door's main is 2560x1920. The stream-check sample above uses that size. Backyard Right's 2560x1920 main is the reading that settles the older notes about that camera.
 
 ## LaunchAgent or LaunchDaemon
 

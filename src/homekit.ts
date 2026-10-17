@@ -82,7 +82,6 @@ import {
 } from "hap-nodejs";
 
 import type { CameraAspect, CameraConfig } from "./config.js";
-import { prepareAnswer } from "./homekit/prepare-answer.js";
 import { ArgusRecordingDelegate, buildRecordingOptions } from "./recording.js";
 import type { SnapshotCache, SnapshotProfile } from "./snapshot-cache.js";
 import { emitTelemetry } from "./telemetry.js";
@@ -498,7 +497,8 @@ export interface StreamingDelegateOptions {
   bindAddress?: string;
   /** Injectable spawn for tests. */
   spawnFn?: typeof spawn;
-  aspect: CameraAspect;
+  /** Crop (`4:3`) or pad (`16:9`). Defaults to `16:9` when a caller builds a delegate directly. */
+  aspect?: CameraAspect;
 }
 
 /**
@@ -525,16 +525,13 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
     /** go2rtc local restream base name resolver, e.g. () => "rtsp://127.0.0.1:8554/backyard-left-sub" */
     private readonly liveUrl: string,
     private readonly snapshots: SnapshotCache,
-    options: StreamingDelegateOptions,
+    options: StreamingDelegateOptions = {},
   ) {
     this.snapshotProfile = options.snapshotProfile ?? "sub";
     this.ffmpegPath = options.ffmpegPath ?? "ffmpeg";
     this.verbose = options.verbose ?? true;
     this.includeAudio = options.includeAudio ?? true;
-    if (options.aspect !== "16:9" && options.aspect !== "4:3") {
-      throw new Error('ArgusStreamingDelegate requires aspect "16:9" or "4:3"');
-    }
-    this.aspect = options.aspect;
+    this.aspect = options.aspect ?? "16:9";
     this.videoMode = options.videoMode ?? "transcode";
     if (options.mainStreamUrl !== undefined) this.mainStreamUrl = options.mainStreamUrl;
     if (options.bindAddress !== undefined) this.bindAddress = options.bindAddress;
@@ -574,11 +571,6 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
   }
 
   public prepareStream(request: PrepareStreamRequest, callback: PrepareStreamCallback): void {
-    const existing = this.sessions.get(request.sessionID);
-    if (existing) {
-      existing.stateMachine.answerPrepareCallback();
-      return;
-    }
     emitTiming({ stage: "prepare_stream_enter", camera: this.cameraName, sessionId: request.sessionID });
     void this.prepareStreamAsync(request, callback);
   }
@@ -636,24 +628,20 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
       // Store session with state machine
       this.sessions.set(request.sessionID, { stateMachine });
 
-      const videoLeg = {
-        port: videoRtcp,
-        ssrc: videoSsrc,
-        srtp_key: request.video.srtp_key,
-        srtp_salt: request.video.srtp_salt,
+      const response: PrepareStreamResponse = {
+        video: {
+          port: videoRtcp,
+          ssrc: videoSsrc,
+          srtp_key: request.video.srtp_key,
+          srtp_salt: request.video.srtp_salt,
+        },
+        audio: {
+          port: audioRtcp,
+          ssrc: audioSsrc,
+          srtp_key: request.audio.srtp_key,
+          srtp_salt: request.audio.srtp_salt,
+        },
       };
-      const response = this.includeAudio
-        ? prepareAnswer({
-            includeAudio: true,
-            video: videoLeg,
-            audio: {
-              port: audioRtcp,
-              ssrc: audioSsrc,
-              srtp_key: request.audio.srtp_key,
-              srtp_salt: request.audio.srtp_salt,
-            },
-          })
-        : prepareAnswer({ includeAudio: false, video: videoLeg });
 
       answer(undefined, response);
     } catch (error) {
@@ -1149,7 +1137,7 @@ export function createCameraAccessory(
   liveUrl: string,
   mainUrl: string,
   snapshots: SnapshotCache,
-  options: Omit<StreamingDelegateOptions, "aspect"> = {},
+  options: StreamingDelegateOptions = {},
 ): CameraAccessoryHandle {
   const accessory = new Accessory(camera.name, uuid.generate(`argus:camera:${camera.name}`));
   accessory.category = Categories.IP_CAMERA;

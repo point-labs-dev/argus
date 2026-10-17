@@ -1,15 +1,20 @@
+import { EventEmitter } from "node:events";
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { PrepareStreamRequest, PrepareStreamResponse } from "hap-nodejs";
 import { AudioStreamingCodecType } from "hap-nodejs";
-import { describe, expect, it } from "vitest";
+import { parse as parseYaml } from "yaml";
+import { describe, expect, it, vi } from "vitest";
 
-import { ConfigError, parseArgusConfig } from "../src/config.js";
+import { ConfigError, loadArgusConfig, parseArgusConfig } from "../src/config.js";
 import {
   ArgusStreamingDelegate,
   buildCameraControllerOptions,
   buildLiveFfmpegArgs,
+  createCameraAccessory,
   type LiveFfmpegInput,
 } from "../src/homekit.js";
-import { prepareAnswer } from "../src/homekit/prepare-answer.js";
 import { SessionStateMachine } from "../src/homekit/session-state-machine.js";
 import { SnapshotCache } from "../src/snapshot-cache.js";
 
@@ -77,47 +82,46 @@ function live(aspect: "16:9" | "4:3"): LiveFfmpegInput {
   };
 }
 
-async function answered(includeAudio: boolean): Promise<{ calls: number; response: PrepareStreamResponse }> {
+function streamRequest(sessionID: string): PrepareStreamRequest {
+  return {
+    sessionID,
+    targetAddress: "10.0.0.41",
+    video: { port: 50000, srtp_key: Buffer.alloc(16, 0x11), srtp_salt: Buffer.alloc(14, 0x22) },
+    audio: { port: 50002, srtp_key: Buffer.alloc(16, 0x33), srtp_salt: Buffer.alloc(14, 0x44) },
+  } as PrepareStreamRequest;
+}
+
+async function answered(includeAudio: boolean): Promise<PrepareStreamResponse> {
   const delegate = new ArgusStreamingDelegate(
     "Garage Door",
     "rtsp://127.0.0.1:8554/garage-door-sub",
     cache(),
     { includeAudio, aspect: "4:3", verbose: false },
   );
-  let calls = 0;
-  const response = await new Promise<PrepareStreamResponse>((resolve, reject) => {
-    delegate.prepareStream(
-      {
-        sessionID: includeAudio ? "audio-on" : "audio-off",
-        targetAddress: "10.0.0.41",
-        video: { port: 50000, srtp_key: Buffer.alloc(16, 0x11), srtp_salt: Buffer.alloc(14, 0x22) },
-        audio: { port: 50002, srtp_key: Buffer.alloc(16, 0x33), srtp_salt: Buffer.alloc(14, 0x44) },
-      } as PrepareStreamRequest,
-      (error, value) => {
-        calls += 1;
-        if (error || !value) reject(error ?? new Error("no response"));
-        else resolve(value);
-      },
-    );
+  return new Promise<PrepareStreamResponse>((resolve, reject) => {
+    delegate.prepareStream(streamRequest(includeAudio ? "audio-on" : "audio-off"), (error, value) => {
+      if (error || !value) reject(error ?? new Error("no response"));
+      else resolve(value);
+    });
   });
-  delegate.prepareStream(
-    {
-      sessionID: includeAudio ? "audio-on" : "audio-off",
-      targetAddress: "10.0.0.41",
-      video: { port: 50000, srtp_key: Buffer.alloc(16, 0x11), srtp_salt: Buffer.alloc(14, 0x22) },
-      audio: { port: 50002, srtp_key: Buffer.alloc(16, 0x33), srtp_salt: Buffer.alloc(14, 0x44) },
-    } as PrepareStreamRequest,
-    () => {
-      calls += 1;
-    },
-  );
-  await new Promise((resolve) => setImmediate(resolve));
-  return { calls, response };
+}
+
+function sourceLeg(leg: PrepareStreamResponse["video"] | NonNullable<PrepareStreamResponse["audio"]>) {
+  if (!leg || !("srtp_key" in leg) || !("srtp_salt" in leg) || !leg.srtp_key || !leg.srtp_salt) {
+    throw new Error("expected source SRTP leg");
+  }
+  return leg;
 }
 
 describe("HAP setup contract", () => {
-  it("rejects a delegate that has no aspect", () => {
-    expect(() => new ArgusStreamingDelegate("Garage Door", "rtsp://x", cache(), {} as never)).toThrow(/aspect/);
+  it("defaults a delegate with no aspect to 16:9", () => {
+    const delegate = new ArgusStreamingDelegate("Garage Door", "rtsp://x", cache());
+    expect(delegate.aspect).toBe("16:9");
+    expect(buildCameraControllerOptions(delegate).streamingOptions.video.resolutions.map((row) => `${row[0]}x${row[1]}`)).toEqual([
+      "854x480",
+      "640x480",
+      "640x360",
+    ]);
   });
 
   it("rejects a camera with no aspect and accepts 4:3", () => {
@@ -125,6 +129,19 @@ describe("HAP setup contract", () => {
     expect(() => parseArgusConfig(configBody())).toThrow(/aspect/i);
     expect(() => parseArgusConfig(configBody("1:1"))).toThrow(ConfigError);
     expect(parseArgusConfig(configBody("4:3")).cameras[0]?.aspect).toBe("4:3");
+  });
+
+  it("parses argus.example.yaml and fails when aspect is removed", async () => {
+    const examplePath = join(dirname(fileURLToPath(import.meta.url)), "../argus.example.yaml");
+    const config = await loadArgusConfig(examplePath);
+    expect(config.cameras.map((camera) => `${camera.name}=${camera.aspect}`)).toEqual([
+      "Backyard Left=16:9",
+      "Front L=16:9",
+    ]);
+    const stripped = readFileSync(examplePath, "utf8").replace(/^\s*aspect:.*$/gm, "");
+    expect(stripped).not.toMatch(/^\s*aspect:/m);
+    expect(() => parseArgusConfig(parseYaml(stripped))).toThrow(ConfigError);
+    expect(() => parseArgusConfig(parseYaml(stripped))).toThrow(/aspect/i);
   });
 
   it("crops 4:3 and pads 16:9, including a Garage Door marked 16:9", () => {
@@ -139,6 +156,43 @@ describe("HAP setup contract", () => {
     expect(pad).toContain("-c:a");
   });
 
+  it("wires a parsed 4:3 camera into a 640x480 crop", async () => {
+    const camera = parseArgusConfig(configBody("4:3", "Garage Door")).cameras[0];
+    if (!camera) throw new Error("missing camera");
+    const spawnFn = vi.fn(() => Object.assign(new EventEmitter(), { kill: vi.fn() }));
+    const { delegate } = createCameraAccessory(
+      camera,
+      "rtsp://127.0.0.1:8554/garage-door-sub",
+      "rtsp://127.0.0.1:8554/garage-door",
+      cache(),
+      {
+        spawnFn: spawnFn as never,
+        verbose: false,
+        mainStreamUrl: "rtsp://127.0.0.1:8554/garage-door",
+      },
+    );
+    await new Promise<void>((resolve, reject) => {
+      delegate.prepareStream(streamRequest("garage-wire"), (error) => (error ? reject(error) : resolve()));
+    });
+    await new Promise<void>((resolve, reject) => {
+      delegate.handleStreamRequest(
+        {
+          type: "start",
+          sessionID: "garage-wire",
+          video: { pt: 99, max_bit_rate: 132, fps: 30, mtu: 1378, profile: 0, level: 2, width: 640, height: 480 },
+          audio: { pt: 110, sample_rate: 24, max_bit_rate: 24, codec: AudioStreamingCodecType.AAC_ELD },
+        } as never,
+        (error) => (error ? reject(error) : resolve()),
+      );
+    });
+    const args = (spawnFn as unknown as { mock: { calls: [string, string[]][] } }).mock.calls[0]?.[1];
+    if (!args) throw new Error("ffmpeg was not spawned");
+    const vf = args[args.indexOf("-vf") + 1];
+    expect(vf).toContain("crop=640:480");
+    expect(vf).not.toContain("pad=");
+    delegate.handleStreamRequest({ type: "stop", sessionID: "garage-wire" } as never, () => {});
+  });
+
   it("advertises from aspect, not from the camera name", () => {
     const wideGarage = new ArgusStreamingDelegate("Garage Door", "rtsp://x", cache(), { aspect: "16:9" });
     const wide = buildCameraControllerOptions(wideGarage).streamingOptions.video.resolutions.map(
@@ -150,37 +204,35 @@ describe("HAP setup contract", () => {
     expect(buildCameraControllerOptions(squareLeft).streamingOptions.video.resolutions).toEqual([[640, 480, 30]]);
   });
 
-  it("copies the request SRTP key and omits audio when audio is off", async () => {
+  it("copies the request SRTP key and keeps audio when audio is off", async () => {
     const on = await answered(true);
-    expect(on.calls).toBe(1);
-    expect(on.response.video.srtp_key.equals(Buffer.alloc(16, 0x11))).toBe(true);
-    expect(on.response.video.srtp_salt.equals(Buffer.alloc(14, 0x22))).toBe(true);
-    expect(on.response.audio?.srtp_key.equals(Buffer.alloc(16, 0x33))).toBe(true);
-    expect(on.response.audio?.srtp_salt.equals(Buffer.alloc(14, 0x44))).toBe(true);
+    const onVideo = sourceLeg(on.video);
+    const onAudio = sourceLeg(on.audio);
+    expect(onVideo.srtp_key.equals(Buffer.alloc(16, 0x11))).toBe(true);
+    expect(onVideo.srtp_salt.equals(Buffer.alloc(14, 0x22))).toBe(true);
+    expect(onAudio.srtp_key.equals(Buffer.alloc(16, 0x33))).toBe(true);
+    expect(onAudio.srtp_salt.equals(Buffer.alloc(14, 0x44))).toBe(true);
 
     const off = await answered(false);
-    expect(off.calls).toBe(1);
-    expect(off.response.audio).toBeUndefined();
-    expect("audio" in off.response).toBe(false);
+    expect(off.audio).toBeDefined();
+    expect(sourceLeg(off.audio).srtp_key.equals(Buffer.alloc(16, 0x33))).toBe(true);
   });
 
-  it("returns audio from prepareAnswer only when the session includes audio", () => {
-    const videoKey = Buffer.alloc(16, 1);
-    const videoSalt = Buffer.alloc(14, 2);
-    const audioKey = Buffer.alloc(16, 3);
-    const audioSalt = Buffer.alloc(14, 4);
-    const withAudio = prepareAnswer({
-      includeAudio: true,
-      video: { port: 1, ssrc: 2, srtp_key: videoKey, srtp_salt: videoSalt },
-      audio: { port: 3, ssrc: 4, srtp_key: audioKey, srtp_salt: audioSalt },
+  it("calls the HAP callback for a second prepareStream", async () => {
+    const delegate = new ArgusStreamingDelegate("Garage Door", "rtsp://x", cache(), {
+      aspect: "4:3",
+      verbose: false,
     });
-    expect(withAudio.audio?.srtp_key).toBe(audioKey);
-    const videoOnly = prepareAnswer({
-      includeAudio: false,
-      video: { port: 1, ssrc: 2, srtp_key: videoKey, srtp_salt: videoSalt },
+    await new Promise<void>((resolve, reject) => {
+      delegate.prepareStream(streamRequest("twice"), (error) => (error ? reject(error) : resolve()));
     });
-    expect(videoOnly.audio).toBeUndefined();
-    expect(videoOnly.video.srtp_key).toBe(videoKey);
+    await new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error("second prepareStream did not call the HAP callback")), 5000);
+      delegate.prepareStream(streamRequest("twice"), () => {
+        clearTimeout(timeout);
+        resolve();
+      });
+    });
   });
 
   it("allows the first prepare answer and rejects the second", () => {
