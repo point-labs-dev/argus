@@ -1,7 +1,13 @@
 import { execFileSync } from "node:child_process";
 import { createSocket } from "node:dgram";
 import { EventEmitter } from "node:events";
-import { Characteristic, Service } from "hap-nodejs";
+import {
+  AudioStreamingCodecType,
+  Characteristic,
+  Service,
+  type PrepareStreamRequest,
+  type PrepareStreamResponse,
+} from "hap-nodejs";
 import { describe, expect, it, vi } from "vitest";
 
 import { parseArgusConfig } from "../src/config.js";
@@ -19,11 +25,11 @@ import {
 } from "../src/homekit.js";
 
 function liveInput(overrides: Partial<LiveFfmpegInput> = {}): LiveFfmpegInput {
-  return {
-    inputUrl: "rtsp://127.0.0.1:8554/backyard-left-sub",
-    targetAddress: "192.168.1.50",
-    videoMode: "transcode",
-    aspect: "16:9",
+  const input: LiveFfmpegInput = {
+    inputUrl: overrides.inputUrl ?? "rtsp://127.0.0.1:8554/backyard-left-sub",
+    targetAddress: overrides.targetAddress ?? "192.168.1.50",
+    videoMode: overrides.videoMode ?? "transcode",
+    aspect: overrides.aspect ?? "16:9",
     video: {
       port: 50000,
       localRtcpPort: 60000,
@@ -43,13 +49,22 @@ function liveInput(overrides: Partial<LiveFfmpegInput> = {}): LiveFfmpegInput {
       localRtcpPort: 60002,
       ssrc: 2,
       payloadType: 110,
-      codec: "OPUS", // AudioStreamingCodecType.OPUS
+      codec: AudioStreamingCodecType.OPUS,
       sampleRateKhz: 24,
       maxBitrateKbps: 24,
       srtpParams: "AUDIOKEY==",
     },
-    ...overrides,
   };
+  if (overrides.video !== undefined) {
+    input.video = { ...input.video, ...overrides.video };
+  }
+  if (overrides.audio !== undefined) {
+    input.audio = { ...input.audio, ...overrides.audio };
+  }
+  if (overrides.localAddress !== undefined) {
+    input.localAddress = overrides.localAddress;
+  }
+  return input;
 }
 
 function cacheWith(jpeg: Buffer): SnapshotCache {
@@ -71,7 +86,7 @@ function cacheWith(jpeg: Buffer): SnapshotCache {
 
 describe("buildLiveFfmpegArgs", () => {
   it("encodes AAC-ELD audio when HomeKit negotiates AAC-ELD", () => {
-    const input = liveInput({ audio: { ...liveInput().audio, codec: "AAC-eld" } });
+    const input = liveInput({ audio: { ...liveInput().audio, codec: AudioStreamingCodecType.AAC_ELD } });
     const args = buildLiveFfmpegArgs(input, true);
     const joined = args.join(" ");
 
@@ -86,7 +101,7 @@ describe("buildLiveFfmpegArgs", () => {
   });
 
   it("encodes Opus audio when HomeKit negotiates Opus", () => {
-    const input = liveInput({ audio: { ...liveInput().audio, codec: "OPUS" } });
+    const input = liveInput({ audio: { ...liveInput().audio, codec: AudioStreamingCodecType.OPUS } });
     const args = buildLiveFfmpegArgs(input, true);
     const joined = args.join(" ");
 
@@ -295,7 +310,11 @@ describe("buildCameraControllerOptions", () => {
     const opts = buildCameraControllerOptions(delegate);
 
     expect(opts.cameraStreamCount).toBe(2);
-    expect(opts.streamingOptions.supportedCryptoSuites).toContain(0); // AES_CM_128_HMAC_SHA1_80
+    const streaming = opts.streamingOptions;
+    if (!("supportedCryptoSuites" in streaming)) {
+      throw new Error("missing crypto suites");
+    }
+    expect(streaming.supportedCryptoSuites).toContain(0);
     const resolutions = opts.streamingOptions.video.resolutions.map((r) => `${r[0]}x${r[1]}`);
     // Default WiFi-friendly ladder (Oct 2026+): cap at 854x480 for MacBook accept
     expect(resolutions).toContain("854x480");
@@ -889,7 +908,7 @@ function renderFilteredFrame(vf: string, srcWidth: number, srcHeight: number): {
       continue;
     }
     const start = offset;
-    while (ppm[offset] > 0x20) offset += 1;
+    while ((ppm[offset] ?? 0) > 0x20) offset += 1;
     tokens.push(ppm.subarray(start, offset).toString());
   }
   offset += 1;
@@ -959,7 +978,7 @@ async function ffmpegArgsFor(
         type: "start",
         sessionID: `${slug}-live`,
         video: { pt: 99, max_bit_rate: 132, fps: 30, mtu: 1378, profile: 0, level: 2, ...ask },
-        audio: { pt: 110, sample_rate: 24, max_bit_rate: 24, codec: "AAC-eld" },
+        audio: { pt: 110, sample_rate: 24, max_bit_rate: 24, codec: AudioStreamingCodecType.AAC_ELD },
       } as never,
       (error) => (error ? reject(error) : resolve()),
     );
@@ -1036,7 +1055,7 @@ describe("4:3 cameras keep an undistorted live frame", () => {
 
   it("paces AAC-ELD with the Oct 1 clock and 188-byte audio packets", () => {
     const args = buildLiveFfmpegArgs(
-      liveInput({ audio: { ...liveInput().audio, codec: "AAC-eld" } }),
+      liveInput({ audio: { ...liveInput().audio, codec: AudioStreamingCodecType.AAC_ELD } }),
     ).join(" ");
 
     expect(args).toContain("-c:a libfdk_aac");
@@ -1081,7 +1100,7 @@ describe("4:3 cameras keep an undistorted live frame", () => {
             type: "start",
             sessionID: "redact",
             video: { pt: 99, max_bit_rate: 132, fps: 30, width: 640, height: 360, mtu: 1378, profile: 0, level: 2 },
-            audio: { pt: 110, sample_rate: 24, max_bit_rate: 24, codec: "AAC-eld" },
+            audio: { pt: 110, sample_rate: 24, max_bit_rate: 24, codec: AudioStreamingCodecType.AAC_ELD },
           } as never,
           (error) => (error ? reject(error) : resolve()),
         );

@@ -161,7 +161,9 @@ describe("go2rtc API credentials", () => {
   it("sends the generated API credentials on the health check", async () => {
     const child = new FakeChildProcess();
     const spawnMock = vi.fn(() => child) satisfies Go2RtcSpawn;
-    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ "front-door": {} }), { status: 200 }));
+    const fetchMock = vi.fn(async (_input: unknown, _init?: RequestInit) =>
+      new Response(JSON.stringify({ "front-door": {} }), { status: 200 }),
+    );
     const directory = await tempDirectory();
     const configPath = path.join(directory, "go2rtc.generated.yaml");
     const supervisor = createGo2RtcSupervisor(createConfig(1984), {
@@ -192,7 +194,7 @@ describe("go2rtc API credentials", () => {
 
   it("sends API credentials when Argus fetches a snapshot", async () => {
     const jpeg = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10]);
-    const fetchMock = vi.fn(async () => new Response(jpeg));
+    const fetchMock = vi.fn(async (_input: unknown, _init?: RequestInit) => new Response(jpeg));
     const cache = new SnapshotCache(createConfig(1984), {
       fetch: fetchMock as unknown as typeof fetch,
       apiCredentials: { username: "argus", password: "fixture-api-secret" },

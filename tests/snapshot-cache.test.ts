@@ -137,7 +137,7 @@ describe("SnapshotCache", () => {
   });
 
   it("uses sub streams by default and main streams when requested", async () => {
-    const fetchMock = vi.fn(async () => okResponse());
+    const fetchMock = vi.fn(async (_input: string) => okResponse());
     const cache = new SnapshotCache(createConfig(), {
       fetch: fetchMock as unknown as typeof fetch,
     });

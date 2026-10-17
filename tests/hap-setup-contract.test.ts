@@ -106,11 +106,14 @@ async function answered(includeAudio: boolean): Promise<PrepareStreamResponse> {
   });
 }
 
-function sourceLeg(leg: PrepareStreamResponse["video"] | NonNullable<PrepareStreamResponse["audio"]>) {
+function sourceLeg(leg: PrepareStreamResponse["video"] | PrepareStreamResponse["audio"] | undefined): {
+  srtp_key: Buffer;
+  srtp_salt: Buffer;
+} {
   if (!leg || !("srtp_key" in leg) || !("srtp_salt" in leg) || !leg.srtp_key || !leg.srtp_salt) {
     throw new Error("expected source SRTP leg");
   }
-  return leg;
+  return { srtp_key: leg.srtp_key, srtp_salt: leg.srtp_salt };
 }
 
 describe("HAP setup contract", () => {
