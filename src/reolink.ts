@@ -2,11 +2,12 @@
 // uniformly for standalone cameras (host = camera IP, channel 0) and NVR-fronted
 // cameras (host = NVR IP, channel N). Verified against both on 2026-06-10.
 
-/** One stalled camera must not hold the motion poll for every other camera. */
-const REQUEST_TIMEOUT_MS = 5_000;
 /** Failed Login waits this long before another attempt. Then the delay doubles. */
 const LOGIN_BACKOFF_START_MS = 5_000;
 const LOGIN_BACKOFF_MAX_MS = 60_000;
+/** A GetAiState error code other than -99 skips GetAiState this long. Then the delay doubles. */
+const AI_PROBE_BACKOFF_START_MS = 30_000;
+const AI_PROBE_BACKOFF_MAX_MS = 300_000;
 
 /**
  * Drop URL userinfo so a host string cannot carry a password into a log line.
@@ -27,8 +28,10 @@ export interface ReolinkClientOptions {
   fetch?: typeof fetch;
   /** Clock injectable for tests. */
   now?: () => number;
-  /** Per-request AbortSignal timeout in ms. Defaults to 5 seconds. Injectable for tests. */
+  /** Per-request AbortSignal timeout in ms. Omitted means no timeout. */
   requestTimeoutMs?: number;
+  /** Back off Login from 5s, doubling to 60s, while it keeps failing. Omitted means the next call logs in again. */
+  loginBackoff?: boolean;
 }
 
 interface ReolinkResponse {
@@ -36,6 +39,13 @@ interface ReolinkResponse {
   code: number;
   value?: Record<string, unknown>;
   error?: { detail?: string; rspCode?: number };
+}
+
+function aiAlarmed(value: Record<string, unknown>): boolean {
+  return (["people", "vehicle", "dog_cat"] as const).some((type) => {
+    const detection = value[type] as { alarm_state?: number; support?: number } | undefined;
+    return detection?.alarm_state === 1;
+  });
 }
 
 export class ReolinkError extends Error {
@@ -63,6 +73,10 @@ export class ReolinkClient {
   private nextLoginAt = 0;
   /** undefined = not probed; false = GetAiState unsupported here (e.g. via the NVR). */
   private aiSupported: boolean | undefined;
+  /** Delay before `getMotionState` asks GetAiState again. 0 means it asks on the next call. */
+  private aiProbeBackoffMs = 0;
+  /** Earliest `now()` at which `getMotionState` may ask GetAiState again. */
+  private nextAiProbeAt = 0;
   private readonly fetchFn: typeof fetch;
   private readonly now: () => number;
 
@@ -79,14 +93,14 @@ export class ReolinkClient {
     const query = token ? `?cmd=${cmd}&token=${token}` : `?cmd=${cmd}`;
     const url = `http://${this.options.host}/cgi-bin/api.cgi${query}`;
     const body = JSON.stringify([{ cmd, action: 0, param }]);
-    const timeoutMs = this.options.requestTimeoutMs ?? REQUEST_TIMEOUT_MS;
+    const timeoutMs = this.options.requestTimeoutMs;
     let response: Response;
     try {
       response = await this.fetchFn(url, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body,
-        signal: AbortSignal.timeout(timeoutMs),
+        ...(timeoutMs === undefined ? {} : { signal: AbortSignal.timeout(timeoutMs) }),
       });
     } catch (error) {
       // undici reports transport failures as a generic "fetch failed" — surface
@@ -106,7 +120,7 @@ export class ReolinkClient {
     return first;
   }
 
-  /** Log in (or reuse a still-valid token) and return it. Repeated Login failures back off. */
+  /** Log in (or reuse a still-valid token) and return it. With `loginBackoff`, repeated Login failures back off. */
   public async ensureToken(): Promise<string> {
     if (this.token && this.now() < this.tokenExpiresAt) {
       return this.token;
@@ -120,7 +134,9 @@ export class ReolinkClient {
       this.nextLoginAt = 0;
       return token;
     } catch (error) {
-      this.scheduleLoginBackoff();
+      if (this.options.loginBackoff) {
+        this.scheduleLoginBackoff();
+      }
       throw error;
     }
   }
@@ -149,6 +165,14 @@ export class ReolinkClient {
       : Math.min(this.loginBackoffMs * 2, LOGIN_BACKOFF_MAX_MS);
     this.loginBackoffMs = delay;
     this.nextLoginAt = this.now() + delay;
+  }
+
+  private scheduleAiProbeBackoff(): void {
+    const delay = this.aiProbeBackoffMs === 0
+      ? AI_PROBE_BACKOFF_START_MS
+      : Math.min(this.aiProbeBackoffMs * 2, AI_PROBE_BACKOFF_MAX_MS);
+    this.aiProbeBackoffMs = delay;
+    this.nextAiProbeAt = this.now() + delay;
   }
 
   /**
@@ -195,22 +219,37 @@ export class ReolinkClient {
       this.fail(`GetAiState ch${channel} on ${this.options.host} failed: ${ai.error?.detail ?? `code ${ai.code}`}`);
     }
     this.aiSupported = true;
-    return (["people", "vehicle", "dog_cat"] as const).some((type) => {
-      const detection = ai.value?.[type] as { alarm_state?: number; support?: number } | undefined;
-      return detection?.alarm_state === 1;
-    });
+    return aiAlarmed(ai.value);
   }
 
   /**
    * True if the channel currently reports motion via EITHER basic motion detection
    * (GetMdState) OR AI person/vehicle/animal detection (GetAiState) on this same host.
    * Many Reolink cameras run in AI mode where GetMdState stays 0 but the AI alarm fires.
+   * rspCode -99 marks GetAiState unsupported here (e.g. via the NVR), and later calls skip it.
+   * Any other GetAiState error code skips GetAiState for 30s, doubling to 5 minutes,
+   * while GetMdState is still read on every call.
    */
   public async getMotionState(channel: number): Promise<boolean> {
     if (await this.getMdState(channel)) {
       return true;
     }
-    return this.getAiState(channel);
+    if (this.aiSupported === false || this.now() < this.nextAiProbeAt) {
+      return false;
+    }
+    const ai = await this.call("GetAiState", { channel }, await this.ensureToken());
+    if (ai.code !== 0 && ai.error?.rspCode === -99) {
+      this.aiSupported = false;
+      return false;
+    }
+    if (ai.code !== 0 || !ai.value) {
+      this.scheduleAiProbeBackoff();
+      return false;
+    }
+    this.aiProbeBackoffMs = 0;
+    this.nextAiProbeAt = 0;
+    this.aiSupported = true;
+    return aiAlarmed(ai.value);
   }
 
   public async getHddInfo(): Promise<unknown> {

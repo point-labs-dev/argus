@@ -5,6 +5,8 @@ import { emitTiming } from "./timing.js";
 
 /** Standalone cameras report AI on channel 0. The NVR channel stays on GetMdState. */
 const DIRECT_AI_CHANNEL = 0;
+/** A stalled motion request fails after this long, so the camera's next poll can run. */
+const MOTION_REQUEST_TIMEOUT_MS = 5_000;
 /** First repeat of a poll error waits this long. Then the delay doubles. */
 const ERROR_LOG_BACKOFF_START_MS = 5_000;
 const ERROR_LOG_BACKOFF_MAX_MS = 60_000;
@@ -69,6 +71,7 @@ export class MotionMonitor {
       const shared = {
         username: camera.username,
         password: camera.password,
+        requestTimeoutMs: MOTION_REQUEST_TIMEOUT_MS,
         ...(options.fetch ? { fetch: options.fetch } : {}),
         ...(options.now ? { now: options.now } : {}),
       };
@@ -76,7 +79,9 @@ export class MotionMonitor {
       return {
         camera,
         client: createClient({ host: camera.host, ...shared }),
-        directAi: directAiHost === undefined ? undefined : createClient({ host: directAiHost, ...shared }),
+        directAi: directAiHost === undefined
+          ? undefined
+          : createClient({ host: directAiHost, ...shared, loginBackoff: true }),
         detected: false,
         lastMotionAt: 0,
         errorBackoffMs: 0,
