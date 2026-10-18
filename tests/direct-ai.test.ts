@@ -1,8 +1,8 @@
-import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { execFileSync, spawnSync } from "node:child_process";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { describe, expect, it, vi } from "vitest";
 
@@ -10,7 +10,7 @@ import { formatError } from "../src/cli.js";
 import { parseArgusConfig } from "../src/config.js";
 import { buildHttpFlvUrl, buildRtspUrl } from "../src/go2rtc.js";
 import { MotionMonitor, writeMotionPollError } from "../src/motion.js";
-import { ReolinkClient, ReolinkError, type ReolinkClientOptions } from "../src/reolink.js";
+import { redactCredentialHosts, ReolinkClient, ReolinkError, type ReolinkClientOptions } from "../src/reolink.js";
 
 const NVR_HOST = "nvr.invalid";
 const DIRECT_HOST = "direct.invalid";
@@ -1072,27 +1072,39 @@ describe("direct AI poll", () => {
     const hosts = [
       "192.0.2.10",
       "192.0.2.10:80",
+      "nvr.lan",
+      "nvr.lan:8000",
       "nvr.invalid",
       "nvr.invalid:80",
       "localhost",
       "localhost:80",
+      "[2001:db8::10]",
+      "[2001:db8::10]:80",
+      "[fe80::1%en0]:80",
       "[::1]",
       "[::1]:80",
       "[fe80::1]",
       "[fe80::1]:554",
     ];
+    const kinds = [
+      "login-detail",
+      "login-http",
+      "login-refused",
+      "login-timeout",
+      "login-abort",
+      "login-backoff",
+      "md",
+      "ai",
+      "ai-backoff",
+      "empty",
+      "no-token",
+    ];
     const lines: Array<{ host: string; kind: string; message: string }> = [];
     await withNoSockets(async () => {
       for (const host of hosts) {
-        lines.push({ host, kind: "login-detail", message: await failMessage(host, "login-detail") });
-        lines.push({ host, kind: "login-http", message: await failMessage(host, "login-http") });
-        lines.push({ host, kind: "login-refused", message: await failMessage(host, "login-refused") });
-        lines.push({ host, kind: "login-timeout", message: await failMessage(host, "login-timeout") });
-        lines.push({ host, kind: "login-abort", message: await failMessage(host, "login-abort") });
-        lines.push({ host, kind: "login-backoff", message: await failMessage(host, "login-backoff") });
-        lines.push({ host, kind: "md", message: await failMessage(host, "md") });
-        lines.push({ host, kind: "ai", message: await failMessage(host, "ai") });
-        lines.push({ host, kind: "ai-backoff", message: await failMessage(host, "ai-backoff") });
+        for (const kind of kinds) {
+          lines.push({ host, kind, message: await failMessage(host, kind) });
+        }
       }
     });
     const expected: Record<string, (host: string) => string> = {
@@ -1105,12 +1117,31 @@ describe("direct AI poll", () => {
       md: (host) => `GetMdState ch2 on ${host} failed: rspCode -6 (please login first)`,
       ai: (host) => `GetAiState ch0 on ${host} failed: busy`,
       "ai-backoff": (host) => `GetAiState ch0 on ${host} failed: backing off`,
+      empty: (host) => `Login on ${host}: empty response`,
+      "no-token": (host) => `Login on ${host}: no token in response`,
     };
+    const mismatches: string[] = [];
     for (const line of lines) {
-      const want = expected[line.kind]!(line.host);
-      expect(line.message, `${line.kind} ${line.host}`).toBe(want);
-      expect(formatError(line.message), `${line.kind} ${line.host} formatError`).toBe(want);
+      const template = expected[line.kind]!(line.host);
+      const bareHost = line.host.slice(line.host.lastIndexOf("@") + 1);
+      const want = await mainRedact(template.replaceAll(line.host, bareHost));
+      if (line.message !== want) {
+        mismatches.push(`${line.kind} ${line.host}\n  got  ${JSON.stringify(line.message)}\n  want ${JSON.stringify(want)}`);
+      }
+      const formatted = formatError(line.message);
+      if (formatted !== want) {
+        mismatches.push(`formatError ${line.kind} ${line.host}\n  got  ${JSON.stringify(formatted)}\n  want ${JSON.stringify(want)}`);
+      }
     }
+    const frame = "host: 192.0.2.10:80: x: y";
+    const wrapped = `Unable to parse YAML at bad.yaml: ${frame}`;
+    if (redactCredentialHosts(frame) !== (await mainRedact(frame))) {
+      mismatches.push(`code frame\n  got  ${JSON.stringify(redactCredentialHosts(frame))}\n  want ${JSON.stringify(await mainRedact(frame))}`);
+    }
+    if (formatError(wrapped) !== (await mainRedact(wrapped))) {
+      mismatches.push(`yaml frame\n  got  ${JSON.stringify(formatError(wrapped))}\n  want ${JSON.stringify(await mainRedact(wrapped))}`);
+    }
+    expect(mismatches).toEqual([]);
     const host = "192.0.2.10:80";
     const stderr = await captureStderr(() =>
       withNoSockets(async () => {
@@ -1351,6 +1382,129 @@ describe("direct AI poll", () => {
     }
   }, 30_000);
 
+  it("keeps an rtsp url with a port and a path byte-identical to main", async () => {
+    const line = "rtsp://127.0.0.1:8554/front-l: Connection refused";
+    const wrapped = `Unable to parse YAML at bad.yaml: ${line}`;
+    expect(formatError(line)).toBe(await mainRedact(line));
+    expect(formatError(wrapped)).toBe(await mainRedact(wrapped));
+    expect(await mainRedact(line)).toBe(line);
+  });
+
+  it("replaces a configured password when a marker sits before a space", async () => {
+    await withNoSockets(async () => {
+      for (const password of ["p/a ssPW", "p?a ssPW", "p#a ssPW"]) {
+        const message = await passwordFailure(password, `admin:${password}@host`);
+        expect(message, password).not.toContain("ssPW");
+        expect(message, password).not.toContain(password);
+        expect(message, password).toContain("***");
+      }
+      const password = "p/a ssPW";
+      const encoded = encodeURIComponent(password);
+      const message = await passwordFailure(password, `encoded ${encoded}`);
+      expect(message).not.toContain(encoded);
+      expect(message).toContain("***");
+    });
+  });
+
+  it("exits 1 when startup throws after go2rtc has started", () => {
+    const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+    const dir = mkdtempSync(join(tmpdir(), "argus-startup-"));
+    const pidFile = join(dir, "go2rtc.pid");
+    const password = "startup-secret";
+    const port = 20000 + Math.floor(Math.random() * 20000);
+    const binary = join(dir, "go2rtc.mjs");
+    writeFileSync(
+      binary,
+      [
+        "#!/usr/bin/env node",
+        "import { createServer } from 'node:http';",
+        "import { readFileSync, writeFileSync } from 'node:fs';",
+        "const configIndex = process.argv.indexOf('-config');",
+        "const config = readFileSync(process.argv[configIndex + 1], 'utf8');",
+        "const port = Number(config.match(/listen: 127\\.0\\.0\\.1:(\\d+)/)[1]);",
+        "writeFileSync(process.env.ARGUS_TEST_GO2RTC_PID, String(process.pid));",
+        "createServer((_req, res) => {",
+        "  res.writeHead(200, { 'content-type': 'application/json' });",
+        "  res.end('{}');",
+        "}).listen(port, '127.0.0.1');",
+        "",
+      ].join("\n"),
+    );
+    chmodSync(binary, 0o755);
+    const configPath = join(dir, "argus.yaml");
+    writeFileSync(
+      configPath,
+      [
+        "cameras:",
+        "  - name: Front L",
+        "    aspect: \"16:9\"",
+        "    host: 192.0.2.10",
+        "    channel: 2",
+        "    mainCodec: h265",
+        "    username: admin",
+        `    password: ${password}`,
+        "    transport: auto",
+        "    streams:",
+        "      main: main",
+        "      sub: sub",
+        "recording:",
+        "  path: ./rec",
+        "  retention:",
+        "    continuous: 3",
+        "    motion: 7",
+        "    alerts: 30",
+        "homekit:",
+        "  pin: \"123-45-678\"",
+        "go2rtc:",
+        `  binary: ${binary}`,
+        `  api_port: ${port}`,
+        "server:",
+        "  port: 8080",
+        "",
+      ].join("\n"),
+    );
+    let childAlive = true;
+    try {
+      const result = spawnSync(process.execPath, ["--import", "tsx", "src/serve.ts", configPath], {
+        cwd: root,
+        encoding: "utf8",
+        timeout: 8_000,
+        env: {
+          ...process.env,
+          ARGUS_TEST_THROW_AFTER_GO2RTC: "1",
+          ARGUS_TEST_GO2RTC_PID: pidFile,
+        },
+      });
+      const pidText = existsSync(pidFile) ? readFileSync(pidFile, "utf8").trim() : "";
+      const pid = Number(pidText);
+      childAlive = Number.isInteger(pid) && pid > 0 ? processAlive(pid) : true;
+      expect({
+        status: result.status,
+        leaked: result.stderr.includes(password),
+        redacted: result.stderr.includes("***"),
+        message: result.stderr.includes("injected startup failure"),
+        childAlive,
+      }).toEqual({
+        status: 1,
+        leaked: false,
+        redacted: true,
+        message: true,
+        childAlive: false,
+      });
+    } finally {
+      const pidText = existsSync(pidFile) ? readFileSync(pidFile, "utf8").trim() : "";
+      const pid = Number(pidText);
+      if (Number.isInteger(pid) && pid > 0) {
+        try {
+          process.kill(pid, "SIGKILL");
+        } catch {
+          // The child already exited.
+        }
+      }
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 20_000);
+
   it("documents cameras[].directAiHost as <host> and says IPv6 is unsupported", () => {
     const root = join(dirname(fileURLToPath(import.meta.url)), "..");
     const readme = readFileSync(join(root, "README.md"), "utf8");
@@ -1401,6 +1555,12 @@ async function failMessage(host: string, kind: string): Promise<string> {
     }
     if (kind === "login-detail" || kind === "login-backoff") {
       return jsonResponse([{ cmd: "Login", code: 1, error: { detail: "rspCode -6 (please login first)", rspCode: -6 } }]);
+    }
+    if (kind === "empty") {
+      return { ok: true, status: 200, json: async () => [] } as unknown as Response;
+    }
+    if (kind === "no-token") {
+      return jsonResponse([{ cmd: "Login", code: 0, value: { Token: { leaseTime: 3600 } } }]);
     }
     const url = String(_input);
     if (url.includes("cmd=Login")) {
@@ -1460,6 +1620,48 @@ async function failMessage(host: string, kind: string): Promise<string> {
     return error instanceof Error ? error.message : String(error);
   }
   throw new Error(`login-backoff on ${host} did not fail on the second poll`);
+}
+
+const MAIN_REDACT_COMMIT = "aaaef4fe94fa35cf81e6ddbbda12789cbfc4a532";
+let mainRedactFn: ((text: string) => string) | undefined;
+
+async function mainRedact(text: string): Promise<string> {
+  if (!mainRedactFn) {
+    const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+    const dir = mkdtempSync(join(tmpdir(), "argus-main-reolink-"));
+    const file = join(dir, "reolink.ts");
+    writeFileSync(file, execFileSync("git", ["show", `${MAIN_REDACT_COMMIT}:src/reolink.ts`], { cwd: root }));
+    const loaded = await import(pathToFileURL(file).href) as { redactCredentialHosts: (value: string) => string };
+    mainRedactFn = loaded.redactCredentialHosts;
+  }
+  return mainRedactFn(text);
+}
+
+async function passwordFailure(password: string, detail: string): Promise<string> {
+  const fetchFn = vi.fn(async () => {
+    throw new Error(detail);
+  }) as unknown as typeof fetch;
+  const client = new ReolinkClient({
+    host: "nvr.lan",
+    username: "admin",
+    password,
+    fetch: fetchFn,
+  });
+  try {
+    await client.ensureToken();
+  } catch (error) {
+    return error instanceof Error ? error.message : String(error);
+  }
+  throw new Error("password failure did not throw");
+}
+
+function processAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function credentialSample(): string {
