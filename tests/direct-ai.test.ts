@@ -6,11 +6,12 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { describe, expect, it, vi } from "vitest";
 
-import { formatError } from "../src/cli.js";
+import { formatError, run } from "../src/cli.js";
 import { parseArgusConfig } from "../src/config.js";
 import { buildHttpFlvUrl, buildRtspUrl } from "../src/go2rtc.js";
+import * as go2rtc from "../src/go2rtc.js";
 import { MotionMonitor, writeMotionPollError } from "../src/motion.js";
-import { redactCredentialHosts, ReolinkClient, ReolinkError, type ReolinkClientOptions } from "../src/reolink.js";
+import { redactCredentialHosts, redactKnownSecrets, ReolinkClient, ReolinkError, type ReolinkClientOptions } from "../src/reolink.js";
 
 const NVR_HOST = "nvr.invalid";
 const DIRECT_HOST = "direct.invalid";
@@ -1158,6 +1159,136 @@ describe("direct AI poll", () => {
     expect(stderr).toBe(`[argus Front L] motion poll error: Login on ${host} fetch failed: ECONNREFUSED\n`);
   });
 
+  it("keeps short-password fail() lines identical to main and writes *** only in userinfo", async () => {
+    const passwords = ["1", "a", "80", "on", "Login", "admin", "p/a ssPW", "p?a ssPW", "p#a ssPW"];
+    const hosts = [
+      "192.0.2.10",
+      "192.0.2.10:80",
+      "192.0.2.20:80",
+      "nvr.lan",
+      "nvr.lan:8000",
+      "nvr.invalid",
+      "nvr.invalid:80",
+      "localhost",
+      "localhost:80",
+      "[2001:db8::10]",
+      "[2001:db8::10]:80",
+      "[2001:db8::1]:8000",
+      "[fe80::1%en0]:80",
+      "[::1]",
+      "[::1]:80",
+      "[fe80::1]",
+      "[fe80::1]:554",
+    ];
+    const kinds = [
+      "login-detail",
+      "login-http",
+      "login-refused",
+      "login-timeout",
+      "login-abort",
+      "login-backoff",
+      "md",
+      "ai",
+      "ai-backoff",
+      "empty",
+      "no-token",
+    ];
+    const templateFor = failTemplate();
+    const mismatches: string[] = [];
+    let overflow = 0;
+    const check = (label: string, got: string, want: string): void => {
+      if (got === want) return;
+      if (mismatches.length < 8) mismatches.push(`${label}\n  got  ${JSON.stringify(got)}\n  want ${JSON.stringify(want)}`);
+      else overflow += 1;
+    };
+    check(
+      "port 80",
+      redactKnownSecrets("192.0.2.20:80", ["80"]),
+      "192.0.2.20:80",
+    );
+    check(
+      "word on",
+      redactKnownSecrets("Login on 192.0.2.10 failed: HTTP 500", ["on"]),
+      "Login on 192.0.2.10 failed: HTTP 500",
+    );
+    check(
+      "letter a",
+      redactKnownSecrets("failed", ["a"]),
+      "failed",
+    );
+    check(
+      "admin inside a word",
+      redactKnownSecrets("administrator", ["admin"]),
+      "administrator",
+    );
+    check(
+      "Login token",
+      redactKnownSecrets("Login on host failed: please login first", ["Login"]),
+      "*** on host failed: please login first",
+    );
+    await withNoSockets(async () => {
+      for (const password of passwords) {
+        for (const host of hosts) {
+          const bare = host.slice(host.lastIndexOf("@") + 1);
+          const encoded = encodeURIComponent(password);
+          const userinfo = `http://admin:${encoded}@${bare}/x admin:${password}@${bare}`;
+          const userinfoWant = `http://admin:***@${bare}/x admin:***@${bare}`;
+          check(`userinfo ${password} ${host}`, redactKnownSecrets(userinfo, [password]), userinfoWant);
+          check(`format userinfo ${password} ${host}`, formatError(userinfo, [password]), userinfoWant);
+          for (const kind of kinds) {
+            const template = templateFor[kind]!(host);
+            const mainLine = await mainRedact(template);
+            const want = maskPassword(mainLine, password);
+            if (password.length < 4) check(`short oracle ${password} ${kind} ${host}`, want, mainLine);
+            check(`fail ${password} ${kind} ${host}`, await failMessage(host, kind, password, 5), want);
+            check(`format ${password} ${kind} ${host}`, formatError(template, [password]), want);
+          }
+        }
+      }
+    });
+    expect(mismatches, `${overflow} more`).toEqual([]);
+  }, 60_000);
+
+  it("keeps host: [2001:db8::1]:8000: x intact in a YAML frame", async () => {
+    const frame = "host: [2001:db8::1]:8000: x";
+    const wrapped = `Unable to parse YAML at bad.yaml: ${frame}`;
+    expect(redactCredentialHosts(frame)).toBe(frame);
+    expect(formatError(wrapped)).toBe(wrapped);
+    expect(await mainRedact(wrapped)).toBe(wrapped);
+  });
+
+  it("keeps the host and the next token for admin:pw@a.b c@d in a YAML frame", async () => {
+    const frame = "admin:pw@a.b c@d";
+    const wrapped = `Unable to parse YAML at bad.yaml: ${frame}`;
+    const want = "Unable to parse YAML at bad.yaml: a.b c@d";
+    expect(redactCredentialHosts(frame)).toBe("a.b c@d");
+    expect(formatError(wrapped)).toBe(want);
+    expect(await mainRedact(wrapped)).toBe(want);
+  });
+
+  it("redacts a sentinel when CLI generation throws after password registration", async () => {
+    const sentinel = "cli-reg-sentinel";
+    const dir = mkdtempSync(join(tmpdir(), "argus-cli-reg-"));
+    const file = join(dir, "argus.yaml");
+    writeArgusYaml(file, sentinel);
+    const spy = vi.spyOn(go2rtc, "generateGo2RtcYaml").mockImplementation((config) => {
+      throw new Error(`generation failed ${config.cameras[0]?.password ?? ""}`);
+    });
+    const secrets: string[] = [];
+    let caught: unknown;
+    try {
+      await run(["--config", file], secrets);
+    } catch (error) {
+      caught = error;
+    } finally {
+      spy.mockRestore();
+      rmSync(dir, { recursive: true, force: true });
+    }
+    const formatted = formatError(caught, secrets);
+    expect(formatted).not.toContain(sentinel);
+    expect(formatted).toContain("***");
+  });
+
   it("redacts a free-text password with a space and / ? # or colon-space, and keeps an email", () => {
     const passwords = [
       `${PASSWORD_LEFT} /${PASSWORD_RIGHT}`,
@@ -1547,7 +1678,88 @@ const REDACTION_EMAIL = "owner@example.com";
 const PASSWORD_LEFT = "Q7aLpha";
 const PASSWORD_RIGHT = "Z9bEta";
 
-async function failMessage(host: string, kind: string): Promise<string> {
+function failTemplate(): Record<string, (host: string) => string> {
+  return {
+    "login-detail": (host) => `Login on ${host} failed: rspCode -6 (please login first)`,
+    "login-http": (host) => `Login on ${host} failed: HTTP 500`,
+    "login-refused": (host) => `Login on ${host} fetch failed: ECONNREFUSED`,
+    "login-timeout": (host) => `Login on ${host} fetch failed: ETIMEDOUT`,
+    "login-abort": (host) => `Login on ${host} fetch failed: 23`,
+    "login-backoff": (host) => `Login on ${host} failed: backing off`,
+    md: (host) => `GetMdState ch2 on ${host} failed: rspCode -6 (please login first)`,
+    ai: (host) => `GetAiState ch0 on ${host} failed: busy`,
+    "ai-backoff": (host) => `GetAiState ch0 on ${host} failed: backing off`,
+    empty: (host) => `Login on ${host}: empty response`,
+    "no-token": (host) => `Login on ${host}: no token in response`,
+  };
+}
+
+function maskWhere(text: string, needle: string, accept: (value: string, index: number) => boolean): string {
+  if (needle.length === 0) return text;
+  let out = "";
+  let cursor = 0;
+  let from = 0;
+  while (from <= text.length - needle.length) {
+    const found = text.indexOf(needle, from);
+    if (found < 0) break;
+    if (accept(text, found)) {
+      out += text.slice(cursor, found) + "***";
+      cursor = found + needle.length;
+      from = cursor;
+    } else {
+      from = found + 1;
+    }
+  }
+  return out + text.slice(cursor);
+}
+
+function isWordChar(char: string | undefined): boolean {
+  return char !== undefined && /[A-Za-z0-9]/.test(char);
+}
+
+function maskPassword(text: string, password: string): string {
+  const encoded = encodeURIComponent(password);
+  const needles = [...new Set([password, encoded])].sort((left, right) => right.length - left.length);
+  const accept = password.length >= 4
+    ? (value: string, index: number, needle: string): boolean => !isWordChar(value[index - 1]) && !isWordChar(value[index + needle.length])
+    : (value: string, index: number, needle: string): boolean => value[index - 1] === ":" && value[index + needle.length] === "@";
+  let out = text;
+  for (const needle of needles) out = maskWhere(out, needle, (value, index) => accept(value, index, needle));
+  return out;
+}
+
+function writeArgusYaml(file: string, password: string): void {
+  writeFileSync(file, [
+    "cameras:",
+    "  - name: Front L",
+    "    aspect: \"16:9\"",
+    "    host: 192.0.2.10",
+    "    channel: 0",
+    "    mainCodec: h265",
+    "    username: admin",
+    `    password: ${password}`,
+    "    transport: auto",
+    "    streams:",
+    "      main: main",
+    "      sub: sub",
+    "recording:",
+    "  path: ./rec",
+    "  retention:",
+    "    continuous: 3",
+    "    motion: 7",
+    "    alerts: 30",
+    "homekit:",
+    "  pin: \"123-45-678\"",
+    "go2rtc:",
+    "  binary: ./go2rtc",
+    "  api_port: 1984",
+    "server:",
+    "  port: 8080",
+    "",
+  ].join("\n"));
+}
+
+async function failMessage(host: string, kind: string, password = DIRECT_PASSWORD, abortMs = 20): Promise<string> {
   let clock = 0;
   const fetchFn = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
     if (kind === "login-http") {
@@ -1598,10 +1810,10 @@ async function failMessage(host: string, kind: string): Promise<string> {
   const client = new ReolinkClient({
     host,
     username: DIRECT_USER,
-    password: DIRECT_PASSWORD,
+    password,
     fetch: fetchFn,
     now: () => clock,
-    ...(kind === "login-abort" ? { requestTimeoutMs: 20 } : {}),
+    ...(kind === "login-abort" ? { requestTimeoutMs: abortMs } : {}),
     ...(loginBackoff ? { loginBackoff: true } : {}),
   });
   const run = async (): Promise<void> => {
