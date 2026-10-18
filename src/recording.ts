@@ -16,11 +16,32 @@ import {
 
 import type { CameraAspect } from "./config.js";
 import { readFragmentedMp4 } from "./mp4.js";
-import { emitTelemetry } from "./telemetry.js";
+import { emitSpan, emitTelemetry, monotonicMs } from "./telemetry.js";
 import { emitTiming } from "./timing.js";
 import { boxMatchesCameraAspect, buildAspectScaleFilter } from "./video-filter.js";
 
 const require = createRequire(import.meta.url);
+
+let recordingSerial = 0;
+
+function nextRecId(): string {
+  recordingSerial += 1;
+  return `r${recordingSerial}`;
+}
+
+function stampMono(): number | undefined {
+  try {
+    return monotonicMs();
+  } catch {
+    return undefined;
+  }
+}
+
+interface FragmentSpan {
+  recId: string;
+  mono: number;
+  sawMedia: boolean;
+}
 
 const PROFILE_TO_X264: Record<number, string> = {
   [H264Profile.BASELINE]: "baseline",
@@ -198,6 +219,8 @@ export class ArgusRecordingDelegate implements CameraRecordingDelegate {
   private configuration: CameraRecordingConfiguration | undefined;
   private active = false;
   private readonly processes = new Map<number, ChildProcess>();
+  private readonly fragmentMono = new Map<number, FragmentSpan>();
+  private readonly spanRecId = new Map<number, string>();
   private readonly ffmpegPath: string;
   private readonly verbose: boolean;
   private readonly spawnFn: typeof spawn;
@@ -243,6 +266,12 @@ export class ArgusRecordingDelegate implements CameraRecordingDelegate {
     const ffmpeg = this.spawnFn(this.ffmpegPath, args, { stdio: ["ignore", "pipe", "pipe"] });
     emitTiming({ stage: "recording_ffmpeg_spawn", camera: this.cameraName, streamId });
     this.processes.set(streamId, ffmpeg);
+    const recId = nextRecId();
+    this.spanRecId.set(streamId, recId);
+    const startedMono = stampMono();
+    if (startedMono !== undefined) {
+      this.fragmentMono.set(streamId, { recId, mono: startedMono, sawMedia: false });
+    }
     ffmpeg.stderr?.on("data", (chunk: Buffer) => {
       if (this.verbose) process.stderr.write(`[argus ${this.cameraName}] hksv-ffmpeg: ${chunk.toString().trimEnd()}\n`);
     });
@@ -267,13 +296,29 @@ export class ArgusRecordingDelegate implements CameraRecordingDelegate {
             emitTelemetry(this.cameraName, "hksv_first_fragment", { streamId });
             emitTiming({ stage: "recording_first_fragment", camera: this.cameraName, streamId });
           }
+          const state = this.fragmentMono.get(streamId);
+          const mono = stampMono();
+          if (state && mono !== undefined) {
+            const durationMs = mono - state.mono;
+            const metadata: Record<string, number | string> = {
+              durationMs,
+              size: segment.data.length,
+            };
+            if (!state.sawMedia) metadata.initial = 1;
+            state.mono = mono;
+            state.sawMedia = true;
+            emitSpan(this.cameraName, "hksv_span_fragment", { streamId, recId: state.recId }, metadata, mono);
+          }
         }
         yield { data: segment.data, isLast: false };
       }
     } finally {
       emitTelemetry(this.cameraName, "hksv_recording_stop", { streamId });
       ffmpeg.kill("SIGKILL");
+      const span = this.fragmentMono.get(streamId);
+      if (span) this.spanRecId.set(streamId, span.recId);
       this.processes.delete(streamId);
+      this.fragmentMono.delete(streamId);
     }
   }
 
@@ -286,6 +331,11 @@ export class ArgusRecordingDelegate implements CameraRecordingDelegate {
         streamId,
         reason: sanitizeRecordingCloseReason(reason),
       });
+      const recId = this.fragmentMono.get(streamId)?.recId ?? this.spanRecId.get(streamId);
+      if (recId !== undefined) emitSpan(this.cameraName, "hksv_span_close", { streamId, recId });
+      else emitSpan(this.cameraName, "hksv_span_close", { streamId });
+      this.fragmentMono.delete(streamId);
+      this.spanRecId.delete(streamId);
     }
   }
 }

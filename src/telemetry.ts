@@ -75,6 +75,62 @@ export function parseTelemetryLog(logContents: string): TelemetryEvent[] {
   return events;
 }
 
+export const SPAN_EVENTS = [
+  "motion_source",
+  "live_start_ack",
+  "hksv_span_fragment",
+  "hksv_span_close",
+] as const;
+
+export type SpanEventName = (typeof SPAN_EVENTS)[number];
+
+export type SpanKey =
+  | { motionId: string }
+  | { sessionId: string }
+  | { streamId: number; recId?: string };
+
+export function monotonicMs(now?: () => number): number {
+  try {
+    const clock = now ?? (() => performance.now());
+    const value = clock();
+    if (typeof value === "number" && Number.isFinite(value)) return Math.round(value);
+  } catch {
+    // Clock failed. Fall through to the wall clock.
+  }
+  try {
+    return Date.now();
+  } catch {
+    return 0;
+  }
+}
+
+export function emitSpan(
+  camera: string,
+  event: SpanEventName,
+  key: SpanKey,
+  metadata?: Record<string, number | string>,
+  monoMs?: number,
+): void {
+  try {
+    const stamped = monoMs ?? monotonicMs();
+    const entry: Record<string, unknown> = {
+      timestamp: Date.now(),
+      camera,
+      event,
+      monoMs: stamped,
+    };
+    if ("sessionId" in key) entry.sessionId = key.sessionId;
+    else if ("streamId" in key) {
+      entry.streamId = key.streamId;
+      if (key.recId !== undefined) entry.recId = key.recId;
+    } else entry.motionId = key.motionId;
+    if (metadata !== undefined && Object.keys(metadata).length > 0) entry.metadata = metadata;
+    process.stderr.write(`ARGUS_TELEMETRY: ${JSON.stringify(entry)}\n`);
+  } catch {
+    return;
+  }
+}
+
 /**
  * Analyze latency between events for a camera. Returns the time delta (ms) between
  * the first occurrence of `fromEvent` and the first occurrence of `toEvent` after it.

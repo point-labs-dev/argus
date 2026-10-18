@@ -112,6 +112,7 @@ Quick summary:
 - Motion detection emits timestamped events
 - Stream pre-warming reduces cold-start delay
 - Telemetry logs are machine-readable JSON (grep `ARGUS_TELEMETRY:`)
+- Span p50 and p95 from a log excerpt: [docs/span-latency.md](docs/span-latency.md). Build first (`npm run build`), then `node scripts/span-latency.mjs excerpt.log`.
 
 ### go2rtc Supervisor
 

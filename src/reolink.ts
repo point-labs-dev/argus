@@ -243,25 +243,30 @@ export class ReolinkClient {
    * while GetMdState is still read on every call.
    */
   public async getMotionState(channel: number): Promise<boolean> {
+    return (await this.classifyMotion(channel)).active;
+  }
+
+  public async classifyMotion(channel: number): Promise<{ active: boolean; via: "md" | "ai" | "none" }> {
     if (await this.getMdState(channel)) {
-      return true;
+      return { active: true, via: "md" };
     }
     if (this.aiSupported === false || this.now() < this.nextAiProbeAt) {
-      return false;
+      return { active: false, via: "none" };
     }
     const ai = await this.call("GetAiState", { channel }, await this.ensureToken());
     if (ai.code !== 0 && ai.error?.rspCode === -99) {
       this.aiSupported = false;
-      return false;
+      return { active: false, via: "none" };
     }
     if (ai.code !== 0 || !ai.value) {
       this.scheduleAiProbeBackoff();
-      return false;
+      return { active: false, via: "none" };
     }
     this.aiProbeBackoffMs = 0;
     this.nextAiProbeAt = 0;
     this.aiSupported = true;
-    return aiAlarmed(ai.value);
+    const active = aiAlarmed(ai.value);
+    return { active, via: active ? "ai" : "none" };
   }
 
   public async getHddInfo(): Promise<unknown> {
