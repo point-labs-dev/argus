@@ -17,7 +17,12 @@ const KEPT = [
 ];
 
 const ROOT_MARKDOWN_ALLOWLIST = ["README.md", "SPEC.md", "LEARNINGS.md", "PROJECT.md"];
-const DOCS_MARKDOWN_ALLOWLIST = ["docs/camera-health.md", "docs/aspect-migration.md", "docs/invariants.md"];
+const DOCS_MARKDOWN_ALLOWLIST = [
+  "docs/camera-health.md",
+  "docs/aspect-migration.md",
+  "docs/invariants.md",
+  "docs/span-latency.md",
+];
 
 function newNoteProblems(paths: string[]): string[] {
   return paths.filter((path) => {
@@ -75,7 +80,7 @@ describe("stream setup invariants", () => {
     expect(newNoteProblems(["README.md", "docs/invariants.md"])).toEqual([]);
     expect(newNoteProblems(["LATENCY.md"])).toEqual(["LATENCY.md"]);
     expect(newNoteProblems(["docs/DIMENSION-PAD-FIX.md"])).toEqual(["docs/DIMENSION-PAD-FIX.md"]);
-    expect(newNoteProblems(["docs/camera-health.md", "docs/aspect-migration.md"])).toEqual([]);
+    expect(newNoteProblems(["docs/camera-health.md", "docs/aspect-migration.md", "docs/span-latency.md"])).toEqual([]);
   });
 
   it("rejects an untracked root note and a new note under docs", () => {
