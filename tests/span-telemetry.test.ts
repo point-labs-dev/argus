@@ -1,6 +1,11 @@
+import { spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
+import { mkdtempSync, copyFileSync, mkdirSync } from "node:fs";
 import { readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { PassThrough } from "node:stream";
+import { Characteristic, Service } from "hap-nodejs";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("node:crypto", async (importOriginal) => {
@@ -46,9 +51,10 @@ vi.mock("node:dgram", () => {
 import { parseArgusConfig } from "../src/config.js";
 import { createCameraAccessory } from "../src/homekit.js";
 import { MotionMonitor, type MotionEdge } from "../src/motion.js";
+import { ArgusRecordingDelegate } from "../src/recording.js";
 import { SnapshotCache } from "../src/snapshot-cache.js";
 import { formatSpanReport } from "../src/span-report.js";
-import { SPAN_EVENTS } from "../src/telemetry.js";
+import { SPAN_EVENTS, monotonicMs } from "../src/telemetry.js";
 
 const SENTINEL_PASSWORD = "s3cret-pass";
 const SENTINEL_TOKEN = "s3cret-token";
@@ -353,16 +359,8 @@ describe("span telemetry", () => {
     }).toEqual(MAIN_BEHAVIOR);
     expect(result.spanLines.map((line) => JSON.parse(line.slice("ARGUS_TELEMETRY: ".length)).event)).toEqual([
       "motion_source",
-      "motion_characteristic_set",
       "motion_source",
-      "motion_characteristic_set",
-      "live_prepare_stream",
-      "live_start_stream",
-      "live_ffmpeg_spawn",
-      "live_first_frame",
       "live_start_ack",
-      "hksv_span_start",
-      "hksv_span_first_fragment",
       "hksv_span_fragment",
       "hksv_span_fragment",
       "hksv_span_close",
@@ -380,7 +378,8 @@ describe("span telemetry", () => {
       motionId?: string;
       sessionId?: string;
       streamId?: number;
-      metadata?: { durationMs?: number; size?: number; via?: string };
+      metadata?: { durationMs?: number; size?: number; via?: string; initial?: number };
+      recId?: string;
     });
     for (const event of parsed) {
       expect(event.monoMs).not.toBe(event.timestamp);
@@ -388,29 +387,35 @@ describe("span telemetry", () => {
     }
     const byEvent = (name: string) => parsed.find((event) => event.event === name);
     const sources = parsed.filter((event) => event.event === "motion_source");
-    const sets = parsed.filter((event) => event.event === "motion_characteristic_set");
     expect(sources.map((event) => ({ camera: event.camera, via: event.metadata?.via }))).toEqual([
       { camera: "Front L", via: "md" },
       { camera: "Garage Door", via: "ai" },
     ]);
-    expect(sets.map((event) => ({ camera: event.camera, motionId: event.motionId, via: event.metadata?.via }))).toEqual(
-      sources.map((event) => ({ camera: event.camera, motionId: event.motionId, via: event.metadata?.via })),
-    );
     expect(new Set(sources.map((event) => event.motionId)).size).toBe(2);
+    const timingSets = result.stderr.split("\n").filter((line) => line.includes('"stage":"motion_characteristic_set"'));
+    expect(timingSets.map((line) => JSON.parse(line.slice("ARGUS_TIMING: ".length)).camera)).toEqual([
+      "Front L",
+      "Garage Door",
+    ]);
+    expect(timingSets.join("\n")).not.toContain("motionId");
+    expect(timingSets.join("\n")).not.toContain("via");
     expect(spanText).not.toContain("motion_nvr_");
     expect(spanText).not.toContain("motion_direct_");
     expect(spanText).not.toContain('"via":"nvr"');
     expect(spanText).not.toContain('"via":"direct"');
+    expect(spanText).not.toContain('"event":"live_ffmpeg_spawn"');
+    expect(spanText).not.toContain('"event":"live_first_frame"');
+    expect(spanText).not.toContain('"event":"motion_characteristic_set"');
     expect(result.fetchCalls.filter((call) => call.cmd === "GetMdState").map((call) => call.channel)).toEqual([2, 2, 0]);
     expect(result.fetchCalls.filter((call) => call.cmd === "GetAiState").map((call) => call.channel)).toEqual([2, 0]);
-    for (const name of ["live_prepare_stream", "live_start_stream", "live_ffmpeg_spawn", "live_first_frame", "live_start_ack"]) {
-      expect(byEvent(name)?.sessionId).toBe("sess-1");
-    }
-    for (const name of ["hksv_span_start", "hksv_span_first_fragment", "hksv_span_close"]) {
-      expect(byEvent(name)?.streamId).toBe(7);
-    }
-    expect(parsed.filter((event) => event.event === "hksv_span_fragment").map((event) => event.metadata)).toEqual([
-      { durationMs: 15, size: 31 },
+    expect(byEvent("live_start_ack")?.sessionId).toBe("sess-1");
+    const fragments = parsed.filter((event) => event.event === "hksv_span_fragment");
+    expect(fragments.map((event) => event.streamId)).toEqual([7, 7]);
+    expect(byEvent("hksv_span_close")?.streamId).toBe(7);
+    expect(byEvent("hksv_span_close")?.recId).toBe(fragments[0]?.recId);
+    expect(fragments[0]?.recId).toBe(fragments[1]?.recId);
+    expect(fragments.map((event) => event.metadata)).toEqual([
+      { durationMs: 15, size: 31, initial: 1 },
       { durationMs: 25, size: 31 },
     ]);
     expect(formatSpanReport(result.stderr)).toBe([
@@ -421,7 +426,7 @@ describe("span telemetry", () => {
       "live_first_frame_to_start_ack n=1 p50=1 p95=1",
       "hksv_start_to_first_fragment n=1 p50=15 p95=15",
       "hksv_first_fragment_to_close n=1 p50=25 p95=25",
-      "hksv_fragment_duration n=2 p50=20 p95=24.5",
+      "hksv_fragment_duration n=1 p50=25 p95=25",
     ].join("\n") + "\n");
     expect(formatSpanReport(result.stderr)).not.toContain(SENTINEL_PASSWORD);
     expect(formatSpanReport(result.stderr)).not.toContain(SENTINEL_HOST);
@@ -445,6 +450,236 @@ describe("span telemetry", () => {
     ].join("\n") + "\n");
     expect(report).not.toContain(SENTINEL_PASSWORD);
     expect(report).not.toContain(SENTINEL_HOST);
+  });
+
+  it("does not pair a reused stream id with an earlier recording start", () => {
+    const log = [
+      'ARGUS_TIMING: {"stage":"recording_start","camera":"Garage Door","monoMs":0,"streamId":7}',
+      'ARGUS_TIMING: {"stage":"recording_start","camera":"Garage Door","monoMs":100,"streamId":7}',
+      'ARGUS_TIMING: {"stage":"recording_first_fragment","camera":"Garage Door","monoMs":115,"streamId":7}',
+      'ARGUS_TELEMETRY: {"timestamp":1,"camera":"Garage Door","event":"hksv_span_close","monoMs":140,"streamId":7,"recId":"r2"}',
+    ].join("\n");
+    const report = formatSpanReport(log);
+    expect(report).toContain("hksv_start_to_first_fragment n=1 p50=15 p95=15");
+    expect(report).toContain("hksv_first_fragment_to_close n=1 p50=25 p95=25");
+    expect(report).not.toContain("p50=115");
+    expect(report).not.toContain("p50=140");
+  });
+
+  it("excludes the start-to-first gap from fragment duration stats", () => {
+    const log = [
+      'ARGUS_TELEMETRY: {"timestamp":1,"camera":"Garage Door","event":"hksv_span_fragment","monoMs":15,"streamId":7,"recId":"r1","metadata":{"durationMs":15,"size":10,"initial":1}}',
+      'ARGUS_TELEMETRY: {"timestamp":1,"camera":"Garage Door","event":"hksv_span_fragment","monoMs":40,"streamId":7,"recId":"r1","metadata":{"durationMs":25,"size":10}}',
+      'ARGUS_TELEMETRY: {"timestamp":1,"camera":"Garage Door","event":"hksv_span_fragment","monoMs":140,"streamId":7,"recId":"r2","metadata":{"durationMs":100,"size":10,"initial":1}}',
+      'ARGUS_TELEMETRY: {"timestamp":1,"camera":"Garage Door","event":"hksv_span_fragment","monoMs":180,"streamId":7,"recId":"r2","metadata":{"durationMs":40,"size":10}}',
+    ].join("\n");
+    expect(formatSpanReport(log)).toContain("hksv_fragment_duration n=2 p50=32.5 p95=39.3");
+  });
+
+  it("leaves both recording maps empty after the stream ends and does not keep an entry when spawn throws", async () => {
+    const stdout = new PassThrough();
+    const proc = Object.assign(new EventEmitter(), { stdout, stderr: new PassThrough(), kill: vi.fn() });
+    const spawnFn = vi.fn(() => proc) as unknown as typeof import("node:child_process").spawn;
+    const delegate = new ArgusRecordingDelegate("Cam", "rtsp://127.0.0.1/main", {
+      spawnFn,
+      verbose: false,
+      aspect: "16:9",
+    });
+    delegate.updateRecordingConfiguration({
+      prebufferLength: 4000,
+      eventTriggerTypes: [1],
+      mediaContainerConfiguration: { type: 0, fragmentLength: 4000 },
+      videoCodec: {
+        type: 0,
+        parameters: { profile: 2, level: 2, bitRate: 2000, iFrameInterval: 4000 },
+        resolution: [1280, 720, 30],
+      },
+      audioCodec: { type: 0, bitrate: 64, samplerate: 3, audioChannels: 1 },
+    } as never);
+    const maps = delegate as unknown as {
+      processes: Map<number, unknown>;
+      fragmentMono: Map<number, unknown>;
+      spanRecId: Map<number, string>;
+    };
+    const generator = delegate.handleRecordingStreamRequest(4);
+    const opened = generator.next();
+    expect(maps.processes.size).toBe(1);
+    expect(maps.fragmentMono.size).toBe(1);
+    stdout.write(mp4Box("ftyp", Buffer.from("isom")));
+    stdout.write(mp4Box("moov", Buffer.from("moovdata")));
+    await opened;
+    stdout.write(mp4Box("moof", Buffer.from("moof")));
+    stdout.write(mp4Box("mdat", Buffer.from("media")));
+    await generator.next();
+    await generator.return(undefined);
+    expect(maps.processes.size).toBe(0);
+    expect(maps.fragmentMono.size).toBe(0);
+    delegate.closeRecordingStream(4, undefined);
+    expect(maps.processes.size).toBe(0);
+    expect(maps.fragmentMono.size).toBe(0);
+    expect(maps.spanRecId.size).toBe(0);
+
+    const failing = new ArgusRecordingDelegate("Cam", "rtsp://127.0.0.1/main", {
+      spawnFn: (() => {
+        throw new Error("spawn failed");
+      }) as unknown as typeof import("node:child_process").spawn,
+      verbose: false,
+      aspect: "16:9",
+    });
+    failing.updateRecordingConfiguration({
+      prebufferLength: 4000,
+      eventTriggerTypes: [1],
+      mediaContainerConfiguration: { type: 0, fragmentLength: 4000 },
+      videoCodec: {
+        type: 0,
+        parameters: { profile: 2, level: 2, bitRate: 2000, iFrameInterval: 4000 },
+        resolution: [1280, 720, 30],
+      },
+      audioCodec: { type: 0, bitrate: 64, samplerate: 3, audioChannels: 1 },
+    } as never);
+    const failedMaps = failing as unknown as { processes: Map<number, unknown>; fragmentMono: Map<number, unknown> };
+    await expect(failing.handleRecordingStreamRequest(5).next()).rejects.toThrow("spawn failed");
+    expect(failedMaps.processes.size).toBe(0);
+    expect(failedMaps.fragmentMono.size).toBe(0);
+  });
+
+  it("prepareStream, START, the ack timer, HKSV, and setMotion survive a throwing or missing monotonic clock", async () => {
+    const uncaught: unknown[] = [];
+    const onUncaught = (error: unknown) => {
+      uncaught.push(error);
+    };
+    process.on("uncaughtException", onUncaught);
+    const clock = vi.spyOn(performance, "now").mockImplementation(() => {
+      throw new Error("performance.now down");
+    });
+    try {
+      vi.useFakeTimers({
+        now: Date.parse("2026-10-18T00:00:00.000Z"),
+        toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"],
+      });
+      (globalThis as { __argusFakePort?: number }).__argusFakePort = 41000;
+      const fetchFn = installFetch(() => 1, 0);
+      const config = configFor([camera("Garage Door", 0)]);
+      const cache = new SnapshotCache(config, {
+        fetch: (async () => {
+          throw new Error("snapshot fetch is out of bounds");
+        }) as typeof fetch,
+      });
+      const stdout = new PassThrough();
+      const proc = Object.assign(new EventEmitter(), {
+        stderr: new PassThrough(),
+        stdout,
+        kill: vi.fn(),
+      });
+      const spawnFn = vi.fn(() => proc) as unknown as typeof import("node:child_process").spawn;
+      const accessory = createCameraAccessory(config.cameras[0]!, LIVE_URL, MAIN_URL, cache, {
+        spawnFn,
+        verbose: false,
+      });
+      const monitor = new MotionMonitor(config.cameras, (name, detected, edge) => {
+        if (edge) accessory.setMotion(detected, edge);
+        else accessory.setMotion(detected);
+      }, { fetch: fetchFn.fetch, now: () => Date.now(), cooldownMs: 30_000 });
+      await monitor.pollOnce();
+      const motion = accessory.accessory.getService(Service.MotionSensor);
+      expect(motion?.getCharacteristic(Characteristic.MotionDetected).value).toBe(true);
+
+      let prepared = false;
+      await new Promise<void>((resolve, reject) => {
+        accessory.delegate.prepareStream(
+          {
+            sessionID: "sess-clock",
+            targetAddress: "192.0.2.10",
+            video: { port: 50000, srtp_key: Buffer.alloc(16, 0x11), srtp_salt: Buffer.alloc(14, 0x22) },
+            audio: { port: 50002, srtp_key: Buffer.alloc(16, 0x33), srtp_salt: Buffer.alloc(14, 0x44) },
+          } as never,
+          (error) => {
+            if (error) {
+              reject(error);
+              return;
+            }
+            prepared = true;
+            resolve();
+          },
+        );
+      });
+      expect(prepared).toBe(true);
+
+      let ackedAt: number | null = null;
+      const started = new Promise<void>((resolve, reject) => {
+        accessory.delegate.handleStreamRequest(
+          {
+            type: "start",
+            sessionID: "sess-clock",
+            video: { pt: 99, max_bit_rate: 299, fps: 30, width: 640, height: 480, mtu: 1378, profile: 0, level: 2 },
+            audio: { pt: 110, sample_rate: 24, max_bit_rate: 24, codec: 3 },
+          } as never,
+          (error) => {
+            if (error) {
+              reject(error);
+              return;
+            }
+            ackedAt = Date.now();
+            resolve();
+          },
+        );
+      });
+      const startRequestedAt = Date.now();
+      await vi.advanceTimersByTimeAsync(99);
+      expect(ackedAt).toBeNull();
+      proc.stderr.write("frame=1\n");
+      await vi.advanceTimersByTimeAsync(1);
+      await started;
+      expect(ackedAt).toBe(startRequestedAt + 100);
+
+      accessory.recordingDelegate.updateRecordingConfiguration({
+        prebufferLength: 4000,
+        eventTriggerTypes: [1],
+        mediaContainerConfiguration: { type: 0, fragmentLength: 4000 },
+        videoCodec: {
+          type: 0,
+          parameters: { profile: 2, level: 2, bitRate: 2000, iFrameInterval: 4000 },
+          resolution: [1280, 720, 30],
+        },
+        audioCodec: { type: 0, bitrate: 64, samplerate: 3, audioChannels: 1 },
+      } as never);
+      const generator = accessory.recordingDelegate.handleRecordingStreamRequest(3);
+      stdout.write(mp4Box("ftyp", Buffer.from("isom")));
+      stdout.write(mp4Box("moov", Buffer.from("moovdata")));
+      const init = await generator.next();
+      expect(init.done).toBe(false);
+      stdout.write(mp4Box("moof", Buffer.from("moof")));
+      stdout.write(mp4Box("mdat", Buffer.from("media")));
+      const fragment = await generator.next();
+      expect(fragment.done).toBe(false);
+      await generator.return(undefined);
+      accessory.setMotion(false);
+      expect(motion?.getCharacteristic(Characteristic.MotionDetected).value).toBe(false);
+      clock.mockRestore();
+      const priorNow = Object.getOwnPropertyDescriptor(performance, "now");
+      Object.defineProperty(performance, "now", { configurable: true, writable: true, value: undefined });
+      expect(() => accessory.setMotion(true, { motionId: "m-missing", via: "md" })).not.toThrow();
+      expect(motion?.getCharacteristic(Characteristic.MotionDetected).value).toBe(true);
+      expect(monotonicMs()).toBeTypeOf("number");
+      if (priorNow) Object.defineProperty(performance, "now", priorNow);
+      expect(uncaught).toEqual([]);
+      expect(monotonicMs(() => {
+        throw new Error("missing");
+      })).toBeTypeOf("number");
+    } finally {
+      clock.mockRestore();
+      process.off("uncaughtException", onUncaught);
+      vi.useRealTimers();
+    }
+  });
+
+  it("prints a build-first error when dist/span-report.js is missing", () => {
+    const directory = mkdtempSync(join(tmpdir(), "argus-span-"));
+    mkdirSync(join(directory, "scripts"));
+    copyFileSync("scripts/span-latency.mjs", join(directory, "scripts/span-latency.mjs"));
+    const result = spawnSync(process.execPath, [join(directory, "scripts/span-latency.mjs")], { encoding: "utf8" });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("span-latency: build first. Missing dist/span-report.js. Run npm run build.");
   });
 });
 

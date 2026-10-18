@@ -77,14 +77,7 @@ export function parseTelemetryLog(logContents: string): TelemetryEvent[] {
 
 export const SPAN_EVENTS = [
   "motion_source",
-  "motion_characteristic_set",
-  "live_prepare_stream",
-  "live_start_stream",
-  "live_ffmpeg_spawn",
-  "live_first_frame",
   "live_start_ack",
-  "hksv_span_start",
-  "hksv_span_first_fragment",
   "hksv_span_fragment",
   "hksv_span_close",
 ] as const;
@@ -94,10 +87,21 @@ export type SpanEventName = (typeof SPAN_EVENTS)[number];
 export type SpanKey =
   | { motionId: string }
   | { sessionId: string }
-  | { streamId: number };
+  | { streamId: number; recId?: string };
 
-export function monotonicMs(now: () => number = () => performance.now()): number {
-  return Math.round(now());
+export function monotonicMs(now?: () => number): number {
+  try {
+    const clock = now ?? (() => performance.now());
+    const value = clock();
+    if (typeof value === "number" && Number.isFinite(value)) return Math.round(value);
+  } catch {
+    // Clock failed. Fall through to the wall clock.
+  }
+  try {
+    return Date.now();
+  } catch {
+    return 0;
+  }
 }
 
 export function emitSpan(
@@ -105,18 +109,21 @@ export function emitSpan(
   event: SpanEventName,
   key: SpanKey,
   metadata?: Record<string, number | string>,
-  monoMs: number = monotonicMs(),
+  monoMs?: number,
 ): void {
   try {
+    const stamped = monoMs ?? monotonicMs();
     const entry: Record<string, unknown> = {
       timestamp: Date.now(),
       camera,
       event,
-      monoMs,
+      monoMs: stamped,
     };
     if ("sessionId" in key) entry.sessionId = key.sessionId;
-    else if ("streamId" in key) entry.streamId = key.streamId;
-    else entry.motionId = key.motionId;
+    else if ("streamId" in key) {
+      entry.streamId = key.streamId;
+      if (key.recId !== undefined) entry.recId = key.recId;
+    } else entry.motionId = key.motionId;
     if (metadata !== undefined && Object.keys(metadata).length > 0) entry.metadata = metadata;
     process.stderr.write(`ARGUS_TELEMETRY: ${JSON.stringify(entry)}\n`);
   } catch {

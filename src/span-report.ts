@@ -1,26 +1,38 @@
 import { SPAN_EVENTS, type SpanEventName } from "./telemetry.js";
 
 const SPANS = [
-  { id: "motion_source_to_characteristic_set", from: "motion_source", to: "motion_characteristic_set" },
-  { id: "live_prepare_stream_to_start_stream", from: "live_prepare_stream", to: "live_start_stream" },
-  { id: "live_start_stream_to_ffmpeg_spawn", from: "live_start_stream", to: "live_ffmpeg_spawn" },
-  { id: "live_ffmpeg_spawn_to_first_frame", from: "live_ffmpeg_spawn", to: "live_first_frame" },
-  { id: "live_first_frame_to_start_ack", from: "live_first_frame", to: "live_start_ack" },
-  { id: "hksv_start_to_first_fragment", from: "hksv_span_start", to: "hksv_span_first_fragment" },
-  { id: "hksv_first_fragment_to_close", from: "hksv_span_first_fragment", to: "hksv_span_close" },
+  { id: "motion_source_to_characteristic_set", from: "motion_source", to: "motion_characteristic_set", pair: "camera", reset: [] },
+  { id: "live_prepare_stream_to_start_stream", from: "prepare_stream_enter", to: "live_session_start", pair: "session", reset: [] },
+  { id: "live_start_stream_to_ffmpeg_spawn", from: "live_session_start", to: "live_ffmpeg_spawn", pair: "session", reset: [] },
+  { id: "live_ffmpeg_spawn_to_first_frame", from: "live_ffmpeg_spawn", to: "live_first_frame", pair: "session", reset: [] },
+  { id: "live_first_frame_to_start_ack", from: "live_first_frame", to: "live_start_ack", pair: "session", reset: [] },
+  { id: "hksv_start_to_first_fragment", from: "recording_start", to: "recording_first_fragment", pair: "stream", reset: [] },
+  { id: "hksv_first_fragment_to_close", from: "recording_first_fragment", to: "hksv_span_close", pair: "stream", reset: ["recording_start"] },
 ] as const;
 
+type Pair = "camera" | "session" | "stream";
+
 interface SpanMark {
-  event: SpanEventName;
+  kind: string;
   camera: string;
   monoMs: number;
-  motionId?: string;
   sessionId?: string;
   streamId?: number;
+  recId?: string;
   durationMs?: number;
+  initial: boolean;
 }
 
 const SPAN_EVENT_SET = new Set<string>(SPAN_EVENTS);
+const TIMING_STAGES = new Set<string>([
+  "motion_characteristic_set",
+  "prepare_stream_enter",
+  "live_session_start",
+  "live_ffmpeg_spawn",
+  "live_first_frame",
+  "recording_start",
+  "recording_first_fragment",
+]);
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -30,7 +42,7 @@ function finiteNumber(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
-function parseMark(value: unknown): SpanMark | undefined {
+function parseTelemetryMark(value: unknown): SpanMark | undefined {
   if (!isRecord(value)) return undefined;
   const event = value["event"];
   const camera = value["camera"];
@@ -38,28 +50,45 @@ function parseMark(value: unknown): SpanMark | undefined {
   if (typeof event !== "string" || !SPAN_EVENT_SET.has(event) || typeof camera !== "string" || monoMs === undefined) {
     return undefined;
   }
-  const mark: SpanMark = { event: event as SpanEventName, camera, monoMs };
-  if (typeof value["motionId"] === "string") mark.motionId = value["motionId"];
+  const mark: SpanMark = { kind: event as SpanEventName, camera, monoMs, initial: false };
   if (typeof value["sessionId"] === "string") mark.sessionId = value["sessionId"];
   const streamId = finiteNumber(value["streamId"]);
   if (streamId !== undefined) mark.streamId = streamId;
+  if (typeof value["recId"] === "string") mark.recId = value["recId"];
   const metadata = value["metadata"];
   if (isRecord(metadata)) {
     const durationMs = finiteNumber(metadata["durationMs"]);
     if (durationMs !== undefined) mark.durationMs = durationMs;
+    if (metadata["initial"] === 1) mark.initial = true;
   }
+  return mark;
+}
+
+function parseTimingMark(value: unknown): SpanMark | undefined {
+  if (!isRecord(value)) return undefined;
+  const stage = value["stage"];
+  const camera = value["camera"];
+  const monoMs = finiteNumber(value["monoMs"]);
+  if (typeof stage !== "string" || !TIMING_STAGES.has(stage) || typeof camera !== "string" || monoMs === undefined) {
+    return undefined;
+  }
+  const mark: SpanMark = { kind: stage, camera, monoMs, initial: false };
+  if (typeof value["sessionId"] === "string") mark.sessionId = value["sessionId"];
+  const streamId = finiteNumber(value["streamId"]);
+  if (streamId !== undefined) mark.streamId = streamId;
   return mark;
 }
 
 function parseSpanLog(logContents: string): SpanMark[] {
   const marks: SpanMark[] = [];
   for (const line of logContents.split("\n")) {
-    const match = line.match(/ARGUS_TELEMETRY: (.+)$/);
-    const json = match?.[1];
+    const telemetry = line.match(/ARGUS_TELEMETRY: (.+)$/)?.[1];
+    const timing = line.match(/ARGUS_TIMING: (.+)$/)?.[1];
+    const json = telemetry ?? timing;
     if (!json) continue;
     try {
       const parsed: unknown = JSON.parse(json);
-      const mark = parseMark(parsed);
+      const mark = telemetry ? parseTelemetryMark(parsed) : parseTimingMark(parsed);
       if (mark) marks.push(mark);
     } catch {
       continue;
@@ -68,47 +97,43 @@ function parseSpanLog(logContents: string): SpanMark[] {
   return marks;
 }
 
-function epochs(marks: readonly SpanMark[]): SpanMark[][] {
-  const groups: SpanMark[][] = [];
-  let current: SpanMark[] = [];
-  let last = Number.NEGATIVE_INFINITY;
-  for (const mark of marks) {
-    if (current.length > 0 && mark.monoMs < last) {
-      groups.push(current);
-      current = [];
-    }
-    current.push(mark);
-    last = mark.monoMs;
+function pairKey(mark: SpanMark, pair: Pair): string | undefined {
+  if (pair === "session") {
+    if (mark.sessionId === undefined) return undefined;
+    return `${mark.camera}\0${mark.sessionId}`;
   }
-  if (current.length > 0) groups.push(current);
-  return groups;
-}
-
-function pairKey(mark: SpanMark): string {
-  if (mark.motionId !== undefined) return `${mark.camera}\0${mark.motionId}`;
-  if (mark.sessionId !== undefined) return `${mark.camera}\0${mark.sessionId}`;
-  if (mark.streamId !== undefined) return `${mark.camera}\0${mark.streamId}`;
+  if (pair === "stream") {
+    if (mark.streamId === undefined) return undefined;
+    return `${mark.camera}\0${mark.streamId}`;
+  }
   return mark.camera;
 }
 
-function samplesFor(marks: readonly SpanMark[], from: SpanEventName, to: SpanEventName): number[] {
+function linearSamples(
+  marks: readonly SpanMark[],
+  from: string,
+  to: string,
+  pair: Pair,
+  reset: readonly string[],
+): number[] {
+  const open = new Map<string, number>();
   const deltas: number[] = [];
-  for (const group of epochs(marks)) {
-    const used = new Set<number>();
-    for (let i = 0; i < group.length; i += 1) {
-      const start = group[i];
-      if (!start || start.event !== from) continue;
-      const startKey = pairKey(start);
-      for (let j = i + 1; j < group.length; j += 1) {
-        if (used.has(j)) continue;
-        const end = group[j];
-        if (!end || end.event !== to || pairKey(end) !== startKey) continue;
-        const delta = end.monoMs - start.monoMs;
-        if (delta < 0) continue;
-        used.add(j);
-        deltas.push(delta);
-        break;
-      }
+  let last = Number.NEGATIVE_INFINITY;
+  for (const mark of marks) {
+    if (mark.monoMs < last) open.clear();
+    last = mark.monoMs;
+    const relevant = mark.kind === from || mark.kind === to || reset.includes(mark.kind);
+    if (!relevant) continue;
+    const key = pairKey(mark, pair);
+    if (key === undefined) continue;
+    if (reset.includes(mark.kind)) open.delete(key);
+    if (mark.kind === from) {
+      open.set(key, mark.monoMs);
+    } else if (mark.kind === to) {
+      const start = open.get(key);
+      if (start === undefined || mark.monoMs < start) continue;
+      deltas.push(mark.monoMs - start);
+      open.delete(key);
     }
   }
   return deltas;
@@ -140,12 +165,15 @@ function lineFor(id: string, samples: readonly number[]): string {
   return `${id} n=${sorted.length} p50=${fmt(percentile(sorted, 50))} p95=${fmt(percentile(sorted, 95))}`;
 }
 
+function fragmentDurations(marks: readonly SpanMark[]): number[] {
+  return marks
+    .filter((mark) => mark.kind === "hksv_span_fragment" && mark.durationMs !== undefined && mark.durationMs >= 0 && !mark.initial)
+    .map((mark) => mark.durationMs ?? 0);
+}
+
 export function formatSpanReport(logContents: string): string {
   const marks = parseSpanLog(logContents);
-  const lines = SPANS.map((span) => lineFor(span.id, samplesFor(marks, span.from, span.to)));
-  const durations = marks
-    .filter((mark) => mark.event === "hksv_span_fragment" && mark.durationMs !== undefined && mark.durationMs >= 0)
-    .map((mark) => mark.durationMs ?? 0);
-  lines.push(lineFor("hksv_fragment_duration", durations));
+  const lines = SPANS.map((span) => lineFor(span.id, linearSamples(marks, span.from, span.to, span.pair, span.reset)));
+  lines.push(lineFor("hksv_fragment_duration", fragmentDurations(marks)));
   return `${lines.join("\n")}\n`;
 }
