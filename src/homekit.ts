@@ -1217,11 +1217,7 @@ export function createCameraAccessory(
       if (detected) {
         emitTiming({ stage: "motion_characteristic_set", camera: camera.name });
         if (edge) {
-          emitSpan(
-            camera.name,
-            edge.path === "direct" ? "motion_direct_characteristic_set" : "motion_nvr_characteristic_set",
-            { motionId: edge.motionId },
-          );
+          emitSpan(camera.name, "motion_characteristic_set", { motionId: edge.motionId }, { via: edge.via });
         }
       }
     },

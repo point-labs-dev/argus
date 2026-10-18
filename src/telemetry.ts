@@ -76,10 +76,8 @@ export function parseTelemetryLog(logContents: string): TelemetryEvent[] {
 }
 
 export const SPAN_EVENTS = [
-  "motion_nvr_source",
-  "motion_nvr_characteristic_set",
-  "motion_direct_source",
-  "motion_direct_characteristic_set",
+  "motion_source",
+  "motion_characteristic_set",
   "live_prepare_stream",
   "live_start_stream",
   "live_ffmpeg_spawn",
@@ -106,7 +104,7 @@ export function emitSpan(
   camera: string,
   event: SpanEventName,
   key: SpanKey,
-  metadata?: Record<string, number>,
+  metadata?: Record<string, number | string>,
   monoMs: number = monotonicMs(),
 ): void {
   try {

@@ -1,8 +1,7 @@
 import { SPAN_EVENTS, type SpanEventName } from "./telemetry.js";
 
 const SPANS = [
-  { id: "motion_nvr_source_to_characteristic_set", from: "motion_nvr_source", to: "motion_nvr_characteristic_set" },
-  { id: "motion_direct_source_to_characteristic_set", from: "motion_direct_source", to: "motion_direct_characteristic_set" },
+  { id: "motion_source_to_characteristic_set", from: "motion_source", to: "motion_characteristic_set" },
   { id: "live_prepare_stream_to_start_stream", from: "live_prepare_stream", to: "live_start_stream" },
   { id: "live_start_stream_to_ffmpeg_spawn", from: "live_start_stream", to: "live_ffmpeg_spawn" },
   { id: "live_ffmpeg_spawn_to_first_frame", from: "live_ffmpeg_spawn", to: "live_first_frame" },

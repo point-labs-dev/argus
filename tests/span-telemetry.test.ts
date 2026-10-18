@@ -48,28 +48,13 @@ import { createCameraAccessory } from "../src/homekit.js";
 import { MotionMonitor, type MotionEdge } from "../src/motion.js";
 import { SnapshotCache } from "../src/snapshot-cache.js";
 import { formatSpanReport } from "../src/span-report.js";
+import { SPAN_EVENTS } from "../src/telemetry.js";
 
 const SENTINEL_PASSWORD = "s3cret-pass";
 const SENTINEL_TOKEN = "s3cret-token";
 const SENTINEL_HOST = "10.9.9.9";
 const LIVE_URL = `rtsp://admin:${SENTINEL_PASSWORD}@${SENTINEL_HOST}/sub`;
 const MAIN_URL = `rtsp://admin:${SENTINEL_PASSWORD}@${SENTINEL_HOST}/main`;
-
-const SPAN_EVENTS = [
-  "motion_nvr_source",
-  "motion_nvr_characteristic_set",
-  "motion_direct_source",
-  "motion_direct_characteristic_set",
-  "live_prepare_stream",
-  "live_start_stream",
-  "live_ffmpeg_spawn",
-  "live_first_frame",
-  "live_start_ack",
-  "hksv_span_start",
-  "hksv_span_first_fragment",
-  "hksv_span_fragment",
-  "hksv_span_close",
-] as const;
 
 function mp4Box(type: string, payload: Buffer): Buffer {
   const header = Buffer.alloc(8);
@@ -367,7 +352,10 @@ describe("span telemetry", () => {
       fetchCalls: result.fetchCalls,
     }).toEqual(MAIN_BEHAVIOR);
     expect(result.spanLines.map((line) => JSON.parse(line.slice("ARGUS_TELEMETRY: ".length)).event)).toEqual([
-      ...SPAN_EVENTS.slice(0, 4),
+      "motion_source",
+      "motion_characteristic_set",
+      "motion_source",
+      "motion_characteristic_set",
       "live_prepare_stream",
       "live_start_stream",
       "live_ffmpeg_spawn",
@@ -386,21 +374,35 @@ describe("span telemetry", () => {
     expect(spanText).not.toContain("rtsp://");
     const parsed = result.spanLines.map((line) => JSON.parse(line.slice("ARGUS_TELEMETRY: ".length)) as {
       timestamp: number;
+      camera: string;
       monoMs: number;
       event: string;
       motionId?: string;
       sessionId?: string;
       streamId?: number;
-      metadata?: { durationMs: number; size: number };
+      metadata?: { durationMs?: number; size?: number; via?: string };
     });
     for (const event of parsed) {
       expect(event.monoMs).not.toBe(event.timestamp);
       expect(event.monoMs).toBeLessThan(1_000_000);
     }
     const byEvent = (name: string) => parsed.find((event) => event.event === name);
-    expect(byEvent("motion_nvr_source")?.motionId).toBe(byEvent("motion_nvr_characteristic_set")?.motionId);
-    expect(byEvent("motion_direct_source")?.motionId).toBe(byEvent("motion_direct_characteristic_set")?.motionId);
-    expect(byEvent("motion_nvr_source")?.motionId).not.toBe(byEvent("motion_direct_source")?.motionId);
+    const sources = parsed.filter((event) => event.event === "motion_source");
+    const sets = parsed.filter((event) => event.event === "motion_characteristic_set");
+    expect(sources.map((event) => ({ camera: event.camera, via: event.metadata?.via }))).toEqual([
+      { camera: "Front L", via: "md" },
+      { camera: "Garage Door", via: "ai" },
+    ]);
+    expect(sets.map((event) => ({ camera: event.camera, motionId: event.motionId, via: event.metadata?.via }))).toEqual(
+      sources.map((event) => ({ camera: event.camera, motionId: event.motionId, via: event.metadata?.via })),
+    );
+    expect(new Set(sources.map((event) => event.motionId)).size).toBe(2);
+    expect(spanText).not.toContain("motion_nvr_");
+    expect(spanText).not.toContain("motion_direct_");
+    expect(spanText).not.toContain('"via":"nvr"');
+    expect(spanText).not.toContain('"via":"direct"');
+    expect(result.fetchCalls.filter((call) => call.cmd === "GetMdState").map((call) => call.channel)).toEqual([2, 2, 0]);
+    expect(result.fetchCalls.filter((call) => call.cmd === "GetAiState").map((call) => call.channel)).toEqual([2, 0]);
     for (const name of ["live_prepare_stream", "live_start_stream", "live_ffmpeg_spawn", "live_first_frame", "live_start_ack"]) {
       expect(byEvent(name)?.sessionId).toBe("sess-1");
     }
@@ -412,8 +414,7 @@ describe("span telemetry", () => {
       { durationMs: 25, size: 31 },
     ]);
     expect(formatSpanReport(result.stderr)).toBe([
-      "motion_nvr_source_to_characteristic_set n=1 p50=0 p95=0",
-      "motion_direct_source_to_characteristic_set n=1 p50=0 p95=0",
+      "motion_source_to_characteristic_set n=2 p50=0 p95=0",
       "live_prepare_stream_to_start_stream n=1 p50=0 p95=0",
       "live_start_stream_to_ffmpeg_spawn n=1 p50=0 p95=0",
       "live_ffmpeg_spawn_to_first_frame n=1 p50=99 p95=99",
@@ -433,8 +434,7 @@ describe("span telemetry", () => {
     ].join("\n");
     const report = formatSpanReport(log);
     expect(report).toBe([
-      "motion_nvr_source_to_characteristic_set n=0",
-      "motion_direct_source_to_characteristic_set n=0",
+      "motion_source_to_characteristic_set n=0",
       "live_prepare_stream_to_start_stream n=0",
       "live_start_stream_to_ffmpeg_spawn n=0",
       "live_ffmpeg_spawn_to_first_frame n=0",
