@@ -134,7 +134,7 @@ function motionTo(
   };
 }
 
-function camera(name: string, channel: number) {
+function camera(name: string, channel: number, directAiHost?: string) {
   return {
     name,
     aspect: "4:3" as const,
@@ -145,6 +145,7 @@ function camera(name: string, channel: number) {
     password: SENTINEL_PASSWORD,
     transport: "auto" as const,
     streams: { main: "main", sub: "sub" },
+    ...(directAiHost === undefined ? {} : { directAiHost }),
   };
 }
 
@@ -155,6 +156,44 @@ function configFor(cameras: ReturnType<typeof camera>[]) {
     homekit: { pin: "123-45-678" },
     go2rtc: { binary: "./go2rtc", api_port: 1984 },
     server: { port: 8080 },
+  });
+}
+
+function liveHarness(name = "Garage Door") {
+  (globalThis as { __argusFakePort?: number }).__argusFakePort = 42000;
+  const config = configFor([camera(name, 0)]);
+  const cache = new SnapshotCache(config, {
+    fetch: (async () => {
+      throw new Error("snapshot fetch is out of bounds");
+    }) as typeof fetch,
+  });
+  const proc = Object.assign(new EventEmitter(), {
+    stderr: new PassThrough(),
+    stdout: new PassThrough(),
+    kill: vi.fn(),
+  });
+  const spawnFn = vi.fn(() => proc) as unknown as typeof import("node:child_process").spawn;
+  const accessory = createCameraAccessory(config.cameras[0]!, LIVE_URL, MAIN_URL, cache, {
+    spawnFn,
+    verbose: false,
+  });
+  return { accessory, proc };
+}
+
+async function prepareSession(accessory: ReturnType<typeof liveHarness>["accessory"], sessionID: string): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    accessory.delegate.prepareStream(
+      {
+        sessionID,
+        targetAddress: "192.0.2.10",
+        video: { port: 50000, srtp_key: Buffer.alloc(16, 0x11), srtp_salt: Buffer.alloc(14, 0x22) },
+        audio: { port: 50002, srtp_key: Buffer.alloc(16, 0x33), srtp_salt: Buffer.alloc(14, 0x44) },
+      } as never,
+      (error) => {
+        if (error) reject(error);
+        else resolve();
+      },
+    );
   });
 }
 
@@ -466,6 +505,19 @@ describe("span telemetry", () => {
     expect(report).not.toContain("p50=140");
   });
 
+  it("drops an open first fragment when the next recording starts without a close", () => {
+    const log = [
+      'ARGUS_TIMING: {"stage":"recording_first_fragment","camera":"Garage Door","monoMs":0,"streamId":7}',
+      'ARGUS_TELEMETRY: {"timestamp":1,"camera":"Garage Door","event":"hksv_span_close","monoMs":4000,"streamId":7,"recId":"r1"}',
+      'ARGUS_TIMING: {"stage":"recording_first_fragment","camera":"Garage Door","monoMs":5000,"streamId":7}',
+      'ARGUS_TIMING: {"stage":"recording_start","camera":"Garage Door","monoMs":6000,"streamId":7}',
+      'ARGUS_TELEMETRY: {"timestamp":1,"camera":"Garage Door","event":"hksv_span_close","monoMs":13500,"streamId":7,"recId":"r3"}',
+      'ARGUS_TIMING: {"stage":"recording_first_fragment","camera":"Garage Door","monoMs":14000,"streamId":7}',
+      'ARGUS_TELEMETRY: {"timestamp":1,"camera":"Garage Door","event":"hksv_span_close","monoMs":22600,"streamId":7,"recId":"r4"}',
+    ].join("\n");
+    expect(formatSpanReport(log)).toContain("hksv_first_fragment_to_close n=2 p50=6300 p95=8370");
+  });
+
   it("excludes the start-to-first gap from fragment duration stats", () => {
     const log = [
       'ARGUS_TELEMETRY: {"timestamp":1,"camera":"Garage Door","event":"hksv_span_fragment","monoMs":15,"streamId":7,"recId":"r1","metadata":{"durationMs":15,"size":10,"initial":1}}',
@@ -541,6 +593,42 @@ describe("span telemetry", () => {
     await expect(failing.handleRecordingStreamRequest(5).next()).rejects.toThrow("spawn failed");
     expect(failedMaps.processes.size).toBe(0);
     expect(failedMaps.fragmentMono.size).toBe(0);
+  });
+
+  it("empties fragmentMono and spanRecId when close runs before generator cleanup", async () => {
+    const stdout = new PassThrough();
+    const proc = Object.assign(new EventEmitter(), { stdout, stderr: new PassThrough(), kill: vi.fn() });
+    const delegate = new ArgusRecordingDelegate("Cam", "rtsp://127.0.0.1/main", {
+      spawnFn: (() => proc) as unknown as typeof import("node:child_process").spawn,
+      verbose: false,
+      aspect: "16:9",
+    });
+    delegate.updateRecordingConfiguration({
+      prebufferLength: 4000,
+      eventTriggerTypes: [1],
+      mediaContainerConfiguration: { type: 0, fragmentLength: 4000 },
+      videoCodec: {
+        type: 0,
+        parameters: { profile: 2, level: 2, bitRate: 2000, iFrameInterval: 4000 },
+        resolution: [1280, 720, 30],
+      },
+      audioCodec: { type: 0, bitrate: 64, samplerate: 3, audioChannels: 1 },
+    } as never);
+    const maps = delegate as unknown as {
+      fragmentMono: Map<number, unknown>;
+      spanRecId: Map<number, string>;
+    };
+    const generator = delegate.handleRecordingStreamRequest(8);
+    const pending = generator.next();
+    expect(maps.fragmentMono.size).toBe(1);
+    expect(maps.spanRecId.size).toBe(1);
+    delegate.closeRecordingStream(8, undefined);
+    expect(maps.fragmentMono.size).toBe(0);
+    expect(maps.spanRecId.size).toBe(0);
+    stdout.end();
+    await pending;
+    expect(maps.fragmentMono.size).toBe(0);
+    expect(maps.spanRecId.size).toBe(0);
   });
 
   it("prepareStream, START, the ack timer, HKSV, and setMotion survive a throwing or missing monotonic clock", async () => {
@@ -671,6 +759,117 @@ describe("span telemetry", () => {
       process.off("uncaughtException", onUncaught);
       vi.useRealTimers();
     }
+  });
+
+  it("labels motion_source via md when the direct branch reads GetMdState", async () => {
+    const calls: Array<{ cmd: string; host: string }> = [];
+    const fetchFn = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      const cmd = url.includes("cmd=") ? (url.split("cmd=")[1]?.split("&")[0] ?? "") : "";
+      const host = url.match(/^https?:\/\/([^/]+)/)?.[1] ?? "";
+      calls.push({ cmd, host });
+      if (cmd === "Login") {
+        return jsonResponse([{ cmd: "Login", code: 0, value: { Token: { name: "tok", leaseTime: 3600 } } }]);
+      }
+      if (cmd === "GetMdState") {
+        return jsonResponse([{ cmd: "GetMdState", code: 0, value: { state: 1 } }]);
+      }
+      if (cmd === "GetAiState") {
+        return jsonResponse([{
+          cmd: "GetAiState",
+          code: 0,
+          value: { people: { alarm_state: 1, support: 1 }, vehicle: { alarm_state: 0 }, dog_cat: { alarm_state: 0 } },
+        }]);
+      }
+      return jsonResponse([{ cmd, code: 1, error: { detail: "unknown" } }]);
+    }) as typeof fetch;
+    const written: string[] = [];
+    const spy = vi.spyOn(process.stderr, "write").mockImplementation((chunk) => {
+      written.push(String(chunk));
+      return true;
+    });
+    try {
+      const config = configFor([camera("Front L", 2, "direct.invalid")]);
+      const monitor = new MotionMonitor(config.cameras, () => {}, { fetch: fetchFn });
+      await monitor.pollOnce();
+    } finally {
+      spy.mockRestore();
+    }
+    const source = written.join("").split("\n").find((line) => line.includes('"event":"motion_source"'));
+    expect(source).toBeDefined();
+    const parsed = JSON.parse(source!.slice("ARGUS_TELEMETRY: ".length)) as {
+      camera: string;
+      metadata?: { via?: string };
+    };
+    expect(parsed.camera).toBe("Front L");
+    expect(parsed.metadata?.via).toBe("md");
+    expect(calls.filter((call) => call.cmd === "GetMdState").map((call) => call.host)).toEqual([SENTINEL_HOST]);
+    expect(calls.some((call) => call.cmd === "GetAiState")).toBe(false);
+  });
+
+  it("does not emit live_start_ack when START already failed", async () => {
+    vi.useFakeTimers({
+      now: Date.parse("2026-10-18T00:00:00.000Z"),
+      toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date", "performance"],
+    });
+    (globalThis as { __argusFakePort?: number }).__argusFakePort = 42000;
+    const written: string[] = [];
+    const spy = vi.spyOn(process.stderr, "write").mockImplementation((chunk) => {
+      written.push(String(chunk));
+      return true;
+    });
+    const { accessory, proc } = liveHarness();
+    try {
+      await prepareSession(accessory, "sess-early");
+      let callbackError: Error | undefined;
+      accessory.delegate.handleStreamRequest(
+        {
+          type: "start",
+          sessionID: "sess-early",
+          video: { pt: 99, max_bit_rate: 299, fps: 30, width: 640, height: 480, mtu: 1378, profile: 0, level: 2 },
+          audio: { pt: 110, sample_rate: 24, max_bit_rate: 24, codec: 3 },
+        } as never,
+        (error) => {
+          callbackError = error;
+        },
+      );
+      proc.emit("error", new Error("ffmpeg failed early"));
+      vi.advanceTimersByTime(100);
+      expect(callbackError?.message).toBe("ffmpeg failed early");
+      expect(written.join("")).not.toContain("live_start_ack");
+      accessory.delegate.handleStreamRequest({ type: "stop", sessionID: "sess-early" } as never, () => {});
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("answers START in the ack timer before setImmediate", async () => {
+    vi.useFakeTimers({
+      now: Date.parse("2026-10-18T00:00:00.000Z"),
+      toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date", "performance"],
+    });
+    (globalThis as { __argusFakePort?: number }).__argusFakePort = 43000;
+    const { accessory } = liveHarness();
+    await prepareSession(accessory, "sess-ack");
+    let ackedAt: number | null = null;
+    accessory.delegate.handleStreamRequest(
+      {
+        type: "start",
+        sessionID: "sess-ack",
+        video: { pt: 99, max_bit_rate: 299, fps: 30, width: 640, height: 480, mtu: 1378, profile: 0, level: 2 },
+        audio: { pt: 110, sample_rate: 24, max_bit_rate: 24, codec: 3 },
+      } as never,
+      (error) => {
+        if (error) throw error;
+        ackedAt = Date.now();
+      },
+    );
+    const startRequestedAt = Date.now();
+    vi.advanceTimersByTime(99);
+    expect(ackedAt).toBeNull();
+    vi.advanceTimersByTime(1);
+    expect(ackedAt).toBe(startRequestedAt + 100);
+    accessory.delegate.handleStreamRequest({ type: "stop", sessionID: "sess-ack" } as never, () => {});
   });
 
   it("prints a build-first error when dist/span-report.js is missing", () => {

@@ -23,7 +23,7 @@ function mp4Box(type: string, payload: Buffer): Buffer {
 }
 
 describe("fragment span", () => {
-  it("does not await the fragment span", async () => {
+  it("yields the media fragment without awaiting the span or a timer turn", async () => {
     const stdout = new PassThrough();
     const proc = Object.assign(new EventEmitter(), { stdout, stderr: new PassThrough(), kill: vi.fn() });
     const delegate = new ArgusRecordingDelegate("Cam", "rtsp://127.0.0.1/main", {
@@ -48,11 +48,14 @@ describe("fragment span", () => {
     await generator.next();
     stdout.write(mp4Box("moof", Buffer.from("moof")));
     stdout.write(mp4Box("mdat", Buffer.from("media")));
-    const raced = await Promise.race([
-      generator.next().then((packet) => ({ kind: "packet" as const, packet })),
-      new Promise<{ kind: "blocked" }>((resolve) => setTimeout(() => resolve({ kind: "blocked" }), 50)),
-    ]);
-    expect(raced.kind).toBe("packet");
+    let settled = false;
+    const pending = generator.next().then((packet) => {
+      settled = true;
+      return packet;
+    });
+    for (let step = 0; step < 40; step += 1) await Promise.resolve();
+    expect(settled).toBe(true);
+    await pending;
     await generator.return(undefined);
   });
 });
