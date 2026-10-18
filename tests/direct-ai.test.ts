@@ -1242,14 +1242,15 @@ describe("direct AI poll", () => {
           const bare = host.slice(host.lastIndexOf("@") + 1);
           const encoded = encodeURIComponent(password);
           const userinfo = `http://admin:${encoded}@${bare}/x admin:${password}@${bare}`;
-          const userinfoWant = maskPassword(userinfo, password);
+          const userinfoWant = password === "admin"
+            ? `http://***:***@${bare}/x ***:***@${bare}`
+            : `http://admin:***@${bare}/x admin:***@${bare}`;
           check(`userinfo ${password} ${host}`, redactKnownSecrets(userinfo, [password]), userinfoWant);
           check(`format userinfo ${password} ${host}`, formatError(userinfo, [password]), userinfoWant);
           for (const kind of kinds) {
             const template = templateFor[kind]!(host);
             const mainLine = await mainRedact(template);
-            const want = maskPassword(mainLine, password);
-            if (password.length < 4) check(`short oracle ${password} ${kind} ${host}`, want, mainLine);
+            const want = password === "Login" ? mainLine.replaceAll("Login", "***") : mainLine;
             check(`fail ${password} ${kind} ${host}`, await failMessage(host, kind, password, 5), want);
             check(`format ${password} ${kind} ${host}`, formatError(template, [password]), want);
           }
@@ -1351,6 +1352,125 @@ describe("direct AI poll", () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  it("masks a 4-character password in free text and leaves a 3-character password raw", () => {
+    expect(redactKnownSecrets("bad password abcd here", ["abcd"])).toBe("bad password *** here");
+    expect(redactKnownSecrets("bad password abc here", ["abc"])).toBe("bad password abc here");
+  });
+
+  it("leaves superadmin intact when the password is admin", () => {
+    expect(redactKnownSecrets("superadmin", ["admin"])).toBe("superadmin");
+  });
+
+  it("masks abcd!x fully when the shorter password is configured first", () => {
+    expect(redactKnownSecrets("abcd!x", ["abcd", "abcd!x"])).toBe("***");
+  });
+
+  it("warns once from serve when a configured password is too short to redact in free text", () => {
+    const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+    const dir = mkdtempSync(join(tmpdir(), "argus-serve-short-pw-"));
+    const pidFile = join(dir, "go2rtc.pid");
+    const port = 20000 + Math.floor(Math.random() * 20000);
+    const binary = join(dir, "go2rtc.mjs");
+    writeFileSync(
+      binary,
+      [
+        "#!/usr/bin/env node",
+        "import { createServer } from 'node:http';",
+        "import { readFileSync, writeFileSync } from 'node:fs';",
+        "const configIndex = process.argv.indexOf('-config');",
+        "const config = readFileSync(process.argv[configIndex + 1], 'utf8');",
+        "const port = Number(config.match(/listen: 127\\.0\\.0\\.1:(\\d+)/)[1]);",
+        "writeFileSync(process.env.ARGUS_TEST_GO2RTC_PID, String(process.pid));",
+        "createServer((_req, res) => {",
+        "  res.writeHead(200, { 'content-type': 'application/json' });",
+        "  res.end('{}');",
+        "}).listen(port, '127.0.0.1');",
+        "",
+      ].join("\n"),
+    );
+    chmodSync(binary, 0o755);
+    const configPath = join(dir, "argus.yaml");
+    writeFileSync(
+      configPath,
+      [
+        "cameras:",
+        "  - name: Camera 1",
+        "    aspect: \"16:9\"",
+        "    host: 192.0.2.10",
+        "    channel: 0",
+        "    mainCodec: h265",
+        "    username: admin",
+        "    password: \"abc\"",
+        "    transport: auto",
+        "    streams:",
+        "      main: main",
+        "      sub: sub",
+        "  - name: Camera 2",
+        "    aspect: \"16:9\"",
+        "    host: 192.0.2.11",
+        "    channel: 0",
+        "    mainCodec: h265",
+        "    username: admin",
+        "    password: \"80\"",
+        "    transport: auto",
+        "    streams:",
+        "      main: main",
+        "      sub: sub",
+        "recording:",
+        "  path: ./rec",
+        "  retention:",
+        "    continuous: 3",
+        "    motion: 7",
+        "    alerts: 30",
+        "homekit:",
+        "  pin: \"123-45-678\"",
+        "go2rtc:",
+        `  binary: ${binary}`,
+        `  api_port: ${port}`,
+        "server:",
+        "  port: 8080",
+        "",
+      ].join("\n"),
+    );
+    const runner = join(dir, "boot.ts");
+    const serveModule = join(root, "src", "serve.ts");
+    writeFileSync(runner, `import { serveConfig } from ${JSON.stringify(serveModule)};
+async function main() {
+  await serveConfig(process.argv[2], {
+    afterGo2Rtc() {
+      throw new Error("stop after warning");
+    },
+  });
+}
+void main();
+`);
+    try {
+      const result = spawnSync(process.execPath, ["--import", "tsx", runner, configPath], {
+        cwd: root,
+        encoding: "utf8",
+        timeout: 15_000,
+        env: {
+          ...process.env,
+          ARGUS_TEST_GO2RTC_PID: pidFile,
+        },
+      });
+      expect(result.stderr).toBe(
+        "[argus] a configured password is too short to redact in free text\nstop after warning\n",
+      );
+    } finally {
+      const pidText = existsSync(pidFile) ? readFileSync(pidFile, "utf8").trim() : "";
+      const pid = Number(pidText);
+      if (Number.isInteger(pid) && pid > 0) {
+        try {
+          process.kill(pid, "SIGKILL");
+        } catch {
+          // The child already exited.
+        }
+      }
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 20_000);
 
   it("redacts a free-text password with a space and / ? # or colon-space, and keeps an email", () => {
     const passwords = [
@@ -1768,40 +1888,6 @@ function failTemplate(): Record<string, (host: string) => string> {
     empty: (host) => `Login on ${host}: empty response`,
     "no-token": (host) => `Login on ${host}: no token in response`,
   };
-}
-
-function maskWhere(text: string, needle: string, accept: (value: string, index: number) => boolean): string {
-  if (needle.length === 0) return text;
-  let out = "";
-  let cursor = 0;
-  let from = 0;
-  while (from <= text.length - needle.length) {
-    const found = text.indexOf(needle, from);
-    if (found < 0) break;
-    if (accept(text, found)) {
-      out += text.slice(cursor, found) + "***";
-      cursor = found + needle.length;
-      from = cursor;
-    } else {
-      from = found + 1;
-    }
-  }
-  return out + text.slice(cursor);
-}
-
-function isWordChar(char: string | undefined): boolean {
-  return char !== undefined && /[A-Za-z0-9]/.test(char);
-}
-
-function maskPassword(text: string, password: string): string {
-  const encoded = encodeURIComponent(password);
-  const needles = [...new Set([password, encoded])].sort((left, right) => right.length - left.length);
-  const accept = password.length >= 4
-    ? (value: string, index: number, needle: string): boolean => !isWordChar(value[index - 1]) && !isWordChar(value[index + needle.length])
-    : (value: string, index: number, needle: string): boolean => value[index - 1] === ":" && value[index + needle.length] === "@";
-  let out = text;
-  for (const needle of needles) out = maskWhere(out, needle, (value, index) => accept(value, index, needle));
-  return out;
 }
 
 function writeArgusYaml(file: string, password: string): void {
