@@ -9,15 +9,24 @@ const LOGIN_BACKOFF_MAX_MS = 60_000;
 const AI_PROBE_BACKOFF_START_MS = 30_000;
 const AI_PROBE_BACKOFF_MAX_MS = 300_000;
 
+/** An `@` followed by a host and then a delimiter, so `pa@ss@host` splits at the last `@`. */
+const AT_HOST = String.raw`@(?=\[|[A-Za-z0-9.-]+(?:[\s/:?#)\]}>,;'"]|$))`;
+/** Userinfo before AT_HOST: a run without spaces, or else the shortest span that stops at `/`, `?`, `#`, or `: `. */
+const USERINFO = String.raw`(?:\S*|(?:(?!:\s)[^\n/?#])*?)`;
+const SCHEME_USERINFO = new RegExp(String.raw`([a-z][a-z0-9+.-]*:\/\/)${USERINFO}${AT_HOST}`, "gi");
+const BARE_USERINFO = new RegExp(
+  String.raw`(^|[\s"'<>()[\]{}=,;])[^\s/:@"'<>()[\]{}=,;]+:(?!\/\/)(?=\S)${USERINFO}${AT_HOST}`,
+  "g",
+);
+
 /**
  * Drop URL userinfo so a host string cannot carry a password into a log line.
- * `user:password@host` and `scheme://userinfo@host` are stripped.
+ * `user:password@host` and `scheme://userinfo@host` are stripped through the last `@`
+ * before the host, so the password may contain `@`, `/`, or a space.
  * A bare `user@host` (an email, or `x@y`) is left alone.
  */
 export function redactCredentialHosts(text: string): string {
-  return text
-    .replace(/([a-z][a-z0-9+.-]*:\/\/)[^\s/@]+(?::[^\s/@]*)?@/gi, "$1")
-    .replace(/(^|[^A-Za-z0-9])([^\s/:@]+):([^\s/@]*)@/g, "$1");
+  return text.replace(SCHEME_USERINFO, "$1").replace(BARE_USERINFO, "$1");
 }
 
 export interface ReolinkClientOptions {
@@ -85,8 +94,11 @@ export class ReolinkClient {
     this.now = options.now ?? (() => Date.now());
   }
 
+  /** Messages name the configured host, so strip its userinfo here, even a bare `user@` that text redaction keeps. */
   private fail(message: string): never {
-    throw new ReolinkError(redactCredentialHosts(message));
+    const host = this.options.host;
+    const bareHost = host.slice(host.lastIndexOf("@") + 1);
+    throw new ReolinkError(redactCredentialHosts(message.replaceAll(host, bareHost)));
   }
 
   private async call(cmd: string, param: Record<string, unknown>, token?: string): Promise<ReolinkResponse> {
