@@ -131,6 +131,20 @@ async function captureStderr(run: () => Promise<unknown>): Promise<string> {
   return written.join("");
 }
 
+function captureStderrSync(run: () => void): string {
+  const written: string[] = [];
+  const spy = vi.spyOn(process.stderr, "write").mockImplementation((chunk) => {
+    written.push(String(chunk));
+    return true;
+  });
+  try {
+    run();
+  } finally {
+    spy.mockRestore();
+  }
+  return written.join("");
+}
+
 function credentialUrlError(input: string | URL | Request): TypeError {
   return new TypeError(`Request cannot be constructed from a URL that includes credentials: ${String(input)}`);
 }
@@ -731,6 +745,52 @@ describe("direct AI poll", () => {
     });
   });
 
+  it("backs off direct-host re-login when GetAiState returns rspCode -6 after a fresh Login", async () => {
+    await withNoSockets(async () => {
+      let clock = 0;
+      const directLoginsAt: number[] = [];
+      const aiAt: number[] = [];
+      let nvrLogins = 0;
+      let mdPolls = 0;
+      const fetchFn = vi.fn(async (input: string | URL | Request) => {
+        const url = String(input);
+        if (url.includes(DIRECT_HOST) && url.includes("cmd=Login")) {
+          directLoginsAt.push(clock);
+          return jsonResponse([{ cmd: "Login", code: 0, value: { Token: { name: `direct-${directLoginsAt.length}`, leaseTime: 3600 } } }]);
+        }
+        if (url.includes("cmd=Login")) {
+          nvrLogins += 1;
+          return jsonResponse([{ cmd: "Login", code: 0, value: { Token: { name: "nvr", leaseTime: 3600 } } }]);
+        }
+        if (url.includes("cmd=GetMdState")) {
+          mdPolls += 1;
+          return jsonResponse([{ cmd: "GetMdState", code: 0, value: { state: 0 } }]);
+        }
+        if (url.includes(DIRECT_HOST) && url.includes("cmd=GetAiState")) {
+          aiAt.push(clock);
+          return jsonResponse([{ cmd: "GetAiState", code: 1, error: { detail: "please login first", rspCode: -6 } }]);
+        }
+        throw new Error(`unexpected ${url}`);
+      }) as unknown as typeof fetch;
+      const monitor = new MotionMonitor(configWith(DIRECT_HOST).cameras, () => {}, {
+        fetch: fetchFn,
+        now: () => clock,
+        onError: () => {},
+      });
+      for (let t = 0; t < 600_000; t += 1_000) {
+        clock = t;
+        await monitor.pollOnce();
+      }
+      expect(directLoginsAt).toEqual([
+        0, 0, 5_000, 15_000, 35_000, 75_000, 135_000, 195_000, 255_000, 315_000, 375_000, 435_000, 495_000, 555_000,
+      ]);
+      expect(aiAt).toEqual(directLoginsAt);
+      expect(directLoginsAt.length).toBeLessThanOrEqual(15);
+      expect(nvrLogins).toBe(1);
+      expect(mdPolls).toBe(600);
+    });
+  });
+
   it("retries NVR Login on the next poll and detects motion within 2s of a 120s outage", async () => {
     await withNoSockets(async () => {
       const recoveredAt = 120_000;
@@ -1008,6 +1068,34 @@ describe("direct AI poll", () => {
     }
   });
 
+  it("redacts a free-text password with a space and / ? # or colon-space, and keeps an email", () => {
+    const passwords = [
+      `${PASSWORD_LEFT} /${PASSWORD_RIGHT}`,
+      `${PASSWORD_LEFT} ?${PASSWORD_RIGHT}`,
+      `${PASSWORD_LEFT} #${PASSWORD_RIGHT}`,
+      `${PASSWORD_LEFT}: ${PASSWORD_RIGHT}`,
+      `my ${PASSWORD_LEFT}/${PASSWORD_RIGHT}`,
+      `my ${PASSWORD_LEFT}?${PASSWORD_RIGHT}`,
+      `my ${PASSWORD_LEFT}#${PASSWORD_RIGHT}`,
+      `my ${PASSWORD_LEFT}: ${PASSWORD_RIGHT}`,
+    ];
+    for (const password of passwords) {
+      const texts = [
+        `admin:${password}@direct.invalid ${REDACTION_EMAIL}`,
+        `http://admin:${password}@direct.invalid/cgi-bin/api.cgi ${REDACTION_EMAIL}`,
+        `admin:${password} ${REDACTION_EMAIL}`,
+      ];
+      for (const text of texts) {
+        const stderr = captureStderrSync(() => writeMotionPollError("Front L", new Error(text)));
+        for (const output of [stderr, formatError(new Error(text)), formatError(text)]) {
+          expect(output, text).not.toContain(PASSWORD_LEFT);
+          expect(output, text).not.toContain(PASSWORD_RIGHT);
+          expect(output, text).toContain(REDACTION_EMAIL);
+        }
+      }
+    }
+  });
+
   it("prints a bare SENTINEL@host from cameras[].host zero times on stderr", async () => {
     const sentinel = "SENTINEL";
     const host = `${sentinel}@${NVR_HOST}`;
@@ -1044,6 +1132,18 @@ describe("direct AI poll", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  }, 30_000);
+
+  it("imports src/cli.ts with no output and exit 0", () => {
+    const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+    const result = spawnSync(
+      process.execPath,
+      ["--import", "tsx", "--input-type=module", "-e", "await import('./src/cli.ts')"],
+      { cwd: root, encoding: "utf8" },
+    );
+    expect(result.stdout).toBe("");
+    expect(result.stderr).toBe("");
+    expect(result.status).toBe(0);
   }, 30_000);
 
   it("documents cameras[].directAiHost as <host> and says IPv6 is unsupported", () => {

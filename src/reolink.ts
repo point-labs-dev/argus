@@ -18,15 +18,83 @@ const BARE_USERINFO = new RegExp(
   String.raw`(^|[\s"'<>()[\]{}=,;])[^\s/:@"'<>()[\]{}=,;]+:(?!\/\/)(?=\S)${USERINFO}${AT_HOST}`,
   "g",
 );
+const MARKED_INTRO = new RegExp(
+  String.raw`([a-z][a-z0-9+.-]*:\/\/)([^\s/:@]+):(?!\/\/)|(^|[\s"'<>()[\]{}=,;])([^\s/:@"'<>()[\]{}=,;]+):(?!\/\/)(?=\S)`,
+  "gi",
+);
 
 /**
  * Drop URL userinfo so a host string cannot carry a password into a log line.
  * `user:password@host` and `scheme://userinfo@host` are stripped through the last `@`
  * before the host, so the password may contain `@`, `/`, or a space.
+ * A password that contains a space and `/`, `?`, `#`, or `: ` is removed too, with or without `@`.
  * A bare `user@host` (an email, or `x@y`) is left alone.
  */
 export function redactCredentialHosts(text: string): string {
-  return text.replace(SCHEME_USERINFO, "$1").replace(BARE_USERINFO, "$1");
+  return redactMarkedPasswords(text.replace(SCHEME_USERINFO, "$1").replace(BARE_USERINFO, "$1"));
+}
+
+function findLastAtHost(value: string): number {
+  const matcher = new RegExp(AT_HOST, "g");
+  let last = -1;
+  for (const match of value.matchAll(matcher)) {
+    last = match.index ?? last;
+  }
+  return last;
+}
+
+function takeMarkedPassword(rest: string): string | null {
+  let end = 0;
+  let sawSpace = false;
+  let marked = false;
+  while (end < rest.length) {
+    const char = rest[end];
+    if (char === " ") {
+      sawSpace = true;
+      end += 1;
+      continue;
+    }
+    if (char !== undefined && /\s/.test(char)) {
+      break;
+    }
+    while (end < rest.length && rest[end] !== " " && !/\s/.test(rest[end] ?? "")) {
+      end += 1;
+    }
+    const slice = rest.slice(0, end);
+    const token = slice.slice(slice.lastIndexOf(" ") + 1);
+    if (sawSpace && (token.includes("/") || token.includes("?") || token.includes("#"))) {
+      marked = true;
+    }
+    if (slice.includes(": ")) {
+      marked = true;
+    }
+    if (marked) {
+      return slice;
+    }
+  }
+  return null;
+}
+
+function redactMarkedPasswords(text: string): string {
+  const matcher = new RegExp(MARKED_INTRO.source, MARKED_INTRO.flags);
+  let out = "";
+  let cursor = 0;
+  for (const match of text.matchAll(matcher)) {
+    const start = match.index ?? 0;
+    if (start < cursor) {
+      continue;
+    }
+    const keep = match[1] ?? match[3] ?? "";
+    const passwordStart = start + match[0].length;
+    const marked = takeMarkedPassword(text.slice(passwordStart));
+    if (marked === null) {
+      continue;
+    }
+    const at = findLastAtHost(marked);
+    out += text.slice(cursor, start) + keep;
+    cursor = passwordStart + (at >= 0 ? at + 1 : marked.length);
+  }
+  return out + text.slice(cursor);
 }
 
 export interface ReolinkClientOptions {
@@ -80,6 +148,12 @@ export class ReolinkClient {
   private loginBackoffMs = 0;
   /** Earliest `now()` at which Login may run again. 0 means it is not backing off. */
   private nextLoginAt = 0;
+  /** True after GetAiState rejects a token that Login just issued. */
+  private freshTokenRejected = false;
+  /** Delay before another direct-host Login after that rejection. 0 means the next one is immediate. */
+  private freshAiRejectBackoffMs = 0;
+  /** Earliest `now()` at which that direct-host Login may run again. */
+  private nextFreshAiAttemptAt = 0;
   /** undefined = not probed; false = GetAiState unsupported here (e.g. via the NVR). */
   private aiSupported: boolean | undefined;
   /** Delay before `getMotionState` asks GetAiState again. 0 means it asks on the next call. */
@@ -179,6 +253,14 @@ export class ReolinkClient {
     this.nextLoginAt = this.now() + delay;
   }
 
+  private scheduleFreshAiRejectBackoff(): void {
+    const delay = this.freshAiRejectBackoffMs === 0
+      ? LOGIN_BACKOFF_START_MS
+      : Math.min(this.freshAiRejectBackoffMs * 2, LOGIN_BACKOFF_MAX_MS);
+    this.freshAiRejectBackoffMs = delay;
+    this.nextFreshAiAttemptAt = this.now() + delay;
+  }
+
   private scheduleAiProbeBackoff(): void {
     const delay = this.aiProbeBackoffMs === 0
       ? AI_PROBE_BACKOFF_START_MS
@@ -209,6 +291,8 @@ export class ReolinkClient {
   /**
    * AI person/vehicle/animal alarm (GetAiState).
    * rspCode -6 (expired token): log in again and retry this request once.
+   * With `loginBackoff`, rspCode -6 on the token Login just issued backs off that re-login
+   * from 5s, doubling to 60s, and skips GetAiState until the wait ends.
    * rspCode -99: this host does not support GetAiState; later calls skip the request.
    * Any other failure is thrown so the poll can surface it.
    */
@@ -216,12 +300,25 @@ export class ReolinkClient {
     if (this.aiSupported === false) {
       return false;
     }
+    if (this.options.loginBackoff === true && this.nextFreshAiAttemptAt !== 0 && this.now() < this.nextFreshAiAttemptAt) {
+      this.fail(`GetAiState ch${channel} on ${this.options.host} failed: backing off`);
+    }
+    const tokenWasCached = this.token !== undefined && this.now() < this.tokenExpiresAt;
     let token = await this.ensureToken();
     let ai = await this.call("GetAiState", { channel }, token);
     if (ai.code !== 0 && ai.error?.rspCode === -6) {
       this.token = undefined;
-      token = await this.ensureToken();
-      ai = await this.call("GetAiState", { channel }, token);
+      const blockRelogin = this.options.loginBackoff === true && this.freshTokenRejected && !tokenWasCached;
+      if (!blockRelogin) {
+        token = await this.ensureToken();
+        ai = await this.call("GetAiState", { channel }, token);
+      }
+      if (ai.code !== 0 && ai.error?.rspCode === -6 && this.options.loginBackoff === true) {
+        this.token = undefined;
+        this.freshTokenRejected = true;
+        this.scheduleFreshAiRejectBackoff();
+        this.fail(`GetAiState ch${channel} on ${this.options.host} failed: ${ai.error.detail ?? `code ${ai.code}`}`);
+      }
     }
     if (ai.code !== 0 && ai.error?.rspCode === -99) {
       this.aiSupported = false;
@@ -230,6 +327,9 @@ export class ReolinkClient {
     if (ai.code !== 0 || !ai.value) {
       this.fail(`GetAiState ch${channel} on ${this.options.host} failed: ${ai.error?.detail ?? `code ${ai.code}`}`);
     }
+    this.freshTokenRejected = false;
+    this.freshAiRejectBackoffMs = 0;
+    this.nextFreshAiAttemptAt = 0;
     this.aiSupported = true;
     return aiAlarmed(ai.value);
   }
