@@ -1021,13 +1021,15 @@ describe("direct AI poll", () => {
           onError: writeMotionPollError,
         });
         await monitor.pollOnce();
-        const client = new ReolinkClient({ host, username: DIRECT_USER, password: DIRECT_PASSWORD, fetch: fetchFn });
-        await client.getHddInfo().catch((error: unknown) => process.stderr.write(`${formatError(error)}\n`));
+        const footageClient = new ReolinkClient({ host, username: DIRECT_USER, password: DIRECT_PASSWORD, fetch: fetchFn });
+        await footageClient.getHddInfo().catch((error: unknown) => {
+          process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
+        });
       }),
     );
+    expect(stderr).not.toContain(sentinel);
     expect(stderr).toContain("motion poll error");
-    expect(stderr).toContain(`GetHddInfo on ${NVR_HOST}`);
-    expect(stderr.split(sentinel)).toHaveLength(1);
+    expect(stderr.match(/Login on nvr\.invalid fetch failed/g) ?? []).toHaveLength(2);
   });
 
   it("runs the CLI through a symlinked entry", () => {
