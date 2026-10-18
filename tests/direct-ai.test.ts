@@ -1,3 +1,7 @@
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
 import { describe, expect, it, vi } from "vitest";
 
 import { formatError } from "../src/cli.js";
@@ -598,7 +602,6 @@ describe("direct AI poll", () => {
       }
       expect(clearedAt).toBe(30_000);
       expect(events).toEqual([["Main", true], ["Main", false]]);
-      // The old default path logged every poll: 600 lines in 10 minutes, and stayed DETECTED.
       expect(errors).toHaveLength(13);
     });
   });
@@ -711,6 +714,29 @@ describe("direct AI poll", () => {
   it("redacts URL userinfo in formatError and keeps an email", () => {
     expectUserinfoRedacted(formatError(new Error(credentialSample())));
     expectUserinfoRedacted(formatError(credentialSample()));
+  });
+
+  it("documents cameras[].directAiHost as <host> and says IPv6 is unsupported", () => {
+    const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+    const readme = readFileSync(join(root, "README.md"), "utf8");
+    const example = readFileSync(join(root, "argus.example.yaml"), "utf8");
+    const readmeSection = readme.split("### Direct AI poll\n\n")[1]?.split("\n\n### ")[0] ?? "";
+    const blockStart = example.indexOf("    # Optional. Poll GetAiState");
+    const blockEnd = example.indexOf("\nrecording:", blockStart);
+    const exampleBlock = blockStart === -1 || blockEnd === -1 ? "" : example.slice(blockStart, blockEnd);
+    expect(readmeSection).toBe(
+      "NVR channels answer `GetAiState` with rspCode -99, so those cameras stay on basic motion unless `cameras[].directAiHost` is set. When it is set, Argus polls `GetAiState` on that host at channel 0 and uses the camera entry's username and password. Video URLs and `GetMdState` stay on `host`. The value is a host with an optional port (`<host>` or `<host>:80`) and rejects a scheme, a path, userinfo, and whitespace. IPv6 is unsupported. Leave it unset to keep a single client. See the commented example on the NVR camera in `argus.example.yaml`.",
+    );
+    expect(exampleBlock).toBe(
+      [
+        "    # Optional. Poll GetAiState on this camera's own host at channel 0.",
+        "    # Video and GetMdState stay on host. A host with an optional port only",
+        "    # (<host> or <host>:80): no scheme, path, userinfo, or whitespace.",
+        "    # IPv6 is unsupported.",
+        "    # Leave unset to keep GetAiState on host. Example: directAiHost: <host>",
+        "",
+      ].join("\n"),
+    );
   });
 });
 
