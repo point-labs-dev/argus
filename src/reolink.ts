@@ -23,22 +23,34 @@ const MARKED_INTRO = new RegExp(
   "gi",
 );
 
-const HOST_PORT = /^\d{1,5}(?=$|\s)/;
+const HOST_PORT = /^\d{1,5}(?=$|[\s:/])/;
 const HOSTNAME = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$/;
 const IPV4 = /^(?:\d{1,3}\.){3}\d{1,3}$/;
 
 /**
- * Drop URL userinfo so a host string cannot carry a password into a log line.
- * `user:password@host` and `scheme://userinfo@host` are stripped through the last `@`
- * before the host, so the password may contain `@`, `/`, or a space.
- * A password with a space or tab and `/`, `?`, `#`, or `: ` is removed too, with or without `@`.
- * A `/`, `?`, or `#` before that gap counts, and so does one token after the marked token.
- * An `@` after a space or tab is the host, so `p@ss word@host` keeps the host.
- * A host:port (IPv4, a hostname, or [IPv6]:port) is not a password.
- * A bare `user@host` (an email, or `x@y`) is left alone.
- * `label-port`: `admin:80 /secret` stays, so `localhost:80 failed:` stays.
- * `clock-email`: `at 12:30 mail owner@example.com` becomes `at example.com`.
- * `second-tail`: a second word after the marked token stays.
+ * Replace each known password, and its URL-encoded form, with `***`.
+ * Longer secrets go first so a short one cannot split a longer one.
+ */
+export function redactKnownSecrets(text: string, secrets: readonly string[]): string {
+  const needles = new Set<string>();
+  for (const secret of secrets) {
+    if (secret.length === 0) continue;
+    needles.add(secret);
+    needles.add(encodeURIComponent(secret));
+  }
+  const ordered = [...needles].sort((left, right) => right.length - left.length);
+  let out = text;
+  for (const needle of ordered) out = out.replaceAll(needle, "***");
+  return out;
+}
+
+/**
+ * Redact a YAML parse error before the config is loaded, so the password is not a known value yet.
+ * A host and port is left as written, including a port before `:`, `/`, whitespace, or the end of the text.
+ * Bracketed IPv6 is left as written, including a zone id and a `]:` that follows the address.
+ * A `/`, `?`, or `#` still marks a password in this frame. One token after that mark is removed.
+ * `admin:80 /secret` stays. `at 12:30 mail owner@example.com` becomes `at example.com`.
+ * A second word after the marked token stays. `admin:p/a ssPW@host` still leaves ` ssPW@host`.
  */
 export function redactCredentialHosts(text: string): string {
   const marked = redactMarkedPasswords(text);
@@ -57,8 +69,11 @@ function colonInsideIpv6(text: string, colonIndex: number): boolean {
   if (open < 0 || text.lastIndexOf("]", colonIndex) > open) return false;
   const close = text.indexOf("]", colonIndex);
   if (close < 0) return false;
-  if (!/^[0-9A-Fa-f:.]+$/.test(text.slice(open + 1, close))) return false;
-  return HOST_PORT.test(text.slice(close + 2)) || text[close + 1] === undefined || /\s/.test(text[close + 1] ?? "");
+  const body = text.slice(open + 1, close);
+  if (!/^[0-9A-Fa-f:.]+(?:%[0-9A-Za-z._~-]+)?$/.test(body)) return false;
+  const after = text[close + 1];
+  if (after === undefined || after === ":" || /\s/.test(after)) return true;
+  return HOST_PORT.test(text.slice(close + 2));
 }
 
 function findLastAtHost(value: string): number {
@@ -225,11 +240,12 @@ export class ReolinkClient {
     this.now = options.now ?? (() => Date.now());
   }
 
-  /** Messages name the configured host, so strip its userinfo here, even a bare `user@` that text redaction keeps. */
+  /** The configured host and password are known here, so replace those values instead of matching shapes. */
   private fail(message: string): never {
     const host = this.options.host;
     const bareHost = host.slice(host.lastIndexOf("@") + 1);
-    throw new ReolinkError(redactCredentialHosts(message.replaceAll(host, bareHost)));
+    const stripped = message.replaceAll(host, bareHost);
+    throw new ReolinkError(redactKnownSecrets(stripped, [this.options.password]));
   }
 
   private async call(cmd: string, param: Record<string, unknown>, token?: string): Promise<ReolinkResponse> {

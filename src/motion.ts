@@ -1,5 +1,5 @@
 import type { CameraConfig } from "./config.js";
-import { ReolinkClient, redactCredentialHosts, type ReolinkClientOptions } from "./reolink.js";
+import { ReolinkClient, redactKnownSecrets, type ReolinkClientOptions } from "./reolink.js";
 import { emitSpan, emitTelemetry } from "./telemetry.js";
 import { emitTiming } from "./timing.js";
 
@@ -23,9 +23,9 @@ function nextMotionId(): string {
   return `m${motionSerial}`;
 }
 
-/** stderr line for a motion poll failure. Userinfo in the message is removed. */
-export function writeMotionPollError(cameraName: string, error: Error): void {
-  process.stderr.write(`[argus ${cameraName}] motion poll error: ${redactCredentialHosts(error.message)}\n`);
+/** stderr line for a motion poll failure. Configured passwords in the message are removed. */
+export function writeMotionPollError(cameraName: string, error: Error, secrets: readonly string[] = []): void {
+  process.stderr.write(`[argus ${cameraName}] motion poll error: ${redactKnownSecrets(error.message, secrets)}\n`);
 }
 
 // Polls each camera's Reolink motion state and reports edges (on/off) with a
@@ -145,6 +145,21 @@ export class MotionMonitor {
     }
   }
 
+  private redactedPollError(state: CameraState, error: Error): Error {
+    const hosts = [state.camera.host];
+    const directAiHost = state.camera.directAiHost;
+    if (directAiHost !== undefined) hosts.push(directAiHost);
+    let message = error.message;
+    for (const host of hosts) {
+      message = message.replaceAll(host, host.slice(host.lastIndexOf("@") + 1));
+    }
+    message = redactKnownSecrets(message, [state.camera.password]);
+    if (message === error.message) return error;
+    const redacted = new Error(message);
+    redacted.name = error.name;
+    return redacted;
+  }
+
   private async readActive(state: CameraState): Promise<{ active: boolean; via: "md" | "ai" | "none" }> {
     if (!state.directAi) {
       return state.client.classifyMotion(state.camera.channel);
@@ -161,7 +176,7 @@ export class MotionMonitor {
     if (state.nextErrorLogAt !== 0 && now < state.nextErrorLogAt) {
       return;
     }
-    this.onError?.(state.camera.name, error);
+    this.onError?.(state.camera.name, this.redactedPollError(state, error));
     const delay = state.errorBackoffMs === 0
       ? ERROR_LOG_BACKOFF_START_MS
       : Math.min(state.errorBackoffMs * 2, ERROR_LOG_BACKOFF_MAX_MS);

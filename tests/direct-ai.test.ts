@@ -998,7 +998,7 @@ describe("direct AI poll", () => {
       const client = new ReolinkClient({
         host: NVR_HOST,
         username: DIRECT_USER,
-        password: DIRECT_PASSWORD,
+        password: REDACTION_SECRET,
         fetch: fetchFn,
       });
       let caught: unknown;
@@ -1019,7 +1019,7 @@ describe("direct AI poll", () => {
       return true;
     });
     try {
-      writeMotionPollError("Front L", new Error(credentialSample()));
+      writeMotionPollError("Front L", new Error(credentialSample()), [REDACTION_SECRET]);
     } finally {
       spy.mockRestore();
     }
@@ -1029,8 +1029,8 @@ describe("direct AI poll", () => {
   });
 
   it("redacts URL userinfo in formatError and keeps an email", () => {
-    expectUserinfoRedacted(formatError(new Error(credentialSample())));
-    expectUserinfoRedacted(formatError(credentialSample()));
+    expectUserinfoRedacted(formatError(new Error(credentialSample()), [REDACTION_SECRET]));
+    expectUserinfoRedacted(formatError(credentialSample(), [REDACTION_SECRET]));
   });
 
   it("keeps a cameras[].host password with @, /, or a space off stderr", async () => {
@@ -1059,11 +1059,11 @@ describe("direct AI poll", () => {
     for (const separator of ["@", "/", " "]) {
       const password = `${PASSWORD_LEFT}${separator}${PASSWORD_RIGHT}`;
       const text = `connect failed for http://admin:${password}@direct.invalid/cgi-bin/api.cgi and admin:${password}@direct.invalid`;
-      const stderr = await captureStderr(async () => writeMotionPollError("Front L", new Error(text)));
-      for (const output of [stderr, formatError(new Error(text)), formatError(text)]) {
+      const stderr = await captureStderr(async () => writeMotionPollError("Front L", new Error(text), [password]));
+      for (const output of [stderr, formatError(new Error(text), [password]), formatError(text, [password])]) {
         expect(output, separator).not.toContain(PASSWORD_LEFT);
         expect(output, separator).not.toContain(PASSWORD_RIGHT);
-        expect(output, separator).toContain("http://direct.invalid/cgi-bin/api.cgi and direct.invalid");
+        expect(output, separator).toContain("http://admin:***@direct.invalid/cgi-bin/api.cgi and admin:***@direct.invalid");
       }
     }
   });
@@ -1176,10 +1176,11 @@ describe("direct AI poll", () => {
         `admin:${password} ${REDACTION_EMAIL}`,
       ];
       for (const text of texts) {
-        const stderr = captureStderrSync(() => writeMotionPollError("Front L", new Error(text)));
-        for (const output of [stderr, formatError(new Error(text)), formatError(text)]) {
+        const stderr = captureStderrSync(() => writeMotionPollError("Front L", new Error(text), [password]));
+        for (const output of [stderr, formatError(new Error(text), [password]), formatError(text, [password])]) {
           expect(output, text).not.toContain(PASSWORD_LEFT);
           expect(output, text).not.toContain(PASSWORD_RIGHT);
+          expect(output, text).toContain("***");
           expect(output, text).toContain(REDACTION_EMAIL);
         }
       }
@@ -1333,18 +1334,28 @@ describe("direct AI poll", () => {
       `admin:p@ss\tword@nvr.invalid ${REDACTION_EMAIL}`,
       `admin:p@ss word@nvr.invalid ${REDACTION_EMAIL}`,
     ];
+    const secrets = [
+      `${PASSWORD_LEFT}\t/${PASSWORD_RIGHT}`,
+      `p/a ss${PASSWORD_RIGHT}`,
+      `x a/b ${PASSWORD_RIGHT}`,
+      "p@ss\tword",
+      "p@ss word",
+      PASSWORD_RIGHT,
+      PASSWORD_LEFT,
+    ];
     for (const text of texts) {
-      const stderr = captureStderrSync(() => writeMotionPollError("Front L", new Error(text)));
-      for (const output of [stderr, formatError(new Error(text)), formatError(text)]) {
+      const stderr = captureStderrSync(() => writeMotionPollError("Front L", new Error(text), secrets));
+      for (const output of [stderr, formatError(new Error(text), secrets), formatError(text, secrets)]) {
         expect(output, text).not.toContain(PASSWORD_LEFT);
         expect(output, text).not.toContain(PASSWORD_RIGHT);
         expect(output, text).not.toContain("p/a");
         expect(output, text).not.toContain("p@ss");
+        expect(output, text).toContain("***");
         expect(output, text).toContain(REDACTION_EMAIL);
       }
     }
-    expect(formatError("admin:p@ss word@nvr.invalid")).toBe("nvr.invalid");
-    expect(formatError(`admin:x a/b ${PASSWORD_RIGHT} extra`)).toBe(" extra");
+    expect(formatError("admin:p@ss word@nvr.invalid", ["p@ss word"])).toBe("admin:***@nvr.invalid");
+    expect(formatError(`admin:x a/b ${PASSWORD_RIGHT} extra`, [PASSWORD_RIGHT])).toBe(`admin:x a/b *** extra`);
     const unchanged = [
       "note: see the docs",
       "Meet:\tsee the docs",
@@ -1356,8 +1367,17 @@ describe("direct AI poll", () => {
       "localhost:80 failed: ECONNREFUSED",
     ];
     for (const text of unchanged) expect(formatError(text), text).toBe(text);
-    expect(formatError(`admin:80 /${PASSWORD_RIGHT}`)).toContain(PASSWORD_RIGHT);
-    expect(formatError(`at 12:30 mail ${REDACTION_EMAIL}`)).toBe("at example.com");
+    expect(formatError(`admin:80 /${PASSWORD_RIGHT}`)).toBe(`admin:80 /${PASSWORD_RIGHT}`);
+    expect(formatError(`admin:80 /${PASSWORD_RIGHT}`, [PASSWORD_RIGHT])).toBe("admin:80 /***");
+    expect(formatError(`at 12:30 mail ${REDACTION_EMAIL}`)).toBe(`at 12:30 mail ${REDACTION_EMAIL}`);
+    expect(formatError(`Unable to parse YAML at bad.yaml: at 12:30 mail ${REDACTION_EMAIL}`)).toBe(
+      "Unable to parse YAML at bad.yaml: at example.com",
+    );
+    expect(formatError(`Unable to parse YAML at bad.yaml: admin:x a/b ${PASSWORD_RIGHT} extra`)).toBe(
+      "Unable to parse YAML at bad.yaml:  extra",
+    );
+    expect(formatError(`Unable to parse YAML at bad.yaml: admin:80 /${PASSWORD_RIGHT}`)).toContain(PASSWORD_RIGHT);
+    expect(formatError("Unable to parse YAML at bad.yaml: admin:p/a ssPW@host")).toContain("ssPW@host");
   });
 
   it("redacts a serve YAML parse-error code frame and keeps host:port", () => {
@@ -1670,8 +1690,8 @@ function credentialSample(): string {
 
 function expectUserinfoRedacted(text: string): void {
   expect(text).not.toContain(REDACTION_SECRET);
-  expect(text).not.toContain(`admin:${REDACTION_SECRET}@`);
-  expect(text).toContain("http://direct.invalid/cgi-bin/api.cgi");
+  expect(text).toContain("admin:***@direct.invalid");
+  expect(text).toContain("http://admin:***@direct.invalid/cgi-bin/api.cgi");
   expect(text).toContain(REDACTION_EMAIL);
   expect(text).toContain("x@y");
 }
