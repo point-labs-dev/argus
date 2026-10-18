@@ -95,6 +95,12 @@ Run the Vitest suite:
 npm test
 ```
 
+### Direct AI poll
+
+NVR channels answer `GetAiState` with rspCode -99, so those cameras stay on basic motion unless `cameras[].directAiHost` is set. When it is set, Argus polls `GetAiState` on that host at channel 0 and uses the camera entry's username and password. Video URLs and `GetMdState` stay on `host`. The value is a host with an optional port (`<host>` or `<host>:80`) and rejects a scheme, a path, userinfo, and whitespace. IPv6 is unsupported. Leave it unset to keep a single client. See the commented example on the NVR camera in `argus.example.yaml`.
+
+When `directAiHost` is unset, `GetAiState` stays on `host`. A reply with rspCode -99 marks it unsupported, as before, and Argus stops asking. Any other error code skips `GetAiState` for 30 seconds, then the wait doubles up to 5 minutes, while `GetMdState` keeps its normal poll. A good reply resets the wait.
+
 ### Alert Latency
 
 Argus instruments the motion→notification→live path with structured telemetry. See [LATENCY.md](LATENCY.md) for:

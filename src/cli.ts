@@ -1,10 +1,13 @@
 #!/usr/bin/env node
 
+import { realpathSync } from "node:fs";
 import { chmod, mkdir, writeFile } from "node:fs/promises";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { ConfigError, loadArgusConfig } from "./config.js";
 import { generateGo2RtcYaml } from "./go2rtc.js";
+import { redactCredentialHosts } from "./reolink.js";
 
 interface CliOptions {
   configPath: string;
@@ -118,16 +121,16 @@ function isNodeErrorWithCode(error: unknown, code: string): error is NodeJS.Errn
   return typeof error === "object" && error !== null && "code" in error && error.code === code;
 }
 
-function formatError(error: unknown): string {
+export function formatError(error: unknown): string {
   if (error instanceof ConfigError) {
-    return error.message;
+    return redactCredentialHosts(error.message);
   }
 
   if (error instanceof Error) {
-    return error.message;
+    return redactCredentialHosts(error.message);
   }
 
-  return String(error);
+  return redactCredentialHosts(String(error));
 }
 
 export async function run(argv: string[]): Promise<void> {
@@ -158,4 +161,15 @@ async function main(): Promise<void> {
   }
 }
 
-void main();
+// The npm bin is a symlink to dist/cli.js, so compare real paths.
+const invokedDirectly = ((): boolean => {
+  if (!process.argv[1]) return false;
+  try {
+    return realpathSync(process.argv[1]) === fileURLToPath(import.meta.url);
+  } catch {
+    return false;
+  }
+})();
+if (invokedDirectly) {
+  void main();
+}

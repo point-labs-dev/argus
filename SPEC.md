@@ -132,6 +132,8 @@ cameras:
     streams:
       main: main            # 4K/high-quality for recording
       sub: sub              # lower-quality for remote/analysis
+    # directAiHost: <host>  # Optional, for an NVR channel. GetAiState polls the camera's
+                            # own host at channel 0. Unset keeps it on host. IPv6 is unsupported.
 
 recording:
   path: ./recordings
