@@ -1217,6 +1217,16 @@ describe("direct AI poll", () => {
       "failed",
     );
     check(
+      "userinfo 80",
+      redactKnownSecrets("http://admin:80@192.0.2.20/x", ["80"]),
+      "http://admin:***@192.0.2.20/x",
+    );
+    check(
+      "userinfo on",
+      redactKnownSecrets("admin:on@192.0.2.10", ["on"]),
+      "admin:***@192.0.2.10",
+    );
+    check(
       "admin inside a word",
       redactKnownSecrets("administrator", ["admin"]),
       "administrator",
@@ -1232,7 +1242,7 @@ describe("direct AI poll", () => {
           const bare = host.slice(host.lastIndexOf("@") + 1);
           const encoded = encodeURIComponent(password);
           const userinfo = `http://admin:${encoded}@${bare}/x admin:${password}@${bare}`;
-          const userinfoWant = `http://admin:***@${bare}/x admin:***@${bare}`;
+          const userinfoWant = maskPassword(userinfo, password);
           check(`userinfo ${password} ${host}`, redactKnownSecrets(userinfo, [password]), userinfoWant);
           check(`format userinfo ${password} ${host}`, formatError(userinfo, [password]), userinfoWant);
           for (const kind of kinds) {
@@ -1287,6 +1297,59 @@ describe("direct AI poll", () => {
     const formatted = formatError(caught, secrets);
     expect(formatted).not.toContain(sentinel);
     expect(formatted).toContain("***");
+  });
+
+  it("warns once at startup when a configured password is too short to redact in free text", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "argus-short-pw-"));
+    const file = join(dir, "argus.yaml");
+    const out = join(dir, "go2rtc.yaml");
+    const warning = "[argus] a configured password is too short to redact in free text\n";
+    const writeCameras = (passwords: string[]): void => {
+      const cameras = passwords.map((password, index) => [
+        `  - name: Camera ${index + 1}`,
+        "    aspect: \"16:9\"",
+        "    host: 192.0.2.10",
+        "    channel: 0",
+        "    mainCodec: h265",
+        "    username: admin",
+        `    password: "${password}"`,
+        "    transport: auto",
+        "    streams:",
+        "      main: main",
+        "      sub: sub",
+      ].join("\n")).join("\n");
+      writeFileSync(file, [
+        "cameras:",
+        cameras,
+        "recording:",
+        "  path: ./rec",
+        "  retention:",
+        "    continuous: 3",
+        "    motion: 7",
+        "    alerts: 30",
+        "homekit:",
+        "  pin: \"123-45-678\"",
+        "go2rtc:",
+        "  binary: ./go2rtc",
+        "  api_port: 1984",
+        "server:",
+        "  port: 8080",
+        "",
+      ].join("\n"));
+    };
+    try {
+      writeCameras(["80", "abc"]);
+      const stderr = await captureStderr(() => run(["--config", file, "--out", out]));
+      expect(stderr).toBe(warning);
+      expect(stderr).not.toContain("80");
+      expect(stderr).not.toContain("abc");
+      expect(stderr).not.toMatch(/\d/);
+      rmSync(out, { force: true });
+      writeCameras(["abcd"]);
+      expect(await captureStderr(() => run(["--config", file, "--out", out]))).toBe("");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it("redacts a free-text password with a space and / ? # or colon-space, and keeps an email", () => {
@@ -1593,7 +1656,7 @@ describe("direct AI poll", () => {
         "    channel: 2",
         "    mainCodec: h265",
         "    username: admin",
-        `    password: ${password}`,
+        `    password: "${password}"`,
         "    transport: auto",
         "    streams:",
         "      main: main",
@@ -1614,15 +1677,28 @@ describe("direct AI poll", () => {
         "",
       ].join("\n"),
     );
+    const runner = join(dir, "boot.ts");
+    const serveModule = join(root, "src", "serve.ts");
+    writeFileSync(runner, `import { serveConfig } from ${JSON.stringify(serveModule)};
+async function main() {
+  const configPath = process.argv[2];
+  if (!configPath) throw new Error("missing config");
+  await serveConfig(configPath, {
+    afterGo2Rtc(passwords) {
+      throw new Error(\`injected startup failure \${passwords[0] ?? ""}\`);
+    },
+  });
+}
+void main();
+`);
     let childAlive = true;
     try {
-      const result = spawnSync(process.execPath, ["--import", "tsx", "src/serve.ts", configPath], {
+      const result = spawnSync(process.execPath, ["--import", "tsx", runner, configPath], {
         cwd: root,
         encoding: "utf8",
         timeout: 8_000,
         env: {
           ...process.env,
-          ARGUS_TEST_THROW_AFTER_GO2RTC: "1",
           ARGUS_TEST_GO2RTC_PID: pidFile,
         },
       });
@@ -1737,7 +1813,7 @@ function writeArgusYaml(file: string, password: string): void {
     "    channel: 0",
     "    mainCodec: h265",
     "    username: admin",
-    `    password: ${password}`,
+    `    password: "${password}"`,
     "    transport: auto",
     "    streams:",
     "      main: main",

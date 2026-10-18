@@ -27,21 +27,66 @@ const HOST_PORT = /^\d{1,5}(?=$|[\s:/])/;
 const HOSTNAME = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$/;
 const IPV4 = /^(?:\d{1,3}\.){3}\d{1,3}$/;
 
+const WORD_CHAR = /[A-Za-z0-9]/;
+
+function isWordChar(char: string | undefined): boolean {
+  return char !== undefined && WORD_CHAR.test(char);
+}
+
+function replaceWhere(text: string, needle: string, accept: (value: string, index: number) => boolean): string {
+  if (needle.length === 0) return text;
+  let out = "";
+  let cursor = 0;
+  let from = 0;
+  while (from <= text.length - needle.length) {
+    const found = text.indexOf(needle, from);
+    if (found < 0) break;
+    if (accept(text, found)) {
+      out += text.slice(cursor, found) + "***";
+      cursor = found + needle.length;
+      from = cursor;
+    } else {
+      from = found + 1;
+    }
+  }
+  return out + text.slice(cursor);
+}
+
 /**
  * Replace each known password, and its URL-encoded form, with `***`.
+ * A password of 4 or more characters is replaced only when neither side touches a letter or digit.
+ * A shorter password is replaced only in userinfo, where it sits between `:` and `@`.
  * Longer secrets go first so a short one cannot split a longer one.
  */
 export function redactKnownSecrets(text: string, secrets: readonly string[]): string {
-  const needles = new Set<string>();
+  const items: Array<{ needle: string; short: boolean }> = [];
+  const seen = new Set<string>();
   for (const secret of secrets) {
     if (secret.length === 0) continue;
-    needles.add(secret);
-    needles.add(encodeURIComponent(secret));
+    const short = secret.length < 4;
+    for (const needle of [secret, encodeURIComponent(secret)]) {
+      const key = `${short ? "s" : "l"}\0${needle}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      items.push({ needle, short });
+    }
   }
-  const ordered = [...needles].sort((left, right) => right.length - left.length);
+  items.sort((left, right) => right.needle.length - left.needle.length || Number(left.short) - Number(right.short));
   let out = text;
-  for (const needle of ordered) out = out.replaceAll(needle, "***");
+  for (const item of items) {
+    out = replaceWhere(out, item.needle, (value, index) => {
+      if (item.short) return value[index - 1] === ":" && value[index + item.needle.length] === "@";
+      return !isWordChar(value[index - 1]) && !isWordChar(value[index + item.needle.length]);
+    });
+  }
   return out;
+}
+
+/** One startup line when a configured password is too short to redact in free text. */
+export function warnShortPasswords(passwords: readonly string[]): void {
+  if (passwords.some((password) => password.length > 0 && password.length < 4)) {
+    process.stderr.write("[argus] a configured password is too short to redact in free text\n");
+  }
 }
 
 /**

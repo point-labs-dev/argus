@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import { Categories, HAPStorage } from "hap-nodejs";
 
 import { formatError } from "./cli.js";
+import { warnShortPasswords } from "./reolink.js";
 import { loadArgusConfig, type ArgusConfig } from "./config.js";
 import { buildGo2RtcStreamNames } from "./go2rtc.js";
 import { startGo2Rtc, type Go2RtcSupervisor } from "./go2rtc-supervisor.js";
@@ -30,7 +31,15 @@ export interface ArgusServer {
   stop(): Promise<void>;
 }
 
-export async function startArgusServer(config: ArgusConfig, configDir = process.cwd()): Promise<ArgusServer> {
+export interface ArgusServerDeps {
+  afterGo2Rtc?: (passwords: readonly string[]) => void;
+}
+
+export async function startArgusServer(
+  config: ArgusConfig,
+  configDir = process.cwd(),
+  deps?: ArgusServerDeps,
+): Promise<ArgusServer> {
   HAPStorage.setCustomStoragePath(path.join(configDir, ".homekit"));
 
   const supervisor: Go2RtcSupervisor = await startGo2Rtc(config, {
@@ -55,9 +64,7 @@ export async function startArgusServer(config: ArgusConfig, configDir = process.
   const passwords = config.cameras.map((camera) => camera.password);
   try {
     cache.startPolling(10_000, ["main"]);
-    if (process.env.ARGUS_TEST_THROW_AFTER_GO2RTC === "1") {
-      throw new Error(`injected startup failure ${passwords[0] ?? ""}`);
-    }
+    deps?.afterGo2Rtc?.(passwords);
 
     // Probe each camera's live (sub) resolution from a snapshot so the accessory
     // advertises the native size copy-mode live view will deliver. Retries through
@@ -136,12 +143,12 @@ export async function startArgusServer(config: ArgusConfig, configDir = process.
       const port = HOMEKIT_PORT_BASE + index;
 
       published.push(accessory);
-    accessory.publish({ username, pincode: config.homekit.pin, port, category: Categories.IP_CAMERA });
+      accessory.publish({ username, pincode: config.homekit.pin, port, category: Categories.IP_CAMERA });
 
-    process.stdout.write(
-      `\n  📷 ${camera.name}\n     pair code: ${config.homekit.pin}\n     setup URI: ${accessory.setupURI()}\n     (port ${port}, id ${username})\n`,
-    );
-  });
+      process.stdout.write(
+        `\n  📷 ${camera.name}\n     pair code: ${config.homekit.pin}\n     setup URI: ${accessory.setupURI()}\n     (port ${port}, id ${username})\n`,
+      );
+    });
 
     // Drive the HomeKit motion sensors from the Reolink motion API.
     motion = new MotionMonitor(
@@ -224,21 +231,25 @@ export async function startArgusServer(config: ArgusConfig, configDir = process.
   }
 }
 
-async function main(): Promise<void> {
+export async function serveConfig(configPath: string, deps?: ArgusServerDeps): Promise<void> {
   const secrets: string[] = [];
   try {
-    await runServer(secrets);
+    await runServer(secrets, configPath, deps);
   } catch (error) {
     process.stderr.write(`${formatError(error, secrets)}\n`);
     process.exitCode = 1;
   }
 }
 
-async function runServer(secrets: string[]): Promise<void> {
-  const configPath = process.argv[2] ?? "argus.yaml";
+async function main(): Promise<void> {
+  await serveConfig(process.argv[2] ?? "argus.yaml");
+}
+
+async function runServer(secrets: string[], configPath: string, deps?: ArgusServerDeps): Promise<void> {
   const config = await loadArgusConfig(configPath);
   for (const camera of config.cameras) secrets.push(camera.password);
-  const server = await startArgusServer(config, path.dirname(path.resolve(configPath)));
+  warnShortPasswords(config.cameras.map((camera) => camera.password));
+  const server = await startArgusServer(config, path.dirname(path.resolve(configPath)), deps);
 
   const shutdown = (): void => {
     process.stdout.write("\nShutting down…\n");

@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 
 import { loadArgusConfig } from "./config.js";
 import { generateGo2RtcYaml } from "./go2rtc.js";
-import { redactCredentialHosts, redactKnownSecrets } from "./reolink.js";
+import { redactCredentialHosts, redactKnownSecrets, warnShortPasswords } from "./reolink.js";
 
 interface CliOptions {
   configPath: string;
@@ -133,6 +133,7 @@ export async function run(argv: string[], secrets: string[] = []): Promise<void>
   const options = parseCliArgs(argv);
   const config = await loadArgusConfig(options.configPath);
   secrets.push(...config.cameras.map((camera) => camera.password));
+  warnShortPasswords(config.cameras.map((camera) => camera.password));
   const generatedYaml = generateGo2RtcYaml(config);
 
   if (!options.outputPath) {
