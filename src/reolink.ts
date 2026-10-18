@@ -23,15 +23,42 @@ const MARKED_INTRO = new RegExp(
   "gi",
 );
 
+const HOST_PORT = /^\d{1,5}(?=$|\s)/;
+const HOSTNAME = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$/;
+const IPV4 = /^(?:\d{1,3}\.){3}\d{1,3}$/;
+
 /**
  * Drop URL userinfo so a host string cannot carry a password into a log line.
  * `user:password@host` and `scheme://userinfo@host` are stripped through the last `@`
  * before the host, so the password may contain `@`, `/`, or a space.
- * A password that contains a space and `/`, `?`, `#`, or `: ` is removed too, with or without `@`.
+ * A password with a space or tab and `/`, `?`, `#`, or `: ` is removed too, with or without `@`.
+ * A `/`, `?`, or `#` before that gap counts, and so does one token after the marked token.
+ * An `@` after a space or tab is the host, so `p@ss word@host` keeps the host.
+ * A host:port (IPv4, a hostname, or [IPv6]:port) is not a password.
  * A bare `user@host` (an email, or `x@y`) is left alone.
+ * `label-port`: `admin:80 /secret` stays, so `localhost:80 failed:` stays.
+ * `clock-email`: `at 12:30 mail owner@example.com` becomes `at example.com`.
+ * `second-tail`: a second word after the marked token stays.
  */
 export function redactCredentialHosts(text: string): string {
-  return redactMarkedPasswords(text.replace(SCHEME_USERINFO, "$1").replace(BARE_USERINFO, "$1"));
+  const marked = redactMarkedPasswords(text);
+  return marked.replace(SCHEME_USERINFO, "$1").replace(BARE_USERINFO, "$1");
+}
+
+function isHostPortIntro(text: string, colonIndex: number, user: string): boolean {
+  if (colonInsideIpv6(text, colonIndex)) return true;
+  if (!HOST_PORT.test(text.slice(colonIndex + 1))) return false;
+  if (IPV4.test(user) || HOSTNAME.test(user)) return true;
+  return false;
+}
+
+function colonInsideIpv6(text: string, colonIndex: number): boolean {
+  const open = text.lastIndexOf("[", colonIndex);
+  if (open < 0 || text.lastIndexOf("]", colonIndex) > open) return false;
+  const close = text.indexOf("]", colonIndex);
+  if (close < 0) return false;
+  if (!/^[0-9A-Fa-f:.]+$/.test(text.slice(open + 1, close))) return false;
+  return HOST_PORT.test(text.slice(close + 2)) || text[close + 1] === undefined || /\s/.test(text[close + 1] ?? "");
 }
 
 function findLastAtHost(value: string): number {
@@ -43,36 +70,68 @@ function findLastAtHost(value: string): number {
   return last;
 }
 
-function takeMarkedPassword(rest: string): string | null {
-  let end = 0;
-  let sawSpace = false;
-  let marked = false;
-  while (end < rest.length) {
-    const char = rest[end];
-    if (char === " ") {
-      sawSpace = true;
-      end += 1;
+function isGap(char: string | undefined): boolean {
+  return char === " " || char === "\t";
+}
+
+function isLineBreak(char: string | undefined): boolean {
+  return char !== undefined && /\s/.test(char) && !isGap(char);
+}
+
+interface MarkedToken {
+  text: string;
+  start: number;
+  end: number;
+}
+
+function markedTokens(rest: string): MarkedToken[] {
+  const tokens: MarkedToken[] = [];
+  let index = 0;
+  while (index < rest.length && !isLineBreak(rest[index])) {
+    if (isGap(rest[index])) {
+      index += 1;
       continue;
     }
-    if (char !== undefined && /\s/.test(char)) {
+    const start = index;
+    while (index < rest.length && !isGap(rest[index]) && !isLineBreak(rest[index])) index += 1;
+    tokens.push({ text: rest.slice(start, index), start, end: index });
+  }
+  return tokens;
+}
+
+function tokenHasMarker(token: string): boolean {
+  return token.includes("/") || token.includes("?") || token.includes("#");
+}
+
+function takeMarkedPassword(rest: string): string | null {
+  const tokens = markedTokens(rest);
+  let marked = -1;
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = tokens[index]!;
+    const slice = rest.slice(0, token.end);
+    if (tokenHasMarker(token.text) || slice.includes(": ") || slice.includes(":\t")) {
+      marked = index;
       break;
     }
-    while (end < rest.length && rest[end] !== " " && !/\s/.test(rest[end] ?? "")) {
-      end += 1;
-    }
-    const slice = rest.slice(0, end);
-    const token = slice.slice(slice.lastIndexOf(" ") + 1);
-    if (sawSpace && (token.includes("/") || token.includes("?") || token.includes("#"))) {
-      marked = true;
-    }
-    if (slice.includes(": ")) {
-      marked = true;
-    }
-    if (marked) {
-      return slice;
-    }
+  }
+  if (marked >= 0) {
+    const next = tokens[marked + 1];
+    const end = next && !next.text.includes("@") ? next.end : tokens[marked]!.end;
+    return rest.slice(0, end);
+  }
+  const firstHost = hostAfterLastAt(tokens[0]?.text ?? "");
+  if (firstHost.includes(".")) return null;
+  for (const token of tokens) {
+    const gapBefore = token.start > 0 && isGap(rest[token.start - 1]);
+    if (gapBefore && token.text.includes("@")) return rest.slice(0, token.end);
   }
   return null;
+}
+
+function hostAfterLastAt(token: string): string {
+  const at = token.lastIndexOf("@");
+  if (at < 0) return "";
+  return token.slice(at + 1).split(/[/?#]/)[0] ?? "";
 }
 
 function redactMarkedPasswords(text: string): string {
@@ -81,15 +140,13 @@ function redactMarkedPasswords(text: string): string {
   let cursor = 0;
   for (const match of text.matchAll(matcher)) {
     const start = match.index ?? 0;
-    if (start < cursor) {
-      continue;
-    }
+    if (start < cursor) continue;
     const keep = match[1] ?? match[3] ?? "";
+    const user = match[2] ?? match[4] ?? "";
     const passwordStart = start + match[0].length;
+    if (isHostPortIntro(text, passwordStart - 1, user)) continue;
     const marked = takeMarkedPassword(text.slice(passwordStart));
-    if (marked === null) {
-      continue;
-    }
+    if (marked === null) continue;
     const at = findLastAtHost(marked);
     out += text.slice(cursor, start) + keep;
     cursor = passwordStart + (at >= 0 ? at + 1 : marked.length);
@@ -300,7 +357,7 @@ export class ReolinkClient {
     if (this.aiSupported === false) {
       return false;
     }
-    if (this.options.loginBackoff === true && this.nextFreshAiAttemptAt !== 0 && this.now() < this.nextFreshAiAttemptAt) {
+    if (this.nextFreshAiAttemptAt !== 0 && this.now() < this.nextFreshAiAttemptAt) {
       this.fail(`GetAiState ch${channel} on ${this.options.host} failed: backing off`);
     }
     const tokenWasCached = this.token !== undefined && this.now() < this.tokenExpiresAt;
@@ -308,7 +365,7 @@ export class ReolinkClient {
     let ai = await this.call("GetAiState", { channel }, token);
     if (ai.code !== 0 && ai.error?.rspCode === -6) {
       this.token = undefined;
-      const blockRelogin = this.options.loginBackoff === true && this.freshTokenRejected && !tokenWasCached;
+      const blockRelogin = this.freshTokenRejected && !tokenWasCached;
       if (!blockRelogin) {
         token = await this.ensureToken();
         ai = await this.call("GetAiState", { channel }, token);

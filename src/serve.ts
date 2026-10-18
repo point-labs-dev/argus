@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 
 import { Categories, HAPStorage } from "hap-nodejs";
 
+import { formatError } from "./cli.js";
 import { loadArgusConfig, type ArgusConfig } from "./config.js";
 import { buildGo2RtcStreamNames } from "./go2rtc.js";
 import { startGo2Rtc, type Go2RtcSupervisor } from "./go2rtc-supervisor.js";
@@ -192,6 +193,15 @@ export async function startArgusServer(config: ArgusConfig, configDir = process.
 }
 
 async function main(): Promise<void> {
+  try {
+    await runServer();
+  } catch (error) {
+    process.stderr.write(`${formatError(error)}\n`);
+    process.exitCode = 1;
+  }
+}
+
+async function runServer(): Promise<void> {
   const configPath = process.argv[2] ?? "argus.yaml";
   const config = await loadArgusConfig(configPath);
   const server = await startArgusServer(config, path.dirname(path.resolve(configPath)));

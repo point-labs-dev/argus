@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, symlinkSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -1068,6 +1068,65 @@ describe("direct AI poll", () => {
     }
   });
 
+  it("keeps every fail() line byte-identical when the host has a port and when it does not", async () => {
+    const hosts = [
+      "192.0.2.10",
+      "192.0.2.10:80",
+      "nvr.invalid",
+      "nvr.invalid:80",
+      "localhost",
+      "localhost:80",
+      "[::1]",
+      "[::1]:80",
+      "[fe80::1]",
+      "[fe80::1]:554",
+    ];
+    const lines: Array<{ host: string; kind: string; message: string }> = [];
+    await withNoSockets(async () => {
+      for (const host of hosts) {
+        lines.push({ host, kind: "login-detail", message: await failMessage(host, "login-detail") });
+        lines.push({ host, kind: "login-http", message: await failMessage(host, "login-http") });
+        lines.push({ host, kind: "login-refused", message: await failMessage(host, "login-refused") });
+        lines.push({ host, kind: "login-timeout", message: await failMessage(host, "login-timeout") });
+        lines.push({ host, kind: "login-abort", message: await failMessage(host, "login-abort") });
+        lines.push({ host, kind: "login-backoff", message: await failMessage(host, "login-backoff") });
+        lines.push({ host, kind: "md", message: await failMessage(host, "md") });
+        lines.push({ host, kind: "ai", message: await failMessage(host, "ai") });
+        lines.push({ host, kind: "ai-backoff", message: await failMessage(host, "ai-backoff") });
+      }
+    });
+    const expected: Record<string, (host: string) => string> = {
+      "login-detail": (host) => `Login on ${host} failed: rspCode -6 (please login first)`,
+      "login-http": (host) => `Login on ${host} failed: HTTP 500`,
+      "login-refused": (host) => `Login on ${host} fetch failed: ECONNREFUSED`,
+      "login-timeout": (host) => `Login on ${host} fetch failed: ETIMEDOUT`,
+      "login-abort": (host) => `Login on ${host} fetch failed: 23`,
+      "login-backoff": (host) => `Login on ${host} failed: backing off`,
+      md: (host) => `GetMdState ch2 on ${host} failed: rspCode -6 (please login first)`,
+      ai: (host) => `GetAiState ch0 on ${host} failed: busy`,
+      "ai-backoff": (host) => `GetAiState ch0 on ${host} failed: backing off`,
+    };
+    for (const line of lines) {
+      const want = expected[line.kind]!(line.host);
+      expect(line.message, `${line.kind} ${line.host}`).toBe(want);
+      expect(formatError(line.message), `${line.kind} ${line.host} formatError`).toBe(want);
+    }
+    const host = "192.0.2.10:80";
+    const stderr = await captureStderr(() =>
+      withNoSockets(async () => {
+        const fetchFn = vi.fn(async () => {
+          throw Object.assign(new TypeError("fetch failed"), { cause: { code: "ECONNREFUSED" } });
+        }) as unknown as typeof fetch;
+        const monitor = new MotionMonitor(configWith(undefined, host).cameras, () => {}, {
+          fetch: fetchFn,
+          onError: writeMotionPollError,
+        });
+        await monitor.pollOnce();
+      }),
+    );
+    expect(stderr).toBe(`[argus Front L] motion poll error: Login on ${host} fetch failed: ECONNREFUSED\n`);
+  });
+
   it("redacts a free-text password with a space and / ? # or colon-space, and keeps an email", () => {
     const passwords = [
       `${PASSWORD_LEFT} /${PASSWORD_RIGHT}`,
@@ -1146,6 +1205,152 @@ describe("direct AI poll", () => {
     expect(result.status).toBe(0);
   }, 30_000);
 
+  it("starts direct-host re-login backoff at 5s again after the host recovers", async () => {
+    await withNoSockets(async () => {
+      let clock = 0;
+      let reject = true;
+      const loginsAt: number[] = [];
+      const fetchFn = vi.fn(async (input: string | URL | Request) => {
+        const url = String(input);
+        if (url.includes("cmd=Login")) {
+          loginsAt.push(clock);
+          return jsonResponse([{ cmd: "Login", code: 0, value: { Token: { name: "tok", leaseTime: 1 } } }]);
+        }
+        if (url.includes("cmd=GetAiState")) {
+          if (reject) {
+            return jsonResponse([{ cmd: "GetAiState", code: 1, error: { detail: "please login first", rspCode: -6 } }]);
+          }
+          return jsonResponse([{
+            cmd: "GetAiState",
+            code: 0,
+            value: { people: { alarm_state: 0, support: 1 }, vehicle: { alarm_state: 0 }, dog_cat: { alarm_state: 0 } },
+          }]);
+        }
+        throw new Error(`unexpected ${url}`);
+      }) as unknown as typeof fetch;
+      const client = new ReolinkClient({
+        host: DIRECT_HOST,
+        username: DIRECT_USER,
+        password: DIRECT_PASSWORD,
+        fetch: fetchFn,
+        now: () => clock,
+        loginBackoff: true,
+      });
+      const poll = async (): Promise<void> => {
+        try {
+          await client.getAiState(0);
+        } catch (error) {
+          if (!(error instanceof ReolinkError)) throw error;
+        }
+      };
+      for (let t = 0; t <= 135_000; t += 1_000) {
+        clock = t;
+        await poll();
+      }
+      expect(loginsAt).toEqual([0, 0, 5_000, 15_000, 35_000, 75_000, 135_000]);
+      reject = false;
+      clock = 195_000;
+      await poll();
+      expect(loginsAt.at(-1)).toBe(195_000);
+      reject = true;
+      const restart = 225_000;
+      for (const t of [restart, restart + 1_000, restart + 5_000, restart + 15_000, restart + 35_000, restart + 75_000, restart + 135_000]) {
+        clock = t;
+        await poll();
+      }
+      expect(loginsAt).toEqual([
+        0, 0, 5_000, 15_000, 35_000, 75_000, 135_000, 195_000,
+        restart, restart, restart + 5_000, restart + 15_000, restart + 35_000, restart + 75_000, restart + 135_000,
+      ]);
+    });
+  });
+
+  it("does not back off GetAiState re-login unless loginBackoff is set", async () => {
+    await withNoSockets(async () => {
+      let clock = 0;
+      let logins = 0;
+      const fetchFn = vi.fn(async (input: string | URL | Request) => {
+        const url = String(input);
+        if (url.includes("cmd=Login")) {
+          logins += 1;
+          return jsonResponse([{ cmd: "Login", code: 0, value: { Token: { name: `t${logins}`, leaseTime: 3600 } } }]);
+        }
+        return jsonResponse([{ cmd: "GetAiState", code: 1, error: { detail: "please login first", rspCode: -6 } }]);
+      }) as unknown as typeof fetch;
+      const client = new ReolinkClient({
+        host: DIRECT_HOST,
+        username: DIRECT_USER,
+        password: DIRECT_PASSWORD,
+        fetch: fetchFn,
+        now: () => clock,
+      });
+      for (const t of [0, 1_000, 5_000]) {
+        clock = t;
+        await expect(client.getAiState(0)).rejects.toThrow(
+          `GetAiState ch0 on ${DIRECT_HOST} failed: please login first`,
+        );
+      }
+      expect(logins).toBe(4);
+    });
+  });
+
+  it("redacts tab, marker-before-space, trailing secret, and @-space passwords", () => {
+    const texts = [
+      `admin:${PASSWORD_LEFT}\t/${PASSWORD_RIGHT} ${REDACTION_EMAIL}`,
+      `admin:p/a ss${PASSWORD_RIGHT} ${REDACTION_EMAIL}`,
+      `admin:x a/b ${PASSWORD_RIGHT} ${REDACTION_EMAIL}`,
+      `admin:p@ss\tword@nvr.invalid ${REDACTION_EMAIL}`,
+      `admin:p@ss word@nvr.invalid ${REDACTION_EMAIL}`,
+    ];
+    for (const text of texts) {
+      const stderr = captureStderrSync(() => writeMotionPollError("Front L", new Error(text)));
+      for (const output of [stderr, formatError(new Error(text)), formatError(text)]) {
+        expect(output, text).not.toContain(PASSWORD_LEFT);
+        expect(output, text).not.toContain(PASSWORD_RIGHT);
+        expect(output, text).not.toContain("p/a");
+        expect(output, text).not.toContain("p@ss");
+        expect(output, text).toContain(REDACTION_EMAIL);
+      }
+    }
+    expect(formatError("admin:p@ss word@nvr.invalid")).toBe("nvr.invalid");
+    expect(formatError(`admin:x a/b ${PASSWORD_RIGHT} extra`)).toBe(" extra");
+    const unchanged = [
+      "note: see the docs",
+      "Meet:\tsee the docs",
+      REDACTION_EMAIL,
+      "x@y",
+      "Login on 192.0.2.10:80 failed: HTTP 500",
+      "GetAiState ch0 on [fe80::1]:554 failed: backing off",
+      "host: 192.0.2.10:80",
+      "localhost:80 failed: ECONNREFUSED",
+    ];
+    for (const text of unchanged) expect(formatError(text), text).toBe(text);
+    expect(formatError(`admin:80 /${PASSWORD_RIGHT}`)).toContain(PASSWORD_RIGHT);
+    expect(formatError(`at 12:30 mail ${REDACTION_EMAIL}`)).toBe("at example.com");
+  });
+
+  it("redacts a serve YAML parse-error code frame and keeps host:port", () => {
+    const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+    const dir = mkdtempSync(join(tmpdir(), "argus-serve-"));
+    try {
+      const file = join(dir, "bad.yaml");
+      writeFileSync(file, `items: [password: admin:${PASSWORD_LEFT} /${PASSWORD_RIGHT}, host: 192.0.2.10:80\n`);
+      const result = spawnSync(process.execPath, ["--import", "tsx", "src/serve.ts", file], {
+        cwd: root,
+        encoding: "utf8",
+        timeout: 20_000,
+      });
+      expect(result.stdout).toBe("");
+      expect(result.stderr).toContain("Unable to parse YAML");
+      expect(result.stderr).not.toContain(PASSWORD_LEFT);
+      expect(result.stderr).not.toContain(PASSWORD_RIGHT);
+      expect(result.stderr).toContain("192.0.2.10:80");
+      expect(result.status).toBe(1);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   it("documents cameras[].directAiHost as <host> and says IPv6 is unsupported", () => {
     const root = join(dirname(fileURLToPath(import.meta.url)), "..");
     const readme = readFileSync(join(root, "README.md"), "utf8");
@@ -1157,6 +1362,7 @@ describe("direct AI poll", () => {
       .join("\n");
     expect(readmeSection).toContain("cameras[].directAiHost");
     expect(readmeSection).toContain("IPv6 is unsupported");
+    expect(readmeSection).toContain("recovery can take up to 60 seconds");
     expect(exampleComments).toContain("directAiHost: <host>");
     expect(exampleComments).toContain("IPv6 is unsupported");
   });
@@ -1166,6 +1372,95 @@ const REDACTION_SECRET = "s3cret-token";
 const REDACTION_EMAIL = "owner@example.com";
 const PASSWORD_LEFT = "Q7aLpha";
 const PASSWORD_RIGHT = "Z9bEta";
+
+async function failMessage(host: string, kind: string): Promise<string> {
+  let clock = 0;
+  const fetchFn = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+    if (kind === "login-http") {
+      return { ok: false, status: 500, json: async () => [] } as unknown as Response;
+    }
+    if (kind === "login-refused") {
+      throw Object.assign(new TypeError("fetch failed"), { cause: { code: "ECONNREFUSED" } });
+    }
+    if (kind === "login-timeout") {
+      throw Object.assign(new TypeError("fetch failed"), { cause: { code: "ETIMEDOUT" } });
+    }
+    if (kind === "login-abort") {
+      await new Promise<void>((_resolve, reject) => {
+        const signal = init?.signal;
+        if (!signal) {
+          reject(new Error("missing abort signal"));
+          return;
+        }
+        const fail = (): void => {
+          reject(Object.assign(new TypeError("fetch failed"), { cause: signal.reason }));
+        };
+        if (signal.aborted) fail();
+        else signal.addEventListener("abort", fail, { once: true });
+      });
+    }
+    if (kind === "login-detail" || kind === "login-backoff") {
+      return jsonResponse([{ cmd: "Login", code: 1, error: { detail: "rspCode -6 (please login first)", rspCode: -6 } }]);
+    }
+    const url = String(_input);
+    if (url.includes("cmd=Login")) {
+      return jsonResponse([{ cmd: "Login", code: 0, value: { Token: { name: "tok", leaseTime: 3600 } } }]);
+    }
+    if (kind === "md") {
+      return jsonResponse([{ cmd: "GetMdState", code: 1, error: { detail: "rspCode -6 (please login first)", rspCode: -6 } }]);
+    }
+    if (kind === "ai-backoff") {
+      return jsonResponse([{ cmd: "GetAiState", code: 1, error: { detail: "please login first", rspCode: -6 } }]);
+    }
+    return jsonResponse([{ cmd: "GetAiState", code: 1, error: { detail: "busy", rspCode: -5 } }]);
+  }) as unknown as typeof fetch;
+  const loginBackoff = kind === "login-backoff" || kind === "ai-backoff";
+  const client = new ReolinkClient({
+    host,
+    username: DIRECT_USER,
+    password: DIRECT_PASSWORD,
+    fetch: fetchFn,
+    now: () => clock,
+    ...(kind === "login-abort" ? { requestTimeoutMs: 20 } : {}),
+    ...(loginBackoff ? { loginBackoff: true } : {}),
+  });
+  const run = async (): Promise<void> => {
+    if (kind === "md") {
+      await client.getMdState(2);
+      return;
+    }
+    if (kind === "ai" || kind === "ai-backoff") {
+      await client.getAiState(0);
+      return;
+    }
+    await client.ensureToken();
+  };
+  const once = async (): Promise<string> => {
+    try {
+      await run();
+    } catch (error) {
+      return error instanceof Error ? error.message : String(error);
+    }
+    throw new Error(`${kind} on ${host} did not fail`);
+  };
+  const first = await once();
+  if (kind !== "login-backoff" && kind !== "ai-backoff") return first;
+  clock = 1_000;
+  if (kind === "ai-backoff") {
+    try {
+      await client.getAiState(0);
+    } catch (error) {
+      return error instanceof Error ? error.message : String(error);
+    }
+    throw new Error(`ai-backoff on ${host} did not fail on the second poll`);
+  }
+  try {
+    await client.ensureToken();
+  } catch (error) {
+    return error instanceof Error ? error.message : String(error);
+  }
+  throw new Error(`login-backoff on ${host} did not fail on the second poll`);
+}
 
 function credentialSample(): string {
   return `connect failed for http://admin:${REDACTION_SECRET}@direct.invalid/cgi-bin/api.cgi admin:${REDACTION_SECRET}@direct.invalid ${REDACTION_EMAIL} x@y`;
