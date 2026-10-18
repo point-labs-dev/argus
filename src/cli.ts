@@ -5,9 +5,9 @@ import { chmod, mkdir, writeFile } from "node:fs/promises";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { ConfigError, loadArgusConfig } from "./config.js";
+import { loadArgusConfig } from "./config.js";
 import { generateGo2RtcYaml } from "./go2rtc.js";
-import { redactCredentialHosts } from "./reolink.js";
+import { redactCredentialHosts, redactKnownSecrets, warnShortPasswords } from "./reolink.js";
 
 interface CliOptions {
   configPath: string;
@@ -121,21 +121,19 @@ function isNodeErrorWithCode(error: unknown, code: string): error is NodeJS.Errn
   return typeof error === "object" && error !== null && "code" in error && error.code === code;
 }
 
-export function formatError(error: unknown): string {
-  if (error instanceof ConfigError) {
-    return redactCredentialHosts(error.message);
+export function formatError(error: unknown, secrets: readonly string[] = []): string {
+  const message = error instanceof Error ? error.message : String(error);
+  if (secrets.length === 0 && message.includes("Unable to parse YAML")) {
+    return redactCredentialHosts(message);
   }
-
-  if (error instanceof Error) {
-    return redactCredentialHosts(error.message);
-  }
-
-  return redactCredentialHosts(String(error));
+  return redactKnownSecrets(message, secrets);
 }
 
-export async function run(argv: string[]): Promise<void> {
+export async function run(argv: string[], secrets: string[] = []): Promise<void> {
   const options = parseCliArgs(argv);
   const config = await loadArgusConfig(options.configPath);
+  secrets.push(...config.cameras.map((camera) => camera.password));
+  warnShortPasswords(config.cameras.map((camera) => camera.password));
   const generatedYaml = generateGo2RtcYaml(config);
 
   if (!options.outputPath) {
@@ -148,15 +146,16 @@ export async function run(argv: string[]): Promise<void> {
 }
 
 async function main(): Promise<void> {
+  const secrets: string[] = [];
   try {
-    await run(process.argv.slice(2));
+    await run(process.argv.slice(2), secrets);
   } catch (error) {
     if (error instanceof HelpRequested) {
       process.stdout.write(`${usage()}\n`);
       return;
     }
 
-    process.stderr.write(`${formatError(error)}\n`);
+    process.stderr.write(`${formatError(error, secrets)}\n`);
     process.exitCode = 1;
   }
 }

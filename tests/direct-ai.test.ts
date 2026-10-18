@@ -1,16 +1,17 @@
-import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, symlinkSync } from "node:fs";
+import { execFileSync, spawnSync } from "node:child_process";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { describe, expect, it, vi } from "vitest";
 
-import { formatError } from "../src/cli.js";
+import { formatError, run } from "../src/cli.js";
 import { parseArgusConfig } from "../src/config.js";
 import { buildHttpFlvUrl, buildRtspUrl } from "../src/go2rtc.js";
+import * as go2rtc from "../src/go2rtc.js";
 import { MotionMonitor, writeMotionPollError } from "../src/motion.js";
-import { ReolinkClient, ReolinkError, type ReolinkClientOptions } from "../src/reolink.js";
+import { redactCredentialHosts, redactKnownSecrets, ReolinkClient, ReolinkError, type ReolinkClientOptions } from "../src/reolink.js";
 
 const NVR_HOST = "nvr.invalid";
 const DIRECT_HOST = "direct.invalid";
@@ -125,6 +126,20 @@ async function captureStderr(run: () => Promise<unknown>): Promise<string> {
   });
   try {
     await run();
+  } finally {
+    spy.mockRestore();
+  }
+  return written.join("");
+}
+
+function captureStderrSync(run: () => void): string {
+  const written: string[] = [];
+  const spy = vi.spyOn(process.stderr, "write").mockImplementation((chunk) => {
+    written.push(String(chunk));
+    return true;
+  });
+  try {
+    run();
   } finally {
     spy.mockRestore();
   }
@@ -731,6 +746,52 @@ describe("direct AI poll", () => {
     });
   });
 
+  it("backs off direct-host re-login when GetAiState returns rspCode -6 after a fresh Login", async () => {
+    await withNoSockets(async () => {
+      let clock = 0;
+      const directLoginsAt: number[] = [];
+      const aiAt: number[] = [];
+      let nvrLogins = 0;
+      let mdPolls = 0;
+      const fetchFn = vi.fn(async (input: string | URL | Request) => {
+        const url = String(input);
+        if (url.includes(DIRECT_HOST) && url.includes("cmd=Login")) {
+          directLoginsAt.push(clock);
+          return jsonResponse([{ cmd: "Login", code: 0, value: { Token: { name: `direct-${directLoginsAt.length}`, leaseTime: 3600 } } }]);
+        }
+        if (url.includes("cmd=Login")) {
+          nvrLogins += 1;
+          return jsonResponse([{ cmd: "Login", code: 0, value: { Token: { name: "nvr", leaseTime: 3600 } } }]);
+        }
+        if (url.includes("cmd=GetMdState")) {
+          mdPolls += 1;
+          return jsonResponse([{ cmd: "GetMdState", code: 0, value: { state: 0 } }]);
+        }
+        if (url.includes(DIRECT_HOST) && url.includes("cmd=GetAiState")) {
+          aiAt.push(clock);
+          return jsonResponse([{ cmd: "GetAiState", code: 1, error: { detail: "please login first", rspCode: -6 } }]);
+        }
+        throw new Error(`unexpected ${url}`);
+      }) as unknown as typeof fetch;
+      const monitor = new MotionMonitor(configWith(DIRECT_HOST).cameras, () => {}, {
+        fetch: fetchFn,
+        now: () => clock,
+        onError: () => {},
+      });
+      for (let t = 0; t < 600_000; t += 1_000) {
+        clock = t;
+        await monitor.pollOnce();
+      }
+      expect(directLoginsAt).toEqual([
+        0, 0, 5_000, 15_000, 35_000, 75_000, 135_000, 195_000, 255_000, 315_000, 375_000, 435_000, 495_000, 555_000,
+      ]);
+      expect(aiAt).toEqual(directLoginsAt);
+      expect(directLoginsAt.length).toBeLessThanOrEqual(15);
+      expect(nvrLogins).toBe(1);
+      expect(mdPolls).toBe(600);
+    });
+  });
+
   it("retries NVR Login on the next poll and detects motion within 2s of a 120s outage", async () => {
     await withNoSockets(async () => {
       const recoveredAt = 120_000;
@@ -938,7 +999,7 @@ describe("direct AI poll", () => {
       const client = new ReolinkClient({
         host: NVR_HOST,
         username: DIRECT_USER,
-        password: DIRECT_PASSWORD,
+        password: REDACTION_SECRET,
         fetch: fetchFn,
       });
       let caught: unknown;
@@ -959,7 +1020,7 @@ describe("direct AI poll", () => {
       return true;
     });
     try {
-      writeMotionPollError("Front L", new Error(credentialSample()));
+      writeMotionPollError("Front L", new Error(credentialSample()), [REDACTION_SECRET]);
     } finally {
       spy.mockRestore();
     }
@@ -969,8 +1030,8 @@ describe("direct AI poll", () => {
   });
 
   it("redacts URL userinfo in formatError and keeps an email", () => {
-    expectUserinfoRedacted(formatError(new Error(credentialSample())));
-    expectUserinfoRedacted(formatError(credentialSample()));
+    expectUserinfoRedacted(formatError(new Error(credentialSample()), [REDACTION_SECRET]));
+    expectUserinfoRedacted(formatError(credentialSample(), [REDACTION_SECRET]));
   });
 
   it("keeps a cameras[].host password with @, /, or a space off stderr", async () => {
@@ -999,11 +1060,455 @@ describe("direct AI poll", () => {
     for (const separator of ["@", "/", " "]) {
       const password = `${PASSWORD_LEFT}${separator}${PASSWORD_RIGHT}`;
       const text = `connect failed for http://admin:${password}@direct.invalid/cgi-bin/api.cgi and admin:${password}@direct.invalid`;
-      const stderr = await captureStderr(async () => writeMotionPollError("Front L", new Error(text)));
-      for (const output of [stderr, formatError(new Error(text)), formatError(text)]) {
+      const stderr = await captureStderr(async () => writeMotionPollError("Front L", new Error(text), [password]));
+      for (const output of [stderr, formatError(new Error(text), [password]), formatError(text, [password])]) {
         expect(output, separator).not.toContain(PASSWORD_LEFT);
         expect(output, separator).not.toContain(PASSWORD_RIGHT);
-        expect(output, separator).toContain("http://direct.invalid/cgi-bin/api.cgi and direct.invalid");
+        expect(output, separator).toContain("http://admin:***@direct.invalid/cgi-bin/api.cgi and admin:***@direct.invalid");
+      }
+    }
+  });
+
+  it("keeps every fail() line byte-identical when the host has a port and when it does not", async () => {
+    const hosts = [
+      "192.0.2.10",
+      "192.0.2.10:80",
+      "nvr.lan",
+      "nvr.lan:8000",
+      "nvr.invalid",
+      "nvr.invalid:80",
+      "localhost",
+      "localhost:80",
+      "[2001:db8::10]",
+      "[2001:db8::10]:80",
+      "[fe80::1%en0]:80",
+      "[::1]",
+      "[::1]:80",
+      "[fe80::1]",
+      "[fe80::1]:554",
+    ];
+    const kinds = [
+      "login-detail",
+      "login-http",
+      "login-refused",
+      "login-timeout",
+      "login-abort",
+      "login-backoff",
+      "md",
+      "ai",
+      "ai-backoff",
+      "empty",
+      "no-token",
+    ];
+    const lines: Array<{ host: string; kind: string; message: string }> = [];
+    await withNoSockets(async () => {
+      for (const host of hosts) {
+        for (const kind of kinds) {
+          lines.push({ host, kind, message: await failMessage(host, kind) });
+        }
+      }
+    });
+    const expected: Record<string, (host: string) => string> = {
+      "login-detail": (host) => `Login on ${host} failed: rspCode -6 (please login first)`,
+      "login-http": (host) => `Login on ${host} failed: HTTP 500`,
+      "login-refused": (host) => `Login on ${host} fetch failed: ECONNREFUSED`,
+      "login-timeout": (host) => `Login on ${host} fetch failed: ETIMEDOUT`,
+      "login-abort": (host) => `Login on ${host} fetch failed: 23`,
+      "login-backoff": (host) => `Login on ${host} failed: backing off`,
+      md: (host) => `GetMdState ch2 on ${host} failed: rspCode -6 (please login first)`,
+      ai: (host) => `GetAiState ch0 on ${host} failed: busy`,
+      "ai-backoff": (host) => `GetAiState ch0 on ${host} failed: backing off`,
+      empty: (host) => `Login on ${host}: empty response`,
+      "no-token": (host) => `Login on ${host}: no token in response`,
+    };
+    const mismatches: string[] = [];
+    for (const line of lines) {
+      const template = expected[line.kind]!(line.host);
+      const bareHost = line.host.slice(line.host.lastIndexOf("@") + 1);
+      const want = await mainRedact(template.replaceAll(line.host, bareHost));
+      if (line.message !== want) {
+        mismatches.push(`${line.kind} ${line.host}\n  got  ${JSON.stringify(line.message)}\n  want ${JSON.stringify(want)}`);
+      }
+      const formatted = formatError(line.message);
+      if (formatted !== want) {
+        mismatches.push(`formatError ${line.kind} ${line.host}\n  got  ${JSON.stringify(formatted)}\n  want ${JSON.stringify(want)}`);
+      }
+    }
+    const frame = "host: 192.0.2.10:80: x: y";
+    const wrapped = `Unable to parse YAML at bad.yaml: ${frame}`;
+    if (redactCredentialHosts(frame) !== (await mainRedact(frame))) {
+      mismatches.push(`code frame\n  got  ${JSON.stringify(redactCredentialHosts(frame))}\n  want ${JSON.stringify(await mainRedact(frame))}`);
+    }
+    if (formatError(wrapped) !== (await mainRedact(wrapped))) {
+      mismatches.push(`yaml frame\n  got  ${JSON.stringify(formatError(wrapped))}\n  want ${JSON.stringify(await mainRedact(wrapped))}`);
+    }
+    expect(mismatches).toEqual([]);
+    const host = "192.0.2.10:80";
+    const stderr = await captureStderr(() =>
+      withNoSockets(async () => {
+        const fetchFn = vi.fn(async () => {
+          throw Object.assign(new TypeError("fetch failed"), { cause: { code: "ECONNREFUSED" } });
+        }) as unknown as typeof fetch;
+        const monitor = new MotionMonitor(configWith(undefined, host).cameras, () => {}, {
+          fetch: fetchFn,
+          onError: writeMotionPollError,
+        });
+        await monitor.pollOnce();
+      }),
+    );
+    expect(stderr).toBe(`[argus Front L] motion poll error: Login on ${host} fetch failed: ECONNREFUSED\n`);
+  });
+
+  it("keeps short-password fail() lines identical to main and writes *** only in userinfo", async () => {
+    const passwords = ["1", "a", "80", "on", "Login", "admin", "p/a ssPW", "p?a ssPW", "p#a ssPW"];
+    const hosts = [
+      "192.0.2.10",
+      "192.0.2.10:80",
+      "192.0.2.20:80",
+      "nvr.lan",
+      "nvr.lan:8000",
+      "nvr.invalid",
+      "nvr.invalid:80",
+      "localhost",
+      "localhost:80",
+      "[2001:db8::10]",
+      "[2001:db8::10]:80",
+      "[2001:db8::1]:8000",
+      "[fe80::1%en0]:80",
+      "[::1]",
+      "[::1]:80",
+      "[fe80::1]",
+      "[fe80::1]:554",
+    ];
+    const kinds = [
+      "login-detail",
+      "login-http",
+      "login-refused",
+      "login-timeout",
+      "login-abort",
+      "login-backoff",
+      "md",
+      "ai",
+      "ai-backoff",
+      "empty",
+      "no-token",
+    ];
+    const templateFor = failTemplate();
+    const mismatches: string[] = [];
+    let overflow = 0;
+    const check = (label: string, got: string, want: string): void => {
+      if (got === want) return;
+      if (mismatches.length < 8) mismatches.push(`${label}\n  got  ${JSON.stringify(got)}\n  want ${JSON.stringify(want)}`);
+      else overflow += 1;
+    };
+    check(
+      "port 80",
+      redactKnownSecrets("192.0.2.20:80", ["80"]),
+      "192.0.2.20:80",
+    );
+    check(
+      "word on",
+      redactKnownSecrets("Login on 192.0.2.10 failed: HTTP 500", ["on"]),
+      "Login on 192.0.2.10 failed: HTTP 500",
+    );
+    check(
+      "letter a",
+      redactKnownSecrets("failed", ["a"]),
+      "failed",
+    );
+    check(
+      "userinfo 80",
+      redactKnownSecrets("http://admin:80@192.0.2.20/x", ["80"]),
+      "http://admin:***@192.0.2.20/x",
+    );
+    check(
+      "userinfo on",
+      redactKnownSecrets("admin:on@192.0.2.10", ["on"]),
+      "admin:***@192.0.2.10",
+    );
+    check(
+      "admin inside a word",
+      redactKnownSecrets("administrator", ["admin"]),
+      "administrator",
+    );
+    check(
+      "Login token",
+      redactKnownSecrets("Login on host failed: please login first", ["Login"]),
+      "*** on host failed: please login first",
+    );
+    await withNoSockets(async () => {
+      for (const password of passwords) {
+        for (const host of hosts) {
+          const bare = host.slice(host.lastIndexOf("@") + 1);
+          const encoded = encodeURIComponent(password);
+          const userinfo = `http://admin:${encoded}@${bare}/x admin:${password}@${bare}`;
+          const userinfoWant = password === "admin"
+            ? `http://***:***@${bare}/x ***:***@${bare}`
+            : `http://admin:***@${bare}/x admin:***@${bare}`;
+          check(`userinfo ${password} ${host}`, redactKnownSecrets(userinfo, [password]), userinfoWant);
+          check(`format userinfo ${password} ${host}`, formatError(userinfo, [password]), userinfoWant);
+          const loginWant: Record<string, string> = {
+            "login-detail": `*** on ${host} failed: rspCode -6 (please login first)`,
+            "login-http": `*** on ${host} failed: HTTP 500`,
+            "login-refused": `*** on ${host} fetch failed: ECONNREFUSED`,
+            "login-timeout": `*** on ${host} fetch failed: ETIMEDOUT`,
+            "login-abort": `*** on ${host} fetch failed: 23`,
+            "login-backoff": `*** on ${host} failed: backing off`,
+            md: `GetMdState ch2 on ${host} failed: rspCode -6 (please login first)`,
+            ai: `GetAiState ch0 on ${host} failed: busy`,
+            "ai-backoff": `GetAiState ch0 on ${host} failed: backing off`,
+            empty: `*** on ${host}: empty response`,
+            "no-token": `*** on ${host}: no token in response`,
+          };
+          for (const kind of kinds) {
+            const template = templateFor[kind]!(host);
+            const want = password === "Login" ? loginWant[kind]! : await mainRedact(template);
+            check(`fail ${password} ${kind} ${host}`, await failMessage(host, kind, password, 5), want);
+            check(`format ${password} ${kind} ${host}`, formatError(template, [password]), want);
+          }
+        }
+      }
+    });
+    expect(mismatches, `${overflow} more`).toEqual([]);
+  }, 60_000);
+
+  it("keeps host: [2001:db8::1]:8000: x intact in a YAML frame", async () => {
+    const frame = "host: [2001:db8::1]:8000: x";
+    const wrapped = `Unable to parse YAML at bad.yaml: ${frame}`;
+    expect(redactCredentialHosts(frame)).toBe(frame);
+    expect(formatError(wrapped)).toBe(wrapped);
+    expect(await mainRedact(wrapped)).toBe(wrapped);
+  });
+
+  it("keeps the host and the next token for admin:pw@a.b c@d in a YAML frame", async () => {
+    const frame = "admin:pw@a.b c@d";
+    const wrapped = `Unable to parse YAML at bad.yaml: ${frame}`;
+    const want = "Unable to parse YAML at bad.yaml: a.b c@d";
+    expect(redactCredentialHosts(frame)).toBe("a.b c@d");
+    expect(formatError(wrapped)).toBe(want);
+    expect(await mainRedact(wrapped)).toBe(want);
+  });
+
+  it("redacts a sentinel when CLI generation throws after password registration", async () => {
+    const sentinel = "cli-reg-sentinel";
+    const dir = mkdtempSync(join(tmpdir(), "argus-cli-reg-"));
+    const file = join(dir, "argus.yaml");
+    writeArgusYaml(file, sentinel);
+    const spy = vi.spyOn(go2rtc, "generateGo2RtcYaml").mockImplementation((config) => {
+      throw new Error(`generation failed ${config.cameras[0]?.password ?? ""}`);
+    });
+    const secrets: string[] = [];
+    let caught: unknown;
+    try {
+      await run(["--config", file], secrets);
+    } catch (error) {
+      caught = error;
+    } finally {
+      spy.mockRestore();
+      rmSync(dir, { recursive: true, force: true });
+    }
+    const formatted = formatError(caught, secrets);
+    expect(formatted).not.toContain(sentinel);
+    expect(formatted).toContain("***");
+  });
+
+  it("warns once at startup when a configured password is too short to redact in free text", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "argus-short-pw-"));
+    const file = join(dir, "argus.yaml");
+    const out = join(dir, "go2rtc.yaml");
+    const warning = "[argus] a configured password is too short to redact in free text\n";
+    const writeCameras = (passwords: string[]): void => {
+      const cameras = passwords.map((password, index) => [
+        `  - name: Camera ${index + 1}`,
+        "    aspect: \"16:9\"",
+        "    host: 192.0.2.10",
+        "    channel: 0",
+        "    mainCodec: h265",
+        "    username: admin",
+        `    password: "${password}"`,
+        "    transport: auto",
+        "    streams:",
+        "      main: main",
+        "      sub: sub",
+      ].join("\n")).join("\n");
+      writeFileSync(file, [
+        "cameras:",
+        cameras,
+        "recording:",
+        "  path: ./rec",
+        "  retention:",
+        "    continuous: 3",
+        "    motion: 7",
+        "    alerts: 30",
+        "homekit:",
+        "  pin: \"123-45-678\"",
+        "go2rtc:",
+        "  binary: ./go2rtc",
+        "  api_port: 1984",
+        "server:",
+        "  port: 8080",
+        "",
+      ].join("\n"));
+    };
+    try {
+      writeCameras(["80", "abc"]);
+      const stderr = await captureStderr(() => run(["--config", file, "--out", out]));
+      expect(stderr).toBe(warning);
+      expect(stderr).not.toContain("80");
+      expect(stderr).not.toContain("abc");
+      expect(stderr).not.toMatch(/\d/);
+      rmSync(out, { force: true });
+      writeCameras(["abcd"]);
+      expect(await captureStderr(() => run(["--config", file, "--out", out]))).toBe("");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("masks a 4-character password in free text and leaves a 3-character password raw", () => {
+    expect(redactKnownSecrets("bad password abcd here", ["abcd"])).toBe("bad password *** here");
+    expect(redactKnownSecrets("bad password abc here", ["abc"])).toBe("bad password abc here");
+  });
+
+  it("leaves superadmin intact when the password is admin", () => {
+    expect(redactKnownSecrets("superadmin", ["admin"])).toBe("superadmin");
+  });
+
+  it("masks abcd!x fully when the shorter password is configured first", () => {
+    expect(redactKnownSecrets("abcd!x", ["abcd", "abcd!x"])).toBe("***");
+  });
+
+  it("warns once from serve when a configured password is too short to redact in free text", () => {
+    const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+    const dir = mkdtempSync(join(tmpdir(), "argus-serve-short-pw-"));
+    const pidFile = join(dir, "go2rtc.pid");
+    const port = 20000 + Math.floor(Math.random() * 20000);
+    const binary = join(dir, "go2rtc.mjs");
+    writeFileSync(
+      binary,
+      [
+        "#!/usr/bin/env node",
+        "import { createServer } from 'node:http';",
+        "import { readFileSync, writeFileSync } from 'node:fs';",
+        "const configIndex = process.argv.indexOf('-config');",
+        "const config = readFileSync(process.argv[configIndex + 1], 'utf8');",
+        "const port = Number(config.match(/listen: 127\\.0\\.0\\.1:(\\d+)/)[1]);",
+        "writeFileSync(process.env.ARGUS_TEST_GO2RTC_PID, String(process.pid));",
+        "createServer((_req, res) => {",
+        "  res.writeHead(200, { 'content-type': 'application/json' });",
+        "  res.end('{}');",
+        "}).listen(port, '127.0.0.1');",
+        "",
+      ].join("\n"),
+    );
+    chmodSync(binary, 0o755);
+    const configPath = join(dir, "argus.yaml");
+    writeFileSync(
+      configPath,
+      [
+        "cameras:",
+        "  - name: Camera 1",
+        "    aspect: \"16:9\"",
+        "    host: 192.0.2.10",
+        "    channel: 0",
+        "    mainCodec: h265",
+        "    username: admin",
+        "    password: \"abc\"",
+        "    transport: auto",
+        "    streams:",
+        "      main: main",
+        "      sub: sub",
+        "  - name: Camera 2",
+        "    aspect: \"16:9\"",
+        "    host: 192.0.2.11",
+        "    channel: 0",
+        "    mainCodec: h265",
+        "    username: admin",
+        "    password: \"80\"",
+        "    transport: auto",
+        "    streams:",
+        "      main: main",
+        "      sub: sub",
+        "recording:",
+        "  path: ./rec",
+        "  retention:",
+        "    continuous: 3",
+        "    motion: 7",
+        "    alerts: 30",
+        "homekit:",
+        "  pin: \"123-45-678\"",
+        "go2rtc:",
+        `  binary: ${binary}`,
+        `  api_port: ${port}`,
+        "server:",
+        "  port: 8080",
+        "",
+      ].join("\n"),
+    );
+    const runner = join(dir, "boot.ts");
+    const serveModule = join(root, "src", "serve.ts");
+    writeFileSync(runner, `import { serveConfig } from ${JSON.stringify(serveModule)};
+async function main() {
+  await serveConfig(process.argv[2], {
+    afterGo2Rtc() {
+      throw new Error("stop after warning");
+    },
+  });
+}
+void main();
+`);
+    try {
+      const result = spawnSync(process.execPath, ["--import", "tsx", runner, configPath], {
+        cwd: root,
+        encoding: "utf8",
+        timeout: 15_000,
+        env: {
+          ...process.env,
+          ARGUS_TEST_GO2RTC_PID: pidFile,
+        },
+      });
+      expect(result.stderr).toBe(
+        "[argus] a configured password is too short to redact in free text\nstop after warning\n",
+      );
+    } finally {
+      const pidText = existsSync(pidFile) ? readFileSync(pidFile, "utf8").trim() : "";
+      const pid = Number(pidText);
+      if (Number.isInteger(pid) && pid > 0) {
+        try {
+          process.kill(pid, "SIGKILL");
+        } catch {
+          // The child already exited.
+        }
+      }
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  it("redacts a free-text password with a space and / ? # or colon-space, and keeps an email", () => {
+    const passwords = [
+      `${PASSWORD_LEFT} /${PASSWORD_RIGHT}`,
+      `${PASSWORD_LEFT} ?${PASSWORD_RIGHT}`,
+      `${PASSWORD_LEFT} #${PASSWORD_RIGHT}`,
+      `${PASSWORD_LEFT}: ${PASSWORD_RIGHT}`,
+      `my ${PASSWORD_LEFT}/${PASSWORD_RIGHT}`,
+      `my ${PASSWORD_LEFT}?${PASSWORD_RIGHT}`,
+      `my ${PASSWORD_LEFT}#${PASSWORD_RIGHT}`,
+      `my ${PASSWORD_LEFT}: ${PASSWORD_RIGHT}`,
+    ];
+    for (const password of passwords) {
+      const texts = [
+        `admin:${password}@direct.invalid ${REDACTION_EMAIL}`,
+        `http://admin:${password}@direct.invalid/cgi-bin/api.cgi ${REDACTION_EMAIL}`,
+        `admin:${password} ${REDACTION_EMAIL}`,
+      ];
+      for (const text of texts) {
+        const stderr = captureStderrSync(() => writeMotionPollError("Front L", new Error(text), [password]));
+        for (const output of [stderr, formatError(new Error(text), [password]), formatError(text, [password])]) {
+          expect(output, text).not.toContain(PASSWORD_LEFT);
+          expect(output, text).not.toContain(PASSWORD_RIGHT);
+          expect(output, text).toContain("***");
+          expect(output, text).toContain(REDACTION_EMAIL);
+        }
       }
     }
   });
@@ -1046,6 +1551,319 @@ describe("direct AI poll", () => {
     }
   }, 30_000);
 
+  it("imports src/cli.ts with no output and exit 0", () => {
+    const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+    const result = spawnSync(
+      process.execPath,
+      ["--import", "tsx", "--input-type=module", "-e", "await import('./src/cli.ts')"],
+      { cwd: root, encoding: "utf8" },
+    );
+    expect(result.stdout).toBe("");
+    expect(result.stderr).toBe("");
+    expect(result.status).toBe(0);
+  }, 30_000);
+
+  it("starts direct-host re-login backoff at 5s again after the host recovers", async () => {
+    await withNoSockets(async () => {
+      let clock = 0;
+      let reject = true;
+      const loginsAt: number[] = [];
+      const fetchFn = vi.fn(async (input: string | URL | Request) => {
+        const url = String(input);
+        if (url.includes("cmd=Login")) {
+          loginsAt.push(clock);
+          return jsonResponse([{ cmd: "Login", code: 0, value: { Token: { name: "tok", leaseTime: 1 } } }]);
+        }
+        if (url.includes("cmd=GetAiState")) {
+          if (reject) {
+            return jsonResponse([{ cmd: "GetAiState", code: 1, error: { detail: "please login first", rspCode: -6 } }]);
+          }
+          return jsonResponse([{
+            cmd: "GetAiState",
+            code: 0,
+            value: { people: { alarm_state: 0, support: 1 }, vehicle: { alarm_state: 0 }, dog_cat: { alarm_state: 0 } },
+          }]);
+        }
+        throw new Error(`unexpected ${url}`);
+      }) as unknown as typeof fetch;
+      const client = new ReolinkClient({
+        host: DIRECT_HOST,
+        username: DIRECT_USER,
+        password: DIRECT_PASSWORD,
+        fetch: fetchFn,
+        now: () => clock,
+        loginBackoff: true,
+      });
+      const poll = async (): Promise<void> => {
+        try {
+          await client.getAiState(0);
+        } catch (error) {
+          if (!(error instanceof ReolinkError)) throw error;
+        }
+      };
+      for (let t = 0; t <= 135_000; t += 1_000) {
+        clock = t;
+        await poll();
+      }
+      expect(loginsAt).toEqual([0, 0, 5_000, 15_000, 35_000, 75_000, 135_000]);
+      reject = false;
+      clock = 195_000;
+      await poll();
+      expect(loginsAt.at(-1)).toBe(195_000);
+      reject = true;
+      const restart = 225_000;
+      for (const t of [restart, restart + 1_000, restart + 5_000, restart + 15_000, restart + 35_000, restart + 75_000, restart + 135_000]) {
+        clock = t;
+        await poll();
+      }
+      expect(loginsAt).toEqual([
+        0, 0, 5_000, 15_000, 35_000, 75_000, 135_000, 195_000,
+        restart, restart, restart + 5_000, restart + 15_000, restart + 35_000, restart + 75_000, restart + 135_000,
+      ]);
+    });
+  });
+
+  it("does not back off GetAiState re-login unless loginBackoff is set", async () => {
+    await withNoSockets(async () => {
+      let clock = 0;
+      let logins = 0;
+      const fetchFn = vi.fn(async (input: string | URL | Request) => {
+        const url = String(input);
+        if (url.includes("cmd=Login")) {
+          logins += 1;
+          return jsonResponse([{ cmd: "Login", code: 0, value: { Token: { name: `t${logins}`, leaseTime: 3600 } } }]);
+        }
+        return jsonResponse([{ cmd: "GetAiState", code: 1, error: { detail: "please login first", rspCode: -6 } }]);
+      }) as unknown as typeof fetch;
+      const client = new ReolinkClient({
+        host: DIRECT_HOST,
+        username: DIRECT_USER,
+        password: DIRECT_PASSWORD,
+        fetch: fetchFn,
+        now: () => clock,
+      });
+      for (const t of [0, 1_000, 5_000]) {
+        clock = t;
+        await expect(client.getAiState(0)).rejects.toThrow(
+          `GetAiState ch0 on ${DIRECT_HOST} failed: please login first`,
+        );
+      }
+      expect(logins).toBe(4);
+    });
+  });
+
+  it("redacts tab, marker-before-space, trailing secret, and @-space passwords", () => {
+    const texts = [
+      `admin:${PASSWORD_LEFT}\t/${PASSWORD_RIGHT} ${REDACTION_EMAIL}`,
+      `admin:p/a ss${PASSWORD_RIGHT} ${REDACTION_EMAIL}`,
+      `admin:x a/b ${PASSWORD_RIGHT} ${REDACTION_EMAIL}`,
+      `admin:p@ss\tword@nvr.invalid ${REDACTION_EMAIL}`,
+      `admin:p@ss word@nvr.invalid ${REDACTION_EMAIL}`,
+    ];
+    const secrets = [
+      `${PASSWORD_LEFT}\t/${PASSWORD_RIGHT}`,
+      `p/a ss${PASSWORD_RIGHT}`,
+      `x a/b ${PASSWORD_RIGHT}`,
+      "p@ss\tword",
+      "p@ss word",
+      PASSWORD_RIGHT,
+      PASSWORD_LEFT,
+    ];
+    for (const text of texts) {
+      const stderr = captureStderrSync(() => writeMotionPollError("Front L", new Error(text), secrets));
+      for (const output of [stderr, formatError(new Error(text), secrets), formatError(text, secrets)]) {
+        expect(output, text).not.toContain(PASSWORD_LEFT);
+        expect(output, text).not.toContain(PASSWORD_RIGHT);
+        expect(output, text).not.toContain("p/a");
+        expect(output, text).not.toContain("p@ss");
+        expect(output, text).toContain("***");
+        expect(output, text).toContain(REDACTION_EMAIL);
+      }
+    }
+    expect(formatError("admin:p@ss word@nvr.invalid", ["p@ss word"])).toBe("admin:***@nvr.invalid");
+    expect(formatError(`admin:x a/b ${PASSWORD_RIGHT} extra`, [PASSWORD_RIGHT])).toBe(`admin:x a/b *** extra`);
+    const unchanged = [
+      "note: see the docs",
+      "Meet:\tsee the docs",
+      REDACTION_EMAIL,
+      "x@y",
+      "Login on 192.0.2.10:80 failed: HTTP 500",
+      "GetAiState ch0 on [fe80::1]:554 failed: backing off",
+      "host: 192.0.2.10:80",
+      "localhost:80 failed: ECONNREFUSED",
+    ];
+    for (const text of unchanged) expect(formatError(text), text).toBe(text);
+    expect(formatError(`admin:80 /${PASSWORD_RIGHT}`)).toBe(`admin:80 /${PASSWORD_RIGHT}`);
+    expect(formatError(`admin:80 /${PASSWORD_RIGHT}`, [PASSWORD_RIGHT])).toBe("admin:80 /***");
+    expect(formatError(`at 12:30 mail ${REDACTION_EMAIL}`)).toBe(`at 12:30 mail ${REDACTION_EMAIL}`);
+    expect(formatError(`Unable to parse YAML at bad.yaml: at 12:30 mail ${REDACTION_EMAIL}`)).toBe(
+      "Unable to parse YAML at bad.yaml: at example.com",
+    );
+    expect(formatError(`Unable to parse YAML at bad.yaml: admin:x a/b ${PASSWORD_RIGHT} extra`)).toBe(
+      "Unable to parse YAML at bad.yaml:  extra",
+    );
+    expect(formatError(`Unable to parse YAML at bad.yaml: admin:80 /${PASSWORD_RIGHT}`)).toContain(PASSWORD_RIGHT);
+    expect(formatError("Unable to parse YAML at bad.yaml: admin:p/a ssPW@host")).toContain("ssPW@host");
+  });
+
+  it("redacts a serve YAML parse-error code frame and keeps host:port", () => {
+    const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+    const dir = mkdtempSync(join(tmpdir(), "argus-serve-"));
+    try {
+      const file = join(dir, "bad.yaml");
+      writeFileSync(file, `items: [password: admin:${PASSWORD_LEFT} /${PASSWORD_RIGHT}, host: 192.0.2.10:80\n`);
+      const result = spawnSync(process.execPath, ["--import", "tsx", "src/serve.ts", file], {
+        cwd: root,
+        encoding: "utf8",
+        timeout: 20_000,
+      });
+      expect(result.stdout).toBe("");
+      expect(result.stderr).toContain("Unable to parse YAML");
+      expect(result.stderr).not.toContain(PASSWORD_LEFT);
+      expect(result.stderr).not.toContain(PASSWORD_RIGHT);
+      expect(result.stderr).toContain("192.0.2.10:80");
+      expect(result.status).toBe(1);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it("keeps an rtsp url with a port and a path byte-identical to main", async () => {
+    const line = "rtsp://127.0.0.1:8554/front-l: Connection refused";
+    const wrapped = `Unable to parse YAML at bad.yaml: ${line}`;
+    expect(formatError(line)).toBe(await mainRedact(line));
+    expect(formatError(wrapped)).toBe(await mainRedact(wrapped));
+    expect(await mainRedact(line)).toBe(line);
+  });
+
+  it("replaces a configured password when a marker sits before a space", async () => {
+    await withNoSockets(async () => {
+      for (const password of ["p/a ssPW", "p?a ssPW", "p#a ssPW"]) {
+        const message = await passwordFailure(password, `admin:${password}@host`);
+        expect(message, password).not.toContain("ssPW");
+        expect(message, password).not.toContain(password);
+        expect(message, password).toContain("***");
+      }
+      const password = "p/a ssPW";
+      const encoded = encodeURIComponent(password);
+      const message = await passwordFailure(password, `encoded ${encoded}`);
+      expect(message).not.toContain(encoded);
+      expect(message).toContain("***");
+    });
+  });
+
+  it("exits 1 when startup throws after go2rtc has started", () => {
+    const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+    const dir = mkdtempSync(join(tmpdir(), "argus-startup-"));
+    const pidFile = join(dir, "go2rtc.pid");
+    const password = "startup-secret";
+    const port = 20000 + Math.floor(Math.random() * 20000);
+    const binary = join(dir, "go2rtc.mjs");
+    writeFileSync(
+      binary,
+      [
+        "#!/usr/bin/env node",
+        "import { createServer } from 'node:http';",
+        "import { readFileSync, writeFileSync } from 'node:fs';",
+        "const configIndex = process.argv.indexOf('-config');",
+        "const config = readFileSync(process.argv[configIndex + 1], 'utf8');",
+        "const port = Number(config.match(/listen: 127\\.0\\.0\\.1:(\\d+)/)[1]);",
+        "writeFileSync(process.env.ARGUS_TEST_GO2RTC_PID, String(process.pid));",
+        "createServer((_req, res) => {",
+        "  res.writeHead(200, { 'content-type': 'application/json' });",
+        "  res.end('{}');",
+        "}).listen(port, '127.0.0.1');",
+        "",
+      ].join("\n"),
+    );
+    chmodSync(binary, 0o755);
+    const configPath = join(dir, "argus.yaml");
+    writeFileSync(
+      configPath,
+      [
+        "cameras:",
+        "  - name: Front L",
+        "    aspect: \"16:9\"",
+        "    host: 192.0.2.10",
+        "    channel: 2",
+        "    mainCodec: h265",
+        "    username: admin",
+        `    password: "${password}"`,
+        "    transport: auto",
+        "    streams:",
+        "      main: main",
+        "      sub: sub",
+        "recording:",
+        "  path: ./rec",
+        "  retention:",
+        "    continuous: 3",
+        "    motion: 7",
+        "    alerts: 30",
+        "homekit:",
+        "  pin: \"123-45-678\"",
+        "go2rtc:",
+        `  binary: ${binary}`,
+        `  api_port: ${port}`,
+        "server:",
+        "  port: 8080",
+        "",
+      ].join("\n"),
+    );
+    const runner = join(dir, "boot.ts");
+    const serveModule = join(root, "src", "serve.ts");
+    writeFileSync(runner, `import { serveConfig } from ${JSON.stringify(serveModule)};
+async function main() {
+  const configPath = process.argv[2];
+  if (!configPath) throw new Error("missing config");
+  await serveConfig(configPath, {
+    afterGo2Rtc(passwords) {
+      throw new Error(\`injected startup failure \${passwords[0] ?? ""}\`);
+    },
+  });
+}
+void main();
+`);
+    let childAlive = true;
+    try {
+      const result = spawnSync(process.execPath, ["--import", "tsx", runner, configPath], {
+        cwd: root,
+        encoding: "utf8",
+        timeout: 8_000,
+        env: {
+          ...process.env,
+          ARGUS_TEST_GO2RTC_PID: pidFile,
+        },
+      });
+      const pidText = existsSync(pidFile) ? readFileSync(pidFile, "utf8").trim() : "";
+      const pid = Number(pidText);
+      childAlive = Number.isInteger(pid) && pid > 0 ? processAlive(pid) : true;
+      expect({
+        status: result.status,
+        leaked: result.stderr.includes(password),
+        redacted: result.stderr.includes("***"),
+        message: result.stderr.includes("injected startup failure"),
+        childAlive,
+      }).toEqual({
+        status: 1,
+        leaked: false,
+        redacted: true,
+        message: true,
+        childAlive: false,
+      });
+    } finally {
+      const pidText = existsSync(pidFile) ? readFileSync(pidFile, "utf8").trim() : "";
+      const pid = Number(pidText);
+      if (Number.isInteger(pid) && pid > 0) {
+        try {
+          process.kill(pid, "SIGKILL");
+        } catch {
+          // The child already exited.
+        }
+      }
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 20_000);
+
   it("documents cameras[].directAiHost as <host> and says IPv6 is unsupported", () => {
     const root = join(dirname(fileURLToPath(import.meta.url)), "..");
     const readme = readFileSync(join(root, "README.md"), "utf8");
@@ -1057,6 +1875,7 @@ describe("direct AI poll", () => {
       .join("\n");
     expect(readmeSection).toContain("cameras[].directAiHost");
     expect(readmeSection).toContain("IPv6 is unsupported");
+    expect(readmeSection).toContain("recovery can take up to 60 seconds");
     expect(exampleComments).toContain("directAiHost: <host>");
     expect(exampleComments).toContain("IPv6 is unsupported");
   });
@@ -1067,14 +1886,198 @@ const REDACTION_EMAIL = "owner@example.com";
 const PASSWORD_LEFT = "Q7aLpha";
 const PASSWORD_RIGHT = "Z9bEta";
 
+function failTemplate(): Record<string, (host: string) => string> {
+  return {
+    "login-detail": (host) => `Login on ${host} failed: rspCode -6 (please login first)`,
+    "login-http": (host) => `Login on ${host} failed: HTTP 500`,
+    "login-refused": (host) => `Login on ${host} fetch failed: ECONNREFUSED`,
+    "login-timeout": (host) => `Login on ${host} fetch failed: ETIMEDOUT`,
+    "login-abort": (host) => `Login on ${host} fetch failed: 23`,
+    "login-backoff": (host) => `Login on ${host} failed: backing off`,
+    md: (host) => `GetMdState ch2 on ${host} failed: rspCode -6 (please login first)`,
+    ai: (host) => `GetAiState ch0 on ${host} failed: busy`,
+    "ai-backoff": (host) => `GetAiState ch0 on ${host} failed: backing off`,
+    empty: (host) => `Login on ${host}: empty response`,
+    "no-token": (host) => `Login on ${host}: no token in response`,
+  };
+}
+
+function writeArgusYaml(file: string, password: string): void {
+  writeFileSync(file, [
+    "cameras:",
+    "  - name: Front L",
+    "    aspect: \"16:9\"",
+    "    host: 192.0.2.10",
+    "    channel: 0",
+    "    mainCodec: h265",
+    "    username: admin",
+    `    password: "${password}"`,
+    "    transport: auto",
+    "    streams:",
+    "      main: main",
+    "      sub: sub",
+    "recording:",
+    "  path: ./rec",
+    "  retention:",
+    "    continuous: 3",
+    "    motion: 7",
+    "    alerts: 30",
+    "homekit:",
+    "  pin: \"123-45-678\"",
+    "go2rtc:",
+    "  binary: ./go2rtc",
+    "  api_port: 1984",
+    "server:",
+    "  port: 8080",
+    "",
+  ].join("\n"));
+}
+
+async function failMessage(host: string, kind: string, password = DIRECT_PASSWORD, abortMs = 20): Promise<string> {
+  let clock = 0;
+  const fetchFn = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+    if (kind === "login-http") {
+      return { ok: false, status: 500, json: async () => [] } as unknown as Response;
+    }
+    if (kind === "login-refused") {
+      throw Object.assign(new TypeError("fetch failed"), { cause: { code: "ECONNREFUSED" } });
+    }
+    if (kind === "login-timeout") {
+      throw Object.assign(new TypeError("fetch failed"), { cause: { code: "ETIMEDOUT" } });
+    }
+    if (kind === "login-abort") {
+      await new Promise<void>((_resolve, reject) => {
+        const signal = init?.signal;
+        if (!signal) {
+          reject(new Error("missing abort signal"));
+          return;
+        }
+        const fail = (): void => {
+          reject(Object.assign(new TypeError("fetch failed"), { cause: signal.reason }));
+        };
+        if (signal.aborted) fail();
+        else signal.addEventListener("abort", fail, { once: true });
+      });
+    }
+    if (kind === "login-detail" || kind === "login-backoff") {
+      return jsonResponse([{ cmd: "Login", code: 1, error: { detail: "rspCode -6 (please login first)", rspCode: -6 } }]);
+    }
+    if (kind === "empty") {
+      return { ok: true, status: 200, json: async () => [] } as unknown as Response;
+    }
+    if (kind === "no-token") {
+      return jsonResponse([{ cmd: "Login", code: 0, value: { Token: { leaseTime: 3600 } } }]);
+    }
+    const url = String(_input);
+    if (url.includes("cmd=Login")) {
+      return jsonResponse([{ cmd: "Login", code: 0, value: { Token: { name: "tok", leaseTime: 3600 } } }]);
+    }
+    if (kind === "md") {
+      return jsonResponse([{ cmd: "GetMdState", code: 1, error: { detail: "rspCode -6 (please login first)", rspCode: -6 } }]);
+    }
+    if (kind === "ai-backoff") {
+      return jsonResponse([{ cmd: "GetAiState", code: 1, error: { detail: "please login first", rspCode: -6 } }]);
+    }
+    return jsonResponse([{ cmd: "GetAiState", code: 1, error: { detail: "busy", rspCode: -5 } }]);
+  }) as unknown as typeof fetch;
+  const loginBackoff = kind === "login-backoff" || kind === "ai-backoff";
+  const client = new ReolinkClient({
+    host,
+    username: DIRECT_USER,
+    password,
+    fetch: fetchFn,
+    now: () => clock,
+    ...(kind === "login-abort" ? { requestTimeoutMs: abortMs } : {}),
+    ...(loginBackoff ? { loginBackoff: true } : {}),
+  });
+  const run = async (): Promise<void> => {
+    if (kind === "md") {
+      await client.getMdState(2);
+      return;
+    }
+    if (kind === "ai" || kind === "ai-backoff") {
+      await client.getAiState(0);
+      return;
+    }
+    await client.ensureToken();
+  };
+  const once = async (): Promise<string> => {
+    try {
+      await run();
+    } catch (error) {
+      return error instanceof Error ? error.message : String(error);
+    }
+    throw new Error(`${kind} on ${host} did not fail`);
+  };
+  const first = await once();
+  if (kind !== "login-backoff" && kind !== "ai-backoff") return first;
+  clock = 1_000;
+  if (kind === "ai-backoff") {
+    try {
+      await client.getAiState(0);
+    } catch (error) {
+      return error instanceof Error ? error.message : String(error);
+    }
+    throw new Error(`ai-backoff on ${host} did not fail on the second poll`);
+  }
+  try {
+    await client.ensureToken();
+  } catch (error) {
+    return error instanceof Error ? error.message : String(error);
+  }
+  throw new Error(`login-backoff on ${host} did not fail on the second poll`);
+}
+
+const MAIN_REDACT_COMMIT = "aaaef4fe94fa35cf81e6ddbbda12789cbfc4a532";
+let mainRedactFn: ((text: string) => string) | undefined;
+
+async function mainRedact(text: string): Promise<string> {
+  if (!mainRedactFn) {
+    const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+    const dir = mkdtempSync(join(tmpdir(), "argus-main-reolink-"));
+    const file = join(dir, "reolink.ts");
+    writeFileSync(file, execFileSync("git", ["show", `${MAIN_REDACT_COMMIT}:src/reolink.ts`], { cwd: root }));
+    const loaded = await import(pathToFileURL(file).href) as { redactCredentialHosts: (value: string) => string };
+    mainRedactFn = loaded.redactCredentialHosts;
+  }
+  return mainRedactFn(text);
+}
+
+async function passwordFailure(password: string, detail: string): Promise<string> {
+  const fetchFn = vi.fn(async () => {
+    throw new Error(detail);
+  }) as unknown as typeof fetch;
+  const client = new ReolinkClient({
+    host: "nvr.lan",
+    username: "admin",
+    password,
+    fetch: fetchFn,
+  });
+  try {
+    await client.ensureToken();
+  } catch (error) {
+    return error instanceof Error ? error.message : String(error);
+  }
+  throw new Error("password failure did not throw");
+}
+
+function processAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function credentialSample(): string {
   return `connect failed for http://admin:${REDACTION_SECRET}@direct.invalid/cgi-bin/api.cgi admin:${REDACTION_SECRET}@direct.invalid ${REDACTION_EMAIL} x@y`;
 }
 
 function expectUserinfoRedacted(text: string): void {
   expect(text).not.toContain(REDACTION_SECRET);
-  expect(text).not.toContain(`admin:${REDACTION_SECRET}@`);
-  expect(text).toContain("http://direct.invalid/cgi-bin/api.cgi");
+  expect(text).toContain("admin:***@direct.invalid");
+  expect(text).toContain("http://admin:***@direct.invalid/cgi-bin/api.cgi");
   expect(text).toContain(REDACTION_EMAIL);
   expect(text).toContain("x@y");
 }

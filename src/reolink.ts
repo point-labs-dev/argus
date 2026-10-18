@@ -18,15 +18,200 @@ const BARE_USERINFO = new RegExp(
   String.raw`(^|[\s"'<>()[\]{}=,;])[^\s/:@"'<>()[\]{}=,;]+:(?!\/\/)(?=\S)${USERINFO}${AT_HOST}`,
   "g",
 );
+const MARKED_INTRO = new RegExp(
+  String.raw`([a-z][a-z0-9+.-]*:\/\/)([^\s/:@]+):(?!\/\/)|(^|[\s"'<>()[\]{}=,;])([^\s/:@"'<>()[\]{}=,;]+):(?!\/\/)(?=\S)`,
+  "gi",
+);
+
+const HOST_PORT = /^\d{1,5}(?=$|[\s:/])/;
+const HOSTNAME = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$/;
+const IPV4 = /^(?:\d{1,3}\.){3}\d{1,3}$/;
+
+const WORD_CHAR = /[A-Za-z0-9]/;
+
+function isWordChar(char: string | undefined): boolean {
+  return char !== undefined && WORD_CHAR.test(char);
+}
+
+function replaceWhere(text: string, needle: string, accept: (value: string, index: number) => boolean): string {
+  if (needle.length === 0) return text;
+  let out = "";
+  let cursor = 0;
+  let from = 0;
+  while (from <= text.length - needle.length) {
+    const found = text.indexOf(needle, from);
+    if (found < 0) break;
+    if (accept(text, found)) {
+      out += text.slice(cursor, found) + "***";
+      cursor = found + needle.length;
+      from = cursor;
+    } else {
+      from = found + 1;
+    }
+  }
+  return out + text.slice(cursor);
+}
 
 /**
- * Drop URL userinfo so a host string cannot carry a password into a log line.
- * `user:password@host` and `scheme://userinfo@host` are stripped through the last `@`
- * before the host, so the password may contain `@`, `/`, or a space.
- * A bare `user@host` (an email, or `x@y`) is left alone.
+ * Replace each known password, and its URL-encoded form, with `***`.
+ * A password of 4 or more characters is replaced only when neither side touches a letter or digit.
+ * A shorter password is replaced only in userinfo, where it sits between `:` and `@`.
+ * Longer secrets go first so a short one cannot split a longer one.
+ */
+export function redactKnownSecrets(text: string, secrets: readonly string[]): string {
+  const items: Array<{ needle: string; short: boolean }> = [];
+  const seen = new Set<string>();
+  for (const secret of secrets) {
+    if (secret.length === 0) continue;
+    const short = secret.length < 4;
+    for (const needle of [secret, encodeURIComponent(secret)]) {
+      const key = `${short ? "s" : "l"}\0${needle}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      items.push({ needle, short });
+    }
+  }
+  items.sort((left, right) => right.needle.length - left.needle.length || Number(left.short) - Number(right.short));
+  let out = text;
+  for (const item of items) {
+    out = replaceWhere(out, item.needle, (value, index) => {
+      if (item.short) return value[index - 1] === ":" && value[index + item.needle.length] === "@";
+      return !isWordChar(value[index - 1]) && !isWordChar(value[index + item.needle.length]);
+    });
+  }
+  return out;
+}
+
+/** One startup line when a configured password is too short to redact in free text. */
+export function warnShortPasswords(passwords: readonly string[]): void {
+  if (passwords.some((password) => password.length > 0 && password.length < 4)) {
+    process.stderr.write("[argus] a configured password is too short to redact in free text\n");
+  }
+}
+
+/**
+ * Redact a YAML parse error before the config is loaded, so the password is not a known value yet.
+ * A host and port is left as written, including a port before `:`, `/`, whitespace, or the end of the text.
+ * Bracketed IPv6 is left as written, including a zone id and a `]:` that follows the address.
+ * A `/`, `?`, or `#` still marks a password in this frame. One token after that mark is removed.
+ * `admin:80 /secret` stays. `at 12:30 mail owner@example.com` becomes `at example.com`.
+ * A second word after the marked token stays. `admin:p/a ssPW@host` still leaves ` ssPW@host`.
  */
 export function redactCredentialHosts(text: string): string {
-  return text.replace(SCHEME_USERINFO, "$1").replace(BARE_USERINFO, "$1");
+  const marked = redactMarkedPasswords(text);
+  return marked.replace(SCHEME_USERINFO, "$1").replace(BARE_USERINFO, "$1");
+}
+
+function isHostPortIntro(text: string, colonIndex: number, user: string): boolean {
+  if (colonInsideIpv6(text, colonIndex)) return true;
+  if (!HOST_PORT.test(text.slice(colonIndex + 1))) return false;
+  if (IPV4.test(user) || HOSTNAME.test(user)) return true;
+  return false;
+}
+
+function colonInsideIpv6(text: string, colonIndex: number): boolean {
+  const open = text.lastIndexOf("[", colonIndex);
+  if (open < 0 || text.lastIndexOf("]", colonIndex) > open) return false;
+  const close = text.indexOf("]", colonIndex);
+  if (close < 0) return false;
+  const body = text.slice(open + 1, close);
+  if (!/^[0-9A-Fa-f:.]+(?:%[0-9A-Za-z._~-]+)?$/.test(body)) return false;
+  const after = text[close + 1];
+  if (after === undefined || after === ":" || /\s/.test(after)) return true;
+  return HOST_PORT.test(text.slice(close + 2));
+}
+
+function findLastAtHost(value: string): number {
+  const matcher = new RegExp(AT_HOST, "g");
+  let last = -1;
+  for (const match of value.matchAll(matcher)) {
+    last = match.index ?? last;
+  }
+  return last;
+}
+
+function isGap(char: string | undefined): boolean {
+  return char === " " || char === "\t";
+}
+
+function isLineBreak(char: string | undefined): boolean {
+  return char !== undefined && /\s/.test(char) && !isGap(char);
+}
+
+interface MarkedToken {
+  text: string;
+  start: number;
+  end: number;
+}
+
+function markedTokens(rest: string): MarkedToken[] {
+  const tokens: MarkedToken[] = [];
+  let index = 0;
+  while (index < rest.length && !isLineBreak(rest[index])) {
+    if (isGap(rest[index])) {
+      index += 1;
+      continue;
+    }
+    const start = index;
+    while (index < rest.length && !isGap(rest[index]) && !isLineBreak(rest[index])) index += 1;
+    tokens.push({ text: rest.slice(start, index), start, end: index });
+  }
+  return tokens;
+}
+
+function tokenHasMarker(token: string): boolean {
+  return token.includes("/") || token.includes("?") || token.includes("#");
+}
+
+function takeMarkedPassword(rest: string): string | null {
+  const tokens = markedTokens(rest);
+  let marked = -1;
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = tokens[index]!;
+    const slice = rest.slice(0, token.end);
+    if (tokenHasMarker(token.text) || slice.includes(": ") || slice.includes(":\t")) {
+      marked = index;
+      break;
+    }
+  }
+  if (marked >= 0) {
+    const next = tokens[marked + 1];
+    const end = next && !next.text.includes("@") ? next.end : tokens[marked]!.end;
+    return rest.slice(0, end);
+  }
+  const firstHost = hostAfterLastAt(tokens[0]?.text ?? "");
+  if (firstHost.includes(".")) return null;
+  for (const token of tokens) {
+    const gapBefore = token.start > 0 && isGap(rest[token.start - 1]);
+    if (gapBefore && token.text.includes("@")) return rest.slice(0, token.end);
+  }
+  return null;
+}
+
+function hostAfterLastAt(token: string): string {
+  const at = token.lastIndexOf("@");
+  if (at < 0) return "";
+  return token.slice(at + 1).split(/[/?#]/)[0] ?? "";
+}
+
+function redactMarkedPasswords(text: string): string {
+  const matcher = new RegExp(MARKED_INTRO.source, MARKED_INTRO.flags);
+  let out = "";
+  let cursor = 0;
+  for (const match of text.matchAll(matcher)) {
+    const start = match.index ?? 0;
+    if (start < cursor) continue;
+    const keep = match[1] ?? match[3] ?? "";
+    const user = match[2] ?? match[4] ?? "";
+    const passwordStart = start + match[0].length;
+    if (isHostPortIntro(text, passwordStart - 1, user)) continue;
+    const marked = takeMarkedPassword(text.slice(passwordStart));
+    if (marked === null) continue;
+    const at = findLastAtHost(marked);
+    out += text.slice(cursor, start) + keep;
+    cursor = passwordStart + (at >= 0 ? at + 1 : marked.length);
+  }
+  return out + text.slice(cursor);
 }
 
 export interface ReolinkClientOptions {
@@ -80,6 +265,12 @@ export class ReolinkClient {
   private loginBackoffMs = 0;
   /** Earliest `now()` at which Login may run again. 0 means it is not backing off. */
   private nextLoginAt = 0;
+  /** True after GetAiState rejects a token that Login just issued. */
+  private freshTokenRejected = false;
+  /** Delay before another direct-host Login after that rejection. 0 means the next one is immediate. */
+  private freshAiRejectBackoffMs = 0;
+  /** Earliest `now()` at which that direct-host Login may run again. */
+  private nextFreshAiAttemptAt = 0;
   /** undefined = not probed; false = GetAiState unsupported here (e.g. via the NVR). */
   private aiSupported: boolean | undefined;
   /** Delay before `getMotionState` asks GetAiState again. 0 means it asks on the next call. */
@@ -94,11 +285,12 @@ export class ReolinkClient {
     this.now = options.now ?? (() => Date.now());
   }
 
-  /** Messages name the configured host, so strip its userinfo here, even a bare `user@` that text redaction keeps. */
+  /** The configured host and password are known here, so replace those values instead of matching shapes. */
   private fail(message: string): never {
     const host = this.options.host;
     const bareHost = host.slice(host.lastIndexOf("@") + 1);
-    throw new ReolinkError(redactCredentialHosts(message.replaceAll(host, bareHost)));
+    const stripped = message.replaceAll(host, bareHost);
+    throw new ReolinkError(redactKnownSecrets(stripped, [this.options.password]));
   }
 
   private async call(cmd: string, param: Record<string, unknown>, token?: string): Promise<ReolinkResponse> {
@@ -179,6 +371,14 @@ export class ReolinkClient {
     this.nextLoginAt = this.now() + delay;
   }
 
+  private scheduleFreshAiRejectBackoff(): void {
+    const delay = this.freshAiRejectBackoffMs === 0
+      ? LOGIN_BACKOFF_START_MS
+      : Math.min(this.freshAiRejectBackoffMs * 2, LOGIN_BACKOFF_MAX_MS);
+    this.freshAiRejectBackoffMs = delay;
+    this.nextFreshAiAttemptAt = this.now() + delay;
+  }
+
   private scheduleAiProbeBackoff(): void {
     const delay = this.aiProbeBackoffMs === 0
       ? AI_PROBE_BACKOFF_START_MS
@@ -209,6 +409,8 @@ export class ReolinkClient {
   /**
    * AI person/vehicle/animal alarm (GetAiState).
    * rspCode -6 (expired token): log in again and retry this request once.
+   * With `loginBackoff`, rspCode -6 on the token Login just issued backs off that re-login
+   * from 5s, doubling to 60s, and skips GetAiState until the wait ends.
    * rspCode -99: this host does not support GetAiState; later calls skip the request.
    * Any other failure is thrown so the poll can surface it.
    */
@@ -216,12 +418,25 @@ export class ReolinkClient {
     if (this.aiSupported === false) {
       return false;
     }
+    if (this.nextFreshAiAttemptAt !== 0 && this.now() < this.nextFreshAiAttemptAt) {
+      this.fail(`GetAiState ch${channel} on ${this.options.host} failed: backing off`);
+    }
+    const tokenWasCached = this.token !== undefined && this.now() < this.tokenExpiresAt;
     let token = await this.ensureToken();
     let ai = await this.call("GetAiState", { channel }, token);
     if (ai.code !== 0 && ai.error?.rspCode === -6) {
       this.token = undefined;
-      token = await this.ensureToken();
-      ai = await this.call("GetAiState", { channel }, token);
+      const blockRelogin = this.freshTokenRejected && !tokenWasCached;
+      if (!blockRelogin) {
+        token = await this.ensureToken();
+        ai = await this.call("GetAiState", { channel }, token);
+      }
+      if (ai.code !== 0 && ai.error?.rspCode === -6 && this.options.loginBackoff === true) {
+        this.token = undefined;
+        this.freshTokenRejected = true;
+        this.scheduleFreshAiRejectBackoff();
+        this.fail(`GetAiState ch${channel} on ${this.options.host} failed: ${ai.error.detail ?? `code ${ai.code}`}`);
+      }
     }
     if (ai.code !== 0 && ai.error?.rspCode === -99) {
       this.aiSupported = false;
@@ -230,6 +445,9 @@ export class ReolinkClient {
     if (ai.code !== 0 || !ai.value) {
       this.fail(`GetAiState ch${channel} on ${this.options.host} failed: ${ai.error?.detail ?? `code ${ai.code}`}`);
     }
+    this.freshTokenRejected = false;
+    this.freshAiRejectBackoffMs = 0;
+    this.nextFreshAiAttemptAt = 0;
     this.aiSupported = true;
     return aiAlarmed(ai.value);
   }
