@@ -11,7 +11,7 @@ import { loadArgusConfig, type ArgusConfig } from "./config.js";
 import { buildGo2RtcStreamNames } from "./go2rtc.js";
 import { startGo2Rtc, type Go2RtcSupervisor } from "./go2rtc-supervisor.js";
 import { createCameraAccessory, getHapBindAddress } from "./homekit.js";
-import { MotionMonitor, writeMotionPollError } from "./motion.js";
+import { MotionMonitor, writeMotionPollError, type MotionEdge } from "./motion.js";
 import { parseJpegDimensions, SnapshotCache } from "./snapshot-cache.js";
 import { emitTelemetry } from "./telemetry.js";
 
@@ -81,7 +81,7 @@ export async function startArgusServer(config: ArgusConfig, configDir = process.
   );
 
   const streamNames = buildGo2RtcStreamNames(config.cameras);
-  const setMotionByCamera = new Map<string, (detected: boolean) => void>();
+  const setMotionByCamera = new Map<string, (detected: boolean, edge?: MotionEdge) => void>();
   
   // Get HAP bind address for interface pinning (dual-NIC safety + prepareStream addressOverride).
   // camera-ffmpeg pattern: HAP advertise + ffmpeg localaddr + RTCP bind = same IP.
@@ -138,8 +138,12 @@ export async function startArgusServer(config: ArgusConfig, configDir = process.
   // Drive the HomeKit motion sensors from the Reolink motion API.
   const motion = new MotionMonitor(
     config.cameras,
-    (cameraName, detected) => {
-      setMotionByCamera.get(cameraName)?.(detected);
+    (cameraName, detected, edge?: MotionEdge) => {
+      const setMotion = setMotionByCamera.get(cameraName);
+      if (setMotion) {
+        if (edge) setMotion(detected, edge);
+        else setMotion(detected);
+      }
       emitTelemetry(cameraName, "homekit_motion_updated", { detected });
       process.stdout.write(`[argus ${cameraName}] motion ${detected ? "DETECTED" : "cleared"}\n`);
       

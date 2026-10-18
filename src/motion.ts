@@ -1,6 +1,6 @@
 import type { CameraConfig } from "./config.js";
 import { ReolinkClient, redactCredentialHosts, type ReolinkClientOptions } from "./reolink.js";
-import { emitTelemetry } from "./telemetry.js";
+import { emitSpan, emitTelemetry } from "./telemetry.js";
 import { emitTiming } from "./timing.js";
 
 /** Standalone cameras report AI on channel 0. The NVR channel stays on GetMdState. */
@@ -10,6 +10,18 @@ const MOTION_REQUEST_TIMEOUT_MS = 5_000;
 /** First repeat of a poll error waits this long. Then the delay doubles. */
 const ERROR_LOG_BACKOFF_START_MS = 5_000;
 const ERROR_LOG_BACKOFF_MAX_MS = 60_000;
+
+export interface MotionEdge {
+  motionId: string;
+  via: "md" | "ai";
+}
+
+let motionSerial = 0;
+
+function nextMotionId(): string {
+  motionSerial += 1;
+  return `m${motionSerial}`;
+}
 
 /** stderr line for a motion poll failure. Userinfo in the message is removed. */
 export function writeMotionPollError(cameraName: string, error: Error): void {
@@ -59,7 +71,7 @@ export class MotionMonitor {
 
   public constructor(
     cameras: readonly CameraConfig[],
-    private readonly onMotion: (cameraName: string, detected: boolean) => void,
+    private readonly onMotion: (cameraName: string, detected: boolean, edge?: MotionEdge) => void,
     options: MotionMonitorOptions = {},
   ) {
     this.pollIntervalMs = options.pollIntervalMs ?? 1000;
@@ -133,14 +145,15 @@ export class MotionMonitor {
     }
   }
 
-  private async readActive(state: CameraState): Promise<boolean> {
+  private async readActive(state: CameraState): Promise<{ active: boolean; via: "md" | "ai" | "none" }> {
     if (!state.directAi) {
-      return state.client.getMotionState(state.camera.channel);
+      return state.client.classifyMotion(state.camera.channel);
     }
     if (await state.client.getMdState(state.camera.channel)) {
-      return true;
+      return { active: true, via: "md" };
     }
-    return state.directAi.getAiState(DIRECT_AI_CHANNEL);
+    const active = await state.directAi.getAiState(DIRECT_AI_CHANNEL);
+    return { active, via: active ? "ai" : "none" };
   }
 
   private reportPollError(state: CameraState, error: Error): void {
@@ -158,8 +171,11 @@ export class MotionMonitor {
 
   private async pollCamera(state: CameraState): Promise<void> {
     let active = false;
+    let via: "md" | "ai" | "none" = "none";
     try {
-      active = await this.readActive(state);
+      const reading = await this.readActive(state);
+      active = reading.active;
+      via = reading.via;
       state.errorBackoffMs = 0;
       state.nextErrorLogAt = 0;
     } catch (error) {
@@ -173,7 +189,13 @@ export class MotionMonitor {
         state.detected = true;
         emitTelemetry(state.camera.name, "motion_detected");
         emitTiming({ stage: "motion_detected", camera: state.camera.name });
-        this.onMotion(state.camera.name, true);
+        if (via === "md" || via === "ai") {
+          const edge: MotionEdge = { motionId: nextMotionId(), via };
+          emitSpan(state.camera.name, "motion_source", { motionId: edge.motionId }, { via });
+          this.onMotion(state.camera.name, true, edge);
+        } else {
+          this.onMotion(state.camera.name, true);
+        }
       }
     } else if (state.detected && now - state.lastMotionAt >= this.cooldownMs) {
       state.detected = false;
