@@ -45,8 +45,9 @@ vi.mock("node:dgram", () => {
 
 import { parseArgusConfig } from "../src/config.js";
 import { createCameraAccessory } from "../src/homekit.js";
-import { MotionMonitor } from "../src/motion.js";
+import { MotionMonitor, type MotionEdge } from "../src/motion.js";
 import { SnapshotCache } from "../src/snapshot-cache.js";
+import { formatSpanReport } from "../src/span-report.js";
 
 const SENTINEL_PASSWORD = "s3cret-pass";
 const SENTINEL_TOKEN = "s3cret-token";
@@ -133,17 +134,13 @@ function installFetch(mdState: () => number, aiAlarm: number): { fetch: typeof f
   return { fetch: fetchFn, calls };
 }
 
-interface MotionEdge {
-  motionId: string;
-  path: "nvr" | "direct";
-}
-
-function motionTo(setMotion: (detected: boolean) => void): (cameraName: string, detected: boolean) => void {
-  const set = setMotion as (detected: boolean, edge?: MotionEdge) => void;
-  return ((cameraName: string, detected: boolean, edge?: MotionEdge) => {
-    void cameraName;
-    set(detected, edge);
-  }) as (cameraName: string, detected: boolean) => void;
+function motionTo(
+  setMotion: (detected: boolean, edge?: MotionEdge) => void,
+): (cameraName: string, detected: boolean, edge?: MotionEdge) => void {
+  return (_cameraName, detected, edge) => {
+    if (edge) setMotion(detected, edge);
+    else setMotion(detected);
+  };
 }
 
 function camera(name: string, channel: number) {
@@ -387,6 +384,67 @@ describe("span telemetry", () => {
     expect(spanText.split(SENTINEL_TOKEN).length - 1).toBe(0);
     expect(spanText.split(SENTINEL_HOST).length - 1).toBe(0);
     expect(spanText).not.toContain("rtsp://");
+    const parsed = result.spanLines.map((line) => JSON.parse(line.slice("ARGUS_TELEMETRY: ".length)) as {
+      timestamp: number;
+      monoMs: number;
+      event: string;
+      motionId?: string;
+      sessionId?: string;
+      streamId?: number;
+      metadata?: { durationMs: number; size: number };
+    });
+    for (const event of parsed) {
+      expect(event.monoMs).not.toBe(event.timestamp);
+      expect(event.monoMs).toBeLessThan(1_000_000);
+    }
+    const byEvent = (name: string) => parsed.find((event) => event.event === name);
+    expect(byEvent("motion_nvr_source")?.motionId).toBe(byEvent("motion_nvr_characteristic_set")?.motionId);
+    expect(byEvent("motion_direct_source")?.motionId).toBe(byEvent("motion_direct_characteristic_set")?.motionId);
+    expect(byEvent("motion_nvr_source")?.motionId).not.toBe(byEvent("motion_direct_source")?.motionId);
+    for (const name of ["live_prepare_stream", "live_start_stream", "live_ffmpeg_spawn", "live_first_frame", "live_start_ack"]) {
+      expect(byEvent(name)?.sessionId).toBe("sess-1");
+    }
+    for (const name of ["hksv_span_start", "hksv_span_first_fragment", "hksv_span_close"]) {
+      expect(byEvent(name)?.streamId).toBe(7);
+    }
+    expect(parsed.filter((event) => event.event === "hksv_span_fragment").map((event) => event.metadata)).toEqual([
+      { durationMs: 15, size: 31 },
+      { durationMs: 25, size: 31 },
+    ]);
+    expect(formatSpanReport(result.stderr)).toBe([
+      "motion_nvr_source_to_characteristic_set n=1 p50=0 p95=0",
+      "motion_direct_source_to_characteristic_set n=1 p50=0 p95=0",
+      "live_prepare_stream_to_start_stream n=1 p50=0 p95=0",
+      "live_start_stream_to_ffmpeg_spawn n=1 p50=0 p95=0",
+      "live_ffmpeg_spawn_to_first_frame n=1 p50=99 p95=99",
+      "live_first_frame_to_start_ack n=1 p50=1 p95=1",
+      "hksv_start_to_first_fragment n=1 p50=15 p95=15",
+      "hksv_first_fragment_to_close n=1 p50=25 p95=25",
+      "hksv_fragment_duration n=2 p50=20 p95=24.5",
+    ].join("\n") + "\n");
+    expect(formatSpanReport(result.stderr)).not.toContain(SENTINEL_PASSWORD);
+    expect(formatSpanReport(result.stderr)).not.toContain(SENTINEL_HOST);
+  });
+
+  it("prints n=0 and drops a sentinel from a log excerpt", () => {
+    const log = [
+      `ARGUS_TELEMETRY: {"timestamp":1,"camera":"Front L","event":"motion_detected","url":"rtsp://admin:${SENTINEL_PASSWORD}@${SENTINEL_HOST}/main"}`,
+      "noise",
+    ].join("\n");
+    const report = formatSpanReport(log);
+    expect(report).toBe([
+      "motion_nvr_source_to_characteristic_set n=0",
+      "motion_direct_source_to_characteristic_set n=0",
+      "live_prepare_stream_to_start_stream n=0",
+      "live_start_stream_to_ffmpeg_spawn n=0",
+      "live_ffmpeg_spawn_to_first_frame n=0",
+      "live_first_frame_to_start_ack n=0",
+      "hksv_start_to_first_fragment n=0",
+      "hksv_first_fragment_to_close n=0",
+      "hksv_fragment_duration n=0",
+    ].join("\n") + "\n");
+    expect(report).not.toContain(SENTINEL_PASSWORD);
+    expect(report).not.toContain(SENTINEL_HOST);
   });
 });
 

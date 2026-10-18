@@ -46,6 +46,10 @@ function telemetryReason(line: string): string {
   return event.metadata?.reason ?? "";
 }
 
+function closeLines(lines: string[]): string[] {
+  return lines.filter((line) => line.includes('"event":"hksv_recording_close"'));
+}
+
 function withTelemetry(run: () => void): string[] {
   const lines: string[] = [];
   const original = process.stderr.write;
@@ -323,84 +327,90 @@ describe("recording hub telemetry", () => {
   }
 
   it("logs a hap close-reason enum name", () => {
-    const lines = withTelemetry(() =>
+    const lines = closeLines(withTelemetry(() =>
       delegate().closeRecordingStream(3, HDSProtocolSpecificErrorReason.NORMAL),
-    );
+    ));
     expect(lines).toHaveLength(1);
     expect(telemetryReason(lines[0] ?? "")).toBe("NORMAL");
     for (const [name, value] of Object.entries(HDSProtocolSpecificErrorReason)) {
       if (typeof value !== "number") continue;
-      const byValue = withTelemetry(() => delegate().closeRecordingStream(3, value));
+      const byValue = closeLines(withTelemetry(() => delegate().closeRecordingStream(3, value)));
       expect(telemetryReason(byValue[0] ?? "")).toBe(name);
-      const byName = withTelemetry(() => delegate().closeRecordingStream(3, name));
+      const byName = closeLines(withTelemetry(() => delegate().closeRecordingStream(3, name)));
       expect(telemetryReason(byName[0] ?? "")).toBe(name);
     }
   });
 
   it("logs none when the close reason is undefined", () => {
-    const lines = withTelemetry(() => delegate().closeRecordingStream(3, undefined));
+    const lines = closeLines(withTelemetry(() => delegate().closeRecordingStream(3, undefined)));
     expect(lines).toHaveLength(1);
     expect(telemetryReason(lines[0] ?? "")).toBe("none");
   });
 
   it("logs other for close reason 42 and for digit strings 0 through 9", () => {
     const streamId = 12;
-    const numeric = withTelemetry(() => delegate().closeRecordingStream(streamId, 42));
+    const numeric = closeLines(withTelemetry(() => delegate().closeRecordingStream(streamId, 42)));
     expect(numeric).toHaveLength(1);
     expect(telemetryReason(numeric[0] ?? "")).toBe("other");
 
     for (const digit of ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]) {
-      const lines = withTelemetry(() => delegate().closeRecordingStream(streamId, digit));
+      const lines = closeLines(withTelemetry(() => delegate().closeRecordingStream(streamId, digit)));
       expect(lines).toHaveLength(1);
       expect(telemetryReason(lines[0] ?? "")).toBe("other");
     }
   });
 
   it("does not copy an uppercase SRTP close reason into the telemetry line", () => {
-    const lines = withTelemetry(() => delegate().closeRecordingStream(4, "SRTP"));
+    const logged = withTelemetry(() => delegate().closeRecordingStream(4, "SRTP"));
+    const lines = closeLines(logged);
     expect(lines).toHaveLength(1);
-    expect(lines[0]).not.toContain("SRTP");
-    expect(lines[0]).not.toContain("srtp");
+    expect(logged.join("")).not.toContain("SRTP");
+    expect(logged.join("")).not.toContain("srtp");
     expect(telemetryReason(lines[0] ?? "")).toBe("other");
   });
 
   it("does not copy an srtp close reason into the telemetry line", () => {
     const secret = "session srtp_key material";
-    const lines = withTelemetry(() => delegate().closeRecordingStream(4, secret));
+    const logged = withTelemetry(() => delegate().closeRecordingStream(4, secret));
+    const lines = closeLines(logged);
     expect(lines).toHaveLength(1);
-    expect(lines[0]).not.toContain("srtp");
-    expect(lines[0]).not.toContain(secret);
+    expect(logged.join("")).not.toContain("srtp");
+    expect(logged.join("")).not.toContain(secret);
     expect(telemetryReason(lines[0] ?? "")).toBe("other");
   });
 
   it("does not copy an unknown close reason", () => {
     const unknown = "NOT_A_HAP_REASON";
-    const lines = withTelemetry(() => delegate().closeRecordingStream(8, unknown));
+    const logged = withTelemetry(() => delegate().closeRecordingStream(8, unknown));
+    const lines = closeLines(logged);
     expect(lines).toHaveLength(1);
-    expect(lines[0]).not.toContain(unknown);
+    expect(logged.join("")).not.toContain(unknown);
     expect(telemetryReason(lines[0] ?? "")).toBe("other");
 
-    const invented = withTelemetry(() => delegate().closeRecordingStream(8, "normal"));
-    expect(invented[0]).not.toContain("normal");
+    const inventedLogged = withTelemetry(() => delegate().closeRecordingStream(8, "normal"));
+    const invented = closeLines(inventedLogged);
+    expect(inventedLogged.join("")).not.toContain("normal");
     expect(telemetryReason(invented[0] ?? "")).toBe("other");
   });
 
   it("does not copy an object close reason", () => {
-    const lines = withTelemetry(() =>
+    const logged = withTelemetry(() =>
       delegate().closeRecordingStream(5, { code: "cancelled", detail: "srtp session dump" }),
     );
+    const lines = closeLines(logged);
     expect(lines).toHaveLength(1);
-    expect(lines[0]).not.toContain("cancelled");
-    expect(lines[0]).not.toContain("srtp");
-    expect(lines[0]).not.toContain("dump");
+    expect(logged.join("")).not.toContain("cancelled");
+    expect(logged.join("")).not.toContain("srtp");
+    expect(logged.join("")).not.toContain("dump");
     expect(telemetryReason(lines[0] ?? "")).toBe("other");
   });
 
   it("does not copy an overlong close reason", () => {
     const raw = `hub-${"x".repeat(220)}`;
-    const lines = withTelemetry(() => delegate().closeRecordingStream(9, raw));
+    const logged = withTelemetry(() => delegate().closeRecordingStream(9, raw));
+    const lines = closeLines(logged);
     expect(lines).toHaveLength(1);
-    expect(lines[0]).not.toContain(raw);
+    expect(logged.join("")).not.toContain(raw);
     expect(telemetryReason(lines[0] ?? "")).toBe("other");
   });
 
