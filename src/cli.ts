@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import { realpathSync } from "node:fs";
 import { chmod, mkdir, writeFile } from "node:fs/promises";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -160,14 +161,15 @@ async function main(): Promise<void> {
   }
 }
 
-function invokedAsCli(): boolean {
-  const entry = process.argv[1];
-  if (entry === undefined) {
+// The npm bin is a symlink to dist/cli.js, so compare real paths.
+const invokedDirectly = ((): boolean => {
+  if (!process.argv[1]) return false;
+  try {
+    return realpathSync(process.argv[1]) === fileURLToPath(import.meta.url);
+  } catch {
     return false;
   }
-  return path.resolve(entry) === fileURLToPath(import.meta.url);
-}
-
-if (invokedAsCli()) {
+})();
+if (invokedDirectly) {
   void main();
 }
