@@ -1247,10 +1247,22 @@ describe("direct AI poll", () => {
             : `http://admin:***@${bare}/x admin:***@${bare}`;
           check(`userinfo ${password} ${host}`, redactKnownSecrets(userinfo, [password]), userinfoWant);
           check(`format userinfo ${password} ${host}`, formatError(userinfo, [password]), userinfoWant);
+          const loginWant: Record<string, string> = {
+            "login-detail": `*** on ${host} failed: rspCode -6 (please login first)`,
+            "login-http": `*** on ${host} failed: HTTP 500`,
+            "login-refused": `*** on ${host} fetch failed: ECONNREFUSED`,
+            "login-timeout": `*** on ${host} fetch failed: ETIMEDOUT`,
+            "login-abort": `*** on ${host} fetch failed: 23`,
+            "login-backoff": `*** on ${host} failed: backing off`,
+            md: `GetMdState ch2 on ${host} failed: rspCode -6 (please login first)`,
+            ai: `GetAiState ch0 on ${host} failed: busy`,
+            "ai-backoff": `GetAiState ch0 on ${host} failed: backing off`,
+            empty: `*** on ${host}: empty response`,
+            "no-token": `*** on ${host}: no token in response`,
+          };
           for (const kind of kinds) {
             const template = templateFor[kind]!(host);
-            const mainLine = await mainRedact(template);
-            const want = password === "Login" ? mainLine.replaceAll("Login", "***") : mainLine;
+            const want = password === "Login" ? loginWant[kind]! : await mainRedact(template);
             check(`fail ${password} ${kind} ${host}`, await failMessage(host, kind, password, 5), want);
             check(`format ${password} ${kind} ${host}`, formatError(template, [password]), want);
           }
