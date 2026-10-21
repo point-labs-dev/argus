@@ -193,6 +193,39 @@ write_logrotate_plist() {
 NODE_BIN="$(command -v node)"
 FFMPEG_BIN="$(command -v ffmpeg)"
 [[ -x "$NODE_BIN" ]] || { echo "node not found in PATH" >&2; exit 1; }
+
+node_version_older() {
+  local got=$1
+  local min=$2
+  local g1 g2 g3 m1 m2 m3
+  IFS=. read -r g1 g2 g3 <<<"${got}"
+  IFS=. read -r m1 m2 m3 <<<"${min}"
+  g1=${g1:-}; g2=${g2:-}; g3=${g3:-}
+  m1=${m1:-}; m2=${m2:-}; m3=${m3:-}
+  g1=${g1%%[!0-9]*}; g2=${g2%%[!0-9]*}; g3=${g3%%[!0-9]*}
+  m1=${m1%%[!0-9]*}; m2=${m2%%[!0-9]*}; m3=${m3%%[!0-9]*}
+  g1=${g1:-0}; g2=${g2:-0}; g3=${g3:-0}
+  m1=${m1:-0}; m2=${m2:-0}; m3=${m3:-0}
+  if ((10#$g1 < 10#$m1)); then return 0; fi
+  if ((10#$g1 > 10#$m1)); then return 1; fi
+  if ((10#$g2 < 10#$m2)); then return 0; fi
+  if ((10#$g2 > 10#$m2)); then return 1; fi
+  if ((10#$g3 < 10#$m3)); then return 0; fi
+  return 1
+}
+
+warn_if_node_below_engines() {
+  local raw ver min
+  min="24.22.1"
+  raw="$("$NODE_BIN" --version 2>/dev/null || true)"
+  ver="${raw#v}"
+  ver="${ver%%[!0-9.]*}"
+  [[ "$ver" == *.* ]] || return 0
+  if node_version_older "$ver" "$min"; then
+    echo "warning: resolved node ${ver} is older than engines minimum >=${min}" >&2
+  fi
+}
+warn_if_node_below_engines || true
 [[ -x "$FFMPEG_BIN" ]] || { echo "ffmpeg not found in PATH" >&2; exit 1; }
 [[ -f "$REPO_DIR/dist/serve.js" ]] || { echo "dist/serve.js missing. Run npm run build first." >&2; exit 1; }
 [[ -f "$REPO_DIR/argus.yaml" ]] || { echo "argus.yaml missing in $REPO_DIR" >&2; exit 1; }
