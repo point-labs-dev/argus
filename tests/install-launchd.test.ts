@@ -75,6 +75,7 @@ type RenderOptions = {
   separateSudoHome?: boolean;
   agentBody?: string;
   seedDaemon?: boolean;
+  nodeStubVersion?: string;
 };
 
 function writeDscl(bin: string, userHome: string) {
@@ -115,6 +116,20 @@ function renderDaemon(
   );
   chmodSync(path.join(bin, "launchctl"), 0o755);
   writeDscl(bin, sudoHome);
+  if (options.nodeStubVersion) {
+    writeFileSync(
+      path.join(bin, "node"),
+      `#!/bin/bash
+if [[ "\${1:-}" == "--version" ]]; then
+  printf '%s\\n' "v${options.nodeStubVersion}"
+  exit 0
+fi
+echo "unexpected node invocation" >&2
+exit 1
+`,
+    );
+    chmodSync(path.join(bin, "node"), 0o755);
+  }
   writeFileSync(path.join(sudoHome, "bin", "argus-logrotate.sh"), "#!/bin/sh\nexit 0\n");
   chmodSync(path.join(sudoHome, "bin", "argus-logrotate.sh"), 0o755);
   const agentBody = options.agentBody ?? agentFixture(FIXTURE_ENV);
@@ -212,6 +227,39 @@ describe("install-launchd daemon plist", () => {
       expect(existsSync(CRED_FILE)).toBe(false);
     } finally {
       cleanup(run);
+    }
+  });
+
+  it("warns and continues when the resolved node is older than engines >=24.22.1", () => {
+    const run = renderDaemon("scripts/install-launchd.sh", {}, true, { nodeStubVersion: "24.18.0" });
+    try {
+      const dest = path.join(run.installRoot, "Library/LaunchDaemons/dev.point-labs.argus.plist");
+      expect(run.result.status, `${run.result.stdout}\n${run.result.stderr}`).toBe(0);
+      expect(run.result.stderr).toContain("resolved node 24.18.0 is older than engines minimum >=24.22.1");
+      expect(run.result.stderr).not.toContain("10.0.0.15");
+      expect(run.result.stderr).not.toMatch(/password/i);
+      const plist = readPlist(dest);
+      expect(plist.ProgramArguments).toEqual(
+        expect.arrayContaining([path.join(run.bin, "node")]),
+      );
+      expect((plist.ProgramArguments as string[])[0]).toBe(path.join(run.bin, "node"));
+    } finally {
+      cleanup(run);
+    }
+  });
+
+  it("stays quiet when the resolved node meets engines >=24.22.1", () => {
+    for (const version of ["24.22.1", "24.22.10", "24.23.0"]) {
+      const run = renderDaemon("scripts/install-launchd.sh", {}, true, { nodeStubVersion: version });
+      try {
+        expect(run.result.status, `${version}\n${run.result.stderr}`).toBe(0);
+        expect(run.result.stderr, version).not.toContain("older than engines");
+        const dest = path.join(run.installRoot, "Library/LaunchDaemons/dev.point-labs.argus.plist");
+        const plist = readPlist(dest);
+        expect((plist.ProgramArguments as string[])[0]).toBe(path.join(run.bin, "node"));
+      } finally {
+        cleanup(run);
+      }
     }
   });
 
