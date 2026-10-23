@@ -1,9 +1,12 @@
 import { EventEmitter } from "node:events";
+import { readFileSync } from "node:fs";
 import { chmod, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
+import { PassThrough } from "node:stream";
 
 import { describe, expect, it, vi } from "vitest";
+import { parse as parseYaml } from "yaml";
 
 import { parseArgusConfig } from "../src/config.js";
 import {
@@ -64,6 +67,47 @@ class FakeChildProcess extends EventEmitter implements Go2RtcChildProcess {
     queueMicrotask(() => this.emit("exit", this.exitCode, this.signalCode));
     return true;
   });
+}
+
+class LogChild extends EventEmitter implements Go2RtcChildProcess {
+  public pid = 4242;
+  public killed = false;
+  public exitCode: number | null = null;
+  public signalCode: NodeJS.Signals | null = null;
+  public readonly stdout = new PassThrough();
+  public readonly stderr = new PassThrough();
+  public readonly kill = vi.fn((signal: NodeJS.Signals | number = "SIGTERM") => {
+    this.killed = true;
+    this.signalCode = typeof signal === "number" ? null : signal;
+    queueMicrotask(() => this.emit("exit", this.exitCode, this.signalCode));
+    return true;
+  });
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function readApiPassword(configPath: string): string {
+  const parsed: unknown = parseYaml(readFileSync(configPath, "utf8"));
+  if (!isRecord(parsed) || !isRecord(parsed.api) || typeof parsed.api.password !== "string") {
+    throw new Error("go2rtc config has no api password");
+  }
+  return parsed.api.password;
+}
+
+function go2rtcLines(logged: readonly string[]): string[] {
+  return logged.filter((line) => line.startsWith("[argus] go2rtc:"));
+}
+
+async function waitForLogged(logged: readonly string[], fragment: string): Promise<void> {
+  const deadline = Date.now() + 2_000;
+  while (!logged.some((line) => line.includes(fragment))) {
+    if (Date.now() >= deadline) {
+      throw new Error(`timed out waiting for ${fragment}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
 }
 
 function okStreamsResponse(
@@ -456,5 +500,134 @@ setInterval(() => {}, 1000000);
       signalCode: "SIGTERM",
     });
     expect(supervisor.process).toBeUndefined();
+  });
+
+  it("redacts the go2rtc API password from the list passed to redaction", async () => {
+    const cameraPassword = "fixture-camera-secret";
+    const child = new LogChild();
+    let apiPassword = "";
+    const spawnMock = vi.fn((_command: string, args: readonly string[]) => {
+      const configPath = args[args.indexOf("-config") + 1];
+      if (configPath === undefined) {
+        throw new Error("spawn was not given a go2rtc config path");
+      }
+      apiPassword = readApiPassword(configPath);
+      child.stdout.write(`api-password ${apiPassword} loaded\n`);
+      return child;
+    }) satisfies Go2RtcSpawn;
+    const logged: string[] = [];
+    const spy = vi.spyOn(process.stderr, "write").mockImplementation((chunk) => {
+      logged.push(String(chunk));
+      return true;
+    });
+    let supervisor: Go2RtcSupervisor | undefined;
+    try {
+      supervisor = createGo2RtcSupervisor(createConfig(cameraPassword), {
+        configPath: await tempPath("go2rtc.generated.yaml"),
+        spawn: spawnMock,
+        fetch: vi.fn(async () => okStreamsResponse()) as unknown as typeof fetch,
+        startupTimeoutMs: 100,
+        healthIntervalMs: 1,
+      });
+      await supervisor.start();
+      await waitForLogged(logged, "api-password");
+      expect(apiPassword).toBe(supervisor.apiCredentials.password);
+      expect(apiPassword).not.toBe(cameraPassword);
+      expect(apiPassword.length).toBeGreaterThanOrEqual(16);
+      expect(logged).toEqual(["[argus] go2rtc: api-password *** loaded\n"]);
+      expect(logged.join("")).not.toContain(apiPassword);
+    } finally {
+      spy.mockRestore();
+      await supervisor?.stop();
+      child.stdout.destroy();
+      child.stderr.destroy();
+    }
+  });
+
+  it("closes the log reader on stop and on a start failure", async () => {
+    const logged: string[] = [];
+    const spy = vi.spyOn(process.stderr, "write").mockImplementation((chunk) => {
+      logged.push(String(chunk));
+      return true;
+    });
+    const children: LogChild[] = [];
+    let releaseHealth: (() => void) | undefined;
+    let failedStart: Promise<unknown> | undefined;
+    try {
+      const stopChild = new LogChild();
+      children.push(stopChild);
+      const stopSupervisor = createGo2RtcSupervisor(createConfig(), {
+        configPath: await tempPath("go2rtc.generated.yaml"),
+        spawn: vi.fn(() => stopChild) satisfies Go2RtcSpawn,
+        fetch: vi.fn(async () => okStreamsResponse()) as unknown as typeof fetch,
+        startupTimeoutMs: 100,
+        healthIntervalMs: 1,
+        shutdownTimeoutMs: 20,
+      });
+      await stopSupervisor.start();
+      stopChild.stdout.write("stdout-while-open\n");
+      await waitForLogged(logged, "stdout-while-open");
+      stopChild.stderr.write("stderr-while-open\n");
+      await waitForLogged(logged, "stderr-while-open");
+      expect(go2rtcLines(logged)).toEqual([
+        "[argus] go2rtc: stdout-while-open\n",
+        "[argus] go2rtc: stderr-while-open\n",
+      ]);
+      await stopSupervisor.stop();
+      stopChild.stdout.write("stdout-after-stop\n");
+      stopChild.stderr.write("stderr-after-stop\n");
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      expect(go2rtcLines(logged)).toEqual([
+        "[argus] go2rtc: stdout-while-open\n",
+        "[argus] go2rtc: stderr-while-open\n",
+      ]);
+
+      logged.length = 0;
+      const failChild = new LogChild();
+      children.push(failChild);
+      const healthGate = new Promise<void>((resolve) => {
+        releaseHealth = resolve;
+      });
+      const failSupervisor = createGo2RtcSupervisor(createConfig(), {
+        configPath: await tempPath("go2rtc.generated.yaml"),
+        spawn: vi.fn(() => failChild) satisfies Go2RtcSpawn,
+        fetch: vi.fn(async () => {
+          await healthGate;
+          return new Response("not ready", { status: 503 });
+        }) as unknown as typeof fetch,
+        startupTimeoutMs: 100,
+        healthIntervalMs: 1,
+        healthRequestTimeoutMs: 50,
+        shutdownTimeoutMs: 20,
+      });
+      failedStart = failSupervisor.start();
+      failChild.stdout.write("stdout-while-starting\n");
+      await waitForLogged(logged, "stdout-while-starting");
+      failChild.stderr.write("stderr-while-starting\n");
+      await waitForLogged(logged, "stderr-while-starting");
+      expect(go2rtcLines(logged)).toEqual([
+        "[argus] go2rtc: stdout-while-starting\n",
+        "[argus] go2rtc: stderr-while-starting\n",
+      ]);
+      releaseHealth?.();
+      releaseHealth = undefined;
+      await expect(failedStart).rejects.toMatchObject({ code: "HEALTH_TIMEOUT" });
+      failedStart = undefined;
+      failChild.stdout.write("stdout-after-failure\n");
+      failChild.stderr.write("stderr-after-failure\n");
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      expect(go2rtcLines(logged)).toEqual([
+        "[argus] go2rtc: stdout-while-starting\n",
+        "[argus] go2rtc: stderr-while-starting\n",
+      ]);
+    } finally {
+      releaseHealth?.();
+      await failedStart?.catch(() => undefined);
+      spy.mockRestore();
+      for (const child of children) {
+        child.stdout.destroy();
+        child.stderr.destroy();
+      }
+    }
   });
 });
