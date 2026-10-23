@@ -104,6 +104,14 @@ function writeLog(directory: string, name: string, contents: string): string {
   return path;
 }
 
+function timingLine(stage: string, camera: string, monoMs: number, extra?: Record<string, unknown>): string {
+  return `ARGUS_TIMING: ${JSON.stringify({ stage, camera, monoMs, ...extra })}`;
+}
+
+function withMotion(line: string): string {
+  return ZERO_REPORT.replace("motion_to_motion_set n=0", line);
+}
+
 describe("notification latency log reader", () => {
   it("counts n greater than 0 for each metric present in real ARGUS_TELEMETRY lines", () => {
     const directory = mkdtempSync(join(tmpdir(), "argus-latency-"));
@@ -152,5 +160,64 @@ describe("notification latency log reader", () => {
     const mixed = `${timing}\n${telemetryLog()}`;
     expect(runScript(writeLog(directory, "mixed.log", mixed))).toBe(formatStageReport(mixed));
     expect(formatStageReport(mixed)).toContain("motion_to_motion_set n=1 min=8 p50=8 p90=8 max=8");
+  });
+
+  it("counts a motion sample only when detected is true", () => {
+    const directory = mkdtempSync(join(tmpdir(), "argus-latency-"));
+    const cleared = [
+      telemetryLine(1_000, "Garage Door", "motion_detected"),
+      telemetryLine(1_050, "Garage Door", "homekit_motion_updated", { detected: false }),
+    ].join("\n");
+    expect(runScript(writeLog(directory, "cleared.log", cleared))).toBe(ZERO_REPORT);
+
+    const held = [
+      telemetryLine(1_000, "Garage Door", "motion_detected"),
+      telemetryLine(1_010, "Garage Door", "homekit_motion_updated", { detected: false }),
+      telemetryLine(1_300, "Garage Door", "homekit_motion_updated", { detected: true }),
+    ].join("\n");
+    expect(runScript(writeLog(directory, "held.log", held))).toBe(
+      withMotion("motion_to_motion_set n=1 min=300 p50=300 p90=300 max=300"),
+    );
+  });
+
+  it("splits samples when the clock goes backwards", () => {
+    const log = [
+      timingLine("motion_detected", "Garage Door", 100),
+      timingLine("motion_characteristic_set", "Garage Door", 100),
+      timingLine("motion_detected", "Porch", 200),
+      timingLine("motion_characteristic_set", "Porch", 280),
+      timingLine("motion_detected", "Front Door", 1_000),
+      timingLine("live_first_frame", "Front Door", 5_000, { sessionId: "s-epoch" }),
+      timingLine("motion_characteristic_set", "Front Door", 1_200),
+    ].join("\n");
+    const directory = mkdtempSync(join(tmpdir(), "argus-latency-"));
+    const report = runScript(writeLog(directory, "epoch.log", log));
+    expect(report).toBe(withMotion("motion_to_motion_set n=2 min=0 p50=40 p90=72 max=80"));
+  });
+
+  it("computes p90 apart from p50", () => {
+    const deltas = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 100];
+    const lines: string[] = [];
+    let at = 0;
+    for (const delta of deltas) {
+      lines.push(timingLine("motion_detected", "Garage Door", at));
+      at += delta;
+      lines.push(timingLine("motion_characteristic_set", "Garage Door", at));
+      at += 1;
+    }
+    const directory = mkdtempSync(join(tmpdir(), "argus-latency-"));
+    const report = runScript(writeLog(directory, "p90.log", lines.join("\n")));
+    expect(report).toBe(withMotion("motion_to_motion_set n=11 min=1 p50=6 p90=10 max=100"));
+  });
+
+  it("uses each end mark once", () => {
+    const log = [
+      timingLine("motion_detected", "Garage Door", 1_000),
+      timingLine("motion_detected", "Garage Door", 1_100),
+      timingLine("motion_characteristic_set", "Garage Door", 1_200),
+    ].join("\n");
+    const directory = mkdtempSync(join(tmpdir(), "argus-latency-"));
+    const report = runScript(writeLog(directory, "used-end.log", log));
+    expect(report).toBe(withMotion("motion_to_motion_set n=1 min=200 p50=200 p90=200 max=200"));
   });
 });
