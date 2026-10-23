@@ -7,6 +7,14 @@ function integer(value) {
   return Number.isInteger(value) ? value : 0;
 }
 
+function metadataOf(event) {
+  return event.metadata !== null && typeof event.metadata === "object" ? event.metadata : {};
+}
+
+function sessionId(metadata) {
+  return typeof metadata.sessionId === "string" ? metadata.sessionId : "";
+}
+
 function summarize(text) {
   let events = 0;
   let startEvents = 0;
@@ -14,6 +22,7 @@ function summarize(text) {
   let videoPackets = 0;
   let audioPackets = 0;
   let zeroEvents = 0;
+  const open = new Map();
   for (const line of text.split("\n")) {
     const index = line.indexOf(MARKER);
     if (index < 0) continue;
@@ -23,8 +32,16 @@ function summarize(text) {
     } catch {
       continue;
     }
-    if (event === null || typeof event !== "object" || event.event !== "rtcp_after_first_frame") continue;
-    const metadata = event.metadata !== null && typeof event.metadata === "object" ? event.metadata : {};
+    if (event === null || typeof event !== "object") continue;
+    const metadata = metadataOf(event);
+    const id = sessionId(metadata);
+    if (event.event === "live_session_first_frame") {
+      open.set(id, (open.get(id) ?? 0) + 1);
+      continue;
+    }
+    if (event.event !== "rtcp_after_first_frame") continue;
+    const current = open.get(id) ?? 0;
+    if (current > 0) open.set(id, current - 1);
     const video = integer(metadata.videoPackets);
     const audio = integer(metadata.audioPackets);
     events += 1;
@@ -34,14 +51,22 @@ function summarize(text) {
     else if (metadata.spawn === "reconfigure") reconfigureEvents += 1;
     if (video === 0 && audio === 0) zeroEvents += 1;
   }
-  return [
-    `events=${events}`,
-    `start_events=${startEvents}`,
-    `reconfigure_events=${reconfigureEvents}`,
-    `video_packets=${videoPackets}`,
-    `audio_packets=${audioPackets}`,
-    `zero_events=${zeroEvents}`,
-  ].join("\n") + "\n";
+  let leaked = 0;
+  for (const count of open.values()) {
+    if (count > 0) leaked += count;
+  }
+  return {
+    leaked,
+    report: [
+      `events=${events}`,
+      `start_events=${startEvents}`,
+      `reconfigure_events=${reconfigureEvents}`,
+      `video_packets=${videoPackets}`,
+      `audio_packets=${audioPackets}`,
+      `zero_events=${zeroEvents}`,
+      `leaked_sessions=${leaked}`,
+    ].join("\n") + "\n",
+  };
 }
 
 const path = process.argv[2];
@@ -59,4 +84,6 @@ try {
   process.exit(1);
 }
 
-process.stdout.write(summarize(text));
+const { report, leaked } = summarize(text);
+process.stdout.write(report);
+if (leaked > 0) process.exitCode = 2;

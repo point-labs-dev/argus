@@ -19,10 +19,15 @@
  * 6. scripts/rtcp-counts.mjs prints log=missing and exits 1 when the log
  *    path is absent. That output does not contain events=0. When the file
  *    exists and has no rtcp_after_first_frame lines, the script exits 0 and
- *    prints events=0.
+ *    prints events=0. The summary ends with leaked_sessions. Each
+ *    live_session_first_frame opens one window for its session id. Each
+ *    rtcp_after_first_frame closes one. leaked_sessions is the number still
+ *    open. A non-integer videoPackets or audioPackets adds 0. leaked_sessions
+ *    of 0 exits 0. leaked_sessions above 0 exits 2.
  * 7. After START is answered, an ffmpeg exit with code 1 and no signal, and
- *    no STOP request, calls forceStopStreamingSession once for that session.
- *    The delegate does not kill the process.
+ *    no STOP request, calls forceStopStreamingSession once, writes one
+ *    rtcp_after_first_frame line, and does not kill the process. A later
+ *    STOP does not kill the process or call forceStop again.
  */
 import { execFileSync } from "node:child_process";
 import { createSocket } from "node:dgram";
@@ -400,6 +405,7 @@ describe("RTCP after the first frame", () => {
       "video_packets=0",
       "audio_packets=0",
       "zero_events=0",
+      "leaked_sessions=0",
       "",
     ].join("\n"));
     expect(quiet.stdout).not.toContain("s3cret");
@@ -420,8 +426,66 @@ describe("RTCP after the first frame", () => {
       "video_packets=3",
       "audio_packets=3",
       "zero_events=1",
+      "leaked_sessions=0",
       "",
     ].join("\n"));
+  });
+
+  it("counts only integers and shows an open RTCP window as a leak", () => {
+    const directory = mkdtempSync(join(tmpdir(), "argus-rtcp-leak-"));
+    const log = join(directory, "serve.err.log");
+    writeFileSync(log, [
+      "noise rtsp://admin:s3cret@10.9.9.9/main",
+      'ARGUS_TELEMETRY: {"event":"live_session_first_frame","metadata":{"sessionId":"s1"}}',
+      'ARGUS_TELEMETRY: {"event":"live_session_first_frame","metadata":{"sessionId":"s1"}}',
+      'ARGUS_TELEMETRY: {"event":"rtcp_after_first_frame","metadata":{"spawn":"start","sessionId":"s1","videoPackets":1.5,"audioPackets":"4"}}',
+      'ARGUS_TELEMETRY: {"event":"live_session_first_frame","metadata":{"sessionId":"s2"}}',
+      'ARGUS_TELEMETRY: {"event":"rtcp_after_first_frame","metadata":{"spawn":"reconfigure","sessionId":"s2","videoPackets":2,"audioPackets":1}}',
+      'ARGUS_TELEMETRY: {"event":"live_session_first_frame","metadata":{"sessionId":"s3"}}',
+      "",
+    ].join("\n"));
+    const counted = runCounts([log]);
+    expect(counted.status).toBe(2);
+    expect(counted.stdout).toBe([
+      "events=2",
+      "start_events=1",
+      "reconfigure_events=1",
+      "video_packets=2",
+      "audio_packets=1",
+      "zero_events=1",
+      "leaked_sessions=2",
+      "",
+    ].join("\n"));
+    expect(counted.stdout).not.toContain("s3cret");
+    expect(counted.stdout).not.toContain("rtsp://");
+    expect(counted.stdout).not.toContain("10.9.9.9");
+    expect(counted.stdout).not.toContain("s1");
+    expect(counted.stdout).not.toContain("s2");
+    expect(counted.stdout).not.toContain("s3");
+  });
+
+  it("exits 2 when a session leaks and 0 when every window is closed", () => {
+    const directory = mkdtempSync(join(tmpdir(), "argus-rtcp-gate-"));
+    const leaky = join(directory, "leaky.log");
+    writeFileSync(leaky, [
+      'ARGUS_TELEMETRY: {"event":"live_session_first_frame","metadata":{"sessionId":"open"}}',
+      "",
+    ].join("\n"));
+    const leaked = runCounts([leaky]);
+    expect(leaked.status).toBe(2);
+    expect(leaked.stdout).toContain("leaked_sessions=1\n");
+
+    const clean = join(directory, "clean.log");
+    writeFileSync(clean, [
+      'ARGUS_TELEMETRY: {"event":"live_session_first_frame","metadata":{"sessionId":"closed"}}',
+      'ARGUS_TELEMETRY: {"event":"rtcp_after_first_frame","metadata":{"spawn":"start","sessionId":"closed","videoPackets":1,"audioPackets":0}}',
+      "",
+    ].join("\n"));
+    const closed = runCounts([clean]);
+    expect(closed.status).toBe(0);
+    expect(closed.stdout).toContain("leaked_sessions=0\n");
+    expect(closed.stdout).not.toContain("closed");
+    expect(leaked.stdout).not.toContain("open");
   });
 
   it("calls forceStop when ffmpeg exits and nobody sent STOP", async () => {
@@ -434,11 +498,22 @@ describe("RTCP after the first frame", () => {
       expect(started.procs[0]!.kill).not.toHaveBeenCalled();
       const log = await capture(async () => {
         started.procs[0]!.emit("exit", 1, null);
+        stop(started.delegate, started.sessionID);
       });
       expect(forceStop).toHaveBeenCalledTimes(1);
       expect(forceStop).toHaveBeenCalledWith("exit-no-stop");
       expect(started.procs[0]!.kill).not.toHaveBeenCalled();
-      expect(rtcpReports(log)).toEqual([]);
+      expect(rtcpReports(log)).toEqual([
+        {
+          camera: "Garage Door",
+          sessionId: "exit-no-stop",
+          spawn: "start",
+          videoPackets: 0,
+          audioPackets: 0,
+          videoLastAt: null,
+          audioLastAt: null,
+        },
+      ]);
     } finally {
       stop(started.delegate, started.sessionID);
     }
