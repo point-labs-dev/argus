@@ -16,6 +16,8 @@ export interface RtcpPacketEvent {
  */
 export class ObservableRtcpSocket extends EventEmitter {
   private seen = false;
+  private packets = 0;
+  private lastAt: number | undefined;
 
   public constructor(
     private readonly socket: Socket,
@@ -26,11 +28,14 @@ export class ObservableRtcpSocket extends EventEmitter {
 
     // RTCP packets: log first arrival, emit events for all
     this.socket.on("message", (msg: Buffer) => {
+      const time = Date.now();
+      this.packets += 1;
+      this.lastAt = time;
       if (!this.seen) {
         this.seen = true;
         this.log(`RTCP arrived on ${this.label} return port (${msg.length} bytes)`);
       }
-      this.emit("packet", { size: msg.length, time: Date.now() } as RtcpPacketEvent);
+      this.emit("packet", { size: msg.length, time } as RtcpPacketEvent);
     });
 
     // Bind errors: log and close instead of crashing process
@@ -76,5 +81,17 @@ export class ObservableRtcpSocket extends EventEmitter {
    */
   public getSocket(): Socket {
     return this.socket;
+  }
+
+  public packetsSeen(): number {
+    return this.packets;
+  }
+
+  public lastPacketAt(): number | undefined {
+    return this.lastAt;
+  }
+
+  public socketLabel(): string {
+    return this.label;
   }
 }

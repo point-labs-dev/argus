@@ -459,9 +459,22 @@ function srtpParamsFromRequest(key: Buffer, salt: Buffer): string {
  * Active streaming session (Phase 2: migrated to SessionStateMachine).
  * The state machine handles lifecycle transitions and callback guards.
  */
+interface RtcpAfterFrameBaseline {
+  socket: ObservableRtcpSocket;
+  count: number;
+}
+
+interface RtcpAfterFrameWindow {
+  sessionId: string;
+  spawn: "start" | "reconfigure";
+  baselines: RtcpAfterFrameBaseline[];
+}
+
 interface ActiveSession {
   stateMachine: SessionStateMachine;
   noRtcpConsumerTimer?: ReturnType<typeof setTimeout>;
+  rtcpSockets?: ObservableRtcpSocket[];
+  rtcpWindow?: RtcpAfterFrameWindow;
 }
 
 export const NO_RTCP_CONSUMER_ABANDON_MS = 15 * 60 * 1000;
@@ -778,6 +791,7 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
       
       if (!firstFrameEmitted && /^frame=([1-9]\d*)$/m.test(text)) {
         firstFrameEmitted = true;
+        this.beginRtcpAfterFirstFrame(session, sessionID, "reconfigure");
         emitTelemetry(this.cameraName, "live_session_first_frame", { sessionId: sessionID });
         emitTiming({ stage: "live_first_frame", camera: this.cameraName, sessionId: sessionID });
       }
@@ -918,6 +932,7 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
     session.stateMachine.start(streamingData);
     const rtcpSockets = [videoReturnSocket];
     if (audioReturnSocket) rtcpSockets.push(audioReturnSocket);
+    session.rtcpSockets = rtcpSockets;
     this.armNoRtcpConsumerWatch(sessionID, rtcpSockets);
 
     // Detect first frame from FFmpeg progress output (pipe:2 → stderr). Progress format:
@@ -939,6 +954,7 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
       // pre-encode state; frame=1 means first packet encoded and sent).
       if (!firstFrameEmitted && /^frame=([1-9]\d*)$/m.test(text)) {
         firstFrameEmitted = true;
+        this.beginRtcpAfterFirstFrame(session, sessionID, "start");
         emitTelemetry(this.cameraName, "live_session_first_frame", { sessionId: sessionID });
         emitTiming({ stage: "live_first_frame", camera: this.cameraName, sessionId: sessionID });
       }
@@ -1011,11 +1027,56 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
     this.controller?.forceStopStreamingSession(sessionID);
   }
 
+  private beginRtcpAfterFirstFrame(
+    session: ActiveSession,
+    sessionID: string,
+    spawn: "start" | "reconfigure",
+  ): void {
+    if (this.sessions.get(sessionID) !== session) return;
+    this.recordRtcpAfterFirstFrame(session);
+    const sockets = session.rtcpSockets ?? [];
+    session.rtcpWindow = {
+      sessionId: sessionID,
+      spawn,
+      baselines: sockets.map((socket) => ({ socket, count: socket.packetsSeen() })),
+    };
+  }
+
+  private recordRtcpAfterFirstFrame(session: ActiveSession): void {
+    const window = session.rtcpWindow;
+    if (window === undefined) return;
+    delete session.rtcpWindow;
+    let videoPackets = 0;
+    let audioPackets = 0;
+    let videoLastAt: number | null = null;
+    let audioLastAt: number | null = null;
+    for (const sample of window.baselines) {
+      const packets = Math.max(0, sample.socket.packetsSeen() - sample.count);
+      const lastAt = packets > 0 ? (sample.socket.lastPacketAt() ?? null) : null;
+      if (sample.socket.socketLabel() === "audio") {
+        audioPackets = packets;
+        audioLastAt = lastAt;
+      } else {
+        videoPackets = packets;
+        videoLastAt = lastAt;
+      }
+    }
+    emitTelemetry(this.cameraName, "rtcp_after_first_frame", {
+      sessionId: window.sessionId,
+      spawn: window.spawn,
+      videoPackets,
+      audioPackets,
+      videoLastAt,
+      audioLastAt,
+    });
+  }
+
   private stopStream(sessionID: string): void {
     const session = this.sessions.get(sessionID);
     if (!session) {
       return;
     }
+    this.recordRtcpAfterFirstFrame(session);
     if (session.noRtcpConsumerTimer) clearTimeout(session.noRtcpConsumerTimer);
 
     // Use state machine's idempotent stop() to get resources to clean up
