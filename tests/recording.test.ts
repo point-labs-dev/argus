@@ -87,7 +87,16 @@ describe("buildRecordingFfmpegArgs", () => {
     expect(joined).toContain("scale=1280:720");
     expect(joined).toContain("-b:v 2000k");
     expect(joined).toContain("-ar 32000"); // samplerate 3 = KHZ_32
-    expect(joined).toContain("expr:gte(t,n_forced*4)"); // 4000ms fragment -> 4s keyframes
+    expect(joined).toContain("expr:gte(t,if(eq(n_forced,0),0,1+(n_forced-1)*4))");
+  });
+
+  it("keeps a negotiated one second fragment on that same interval", () => {
+    const config = recordingConfig();
+    const mutable = config as { mediaContainerConfiguration: { fragmentLength: number } };
+    mutable.mediaContainerConfiguration.fragmentLength = 1000;
+    const joined = buildRecordingFfmpegArgs("rtsp://x/main", config, "16:9").join(" ");
+    expect(joined).toContain("expr:gte(t,n_forced*1)");
+    expect(joined).not.toContain("n_forced-1");
   });
 
   it("caps input analysis at the measured 200ms floor (recording-start latency)", () => {
@@ -206,11 +215,9 @@ describe("ArgusRecordingDelegate", () => {
     expect(packet?.isLast).toBe(false);
   });
 
-  it("delivers first video fragment at its natural boundary (~4s), not delayed by hold-back", async () => {
-    // Phase 3 requirement: first video fragment arrives at ~4s (its fragment boundary),
-    // not delayed to ~8s by holding one fragment back. With 4s fragments:
-    // - Pre-1.3.15: init@+4.27s, video1@+8.27s (every packet delayed by one fragment)
-    // - Post-1.3.15: init@+0.04s, video1@+4.22s (immediate delivery)
+  it("delivers the first video fragment when ffmpeg writes it", async () => {
+    // The delegate must not hold one fragment back. That hold delayed every
+    // packet by one fragment: init at about +4s and the first video at about +8s.
     const stdout = new PassThrough();
     const fakeProc = Object.assign(new EventEmitter(), { stdout, stderr: new PassThrough(), kill: vi.fn() });
     const spawnFn = vi.fn(() => fakeProc) as unknown as typeof import("node:child_process").spawn;
@@ -237,9 +244,8 @@ describe("ArgusRecordingDelegate", () => {
     const { value: packet } = await generator.next();
     const fragmentLatency = Date.now() - t0;
 
-    // First video fragment delivered without the +4s hold-back delay.
-    // Upper bound is generous (4.5s) because this is a mock test, not real ffmpeg;
-    // the real harness (verify-hksv-delivery.mjs) measures actual 4.22s timing.
+    // The mock writes the fragment 50ms after init. The delegate must yield it
+    // without adding a fragment-length hold.
     expect(fragmentLatency).toBeLessThan(4500);
     expect(packet?.data.toString("ascii", 4, 8)).toBe("moof");
     expect(packet?.isLast).toBe(false);
