@@ -7,6 +7,7 @@ import { parseJpegDimensions, SnapshotCache } from "../src/snapshot-cache.js";
 
 const jpeg = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10]);
 const invalidJpeg = Buffer.from([0x6e, 0x6f, 0x70, 0x65]);
+const timerResolutionMs = 1;
 
 function createConfig() {
   return parseArgusConfig({
@@ -197,8 +198,8 @@ describe("SnapshotCache", () => {
 
     expect(result).toEqual({ success: true, attempts: 2 });
     expect(fetchMock).toHaveBeenCalledTimes(2);
-    // Exponential backoff: first retry after 50ms * 2^0 = 50ms
-    expect(elapsed).toBeGreaterThanOrEqual(50);
+    const expectedWaitMs = 50;
+    expect(elapsed).toBeGreaterThanOrEqual(expectedWaitMs - timerResolutionMs);
     expect(elapsed).toBeLessThan(200);
   });
 
@@ -218,8 +219,8 @@ describe("SnapshotCache", () => {
 
     expect(result).toEqual({ success: true, attempts: 3 });
     expect(fetchMock).toHaveBeenCalledTimes(3);
-    // Exponential backoff: 50ms + 100ms = 150ms minimum
-    expect(elapsed).toBeGreaterThanOrEqual(150);
+    const expectedWaitMs = 50 + 100;
+    expect(elapsed).toBeGreaterThanOrEqual(expectedWaitMs - 2 * timerResolutionMs);
     expect(elapsed).toBeLessThan(300);
   });
 
@@ -253,9 +254,8 @@ describe("SnapshotCache", () => {
     await cache.warmStream("Front Door", "sub", 3, 100);
     const elapsed = Date.now() - startTime;
 
-    // Backoff: 100ms * 2^0 + 100ms * 2^1 = 100ms + 200ms = 300ms minimum
-    expect(elapsed).toBeGreaterThanOrEqual(300);
-    // Add 200ms buffer for execution time
-    expect(elapsed).toBeLessThan(600);
+    const expectedWaitMs = 100 + 200;
+    expect(elapsed).toBeGreaterThanOrEqual(expectedWaitMs - 2 * timerResolutionMs);
+    expect(elapsed).toBeLessThan(expectedWaitMs + 300);
   });
 });
