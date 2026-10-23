@@ -26,6 +26,9 @@ const FIXTURE_ENV: Record<string, string> = {
   ARGUS_FFMPEG: "/usr/local/bin/ffmpeg-homebridge",
 };
 
+const PINNED_NODE = "/opt/rollback/node@24/24.18.0/bin/node";
+const PINNED_DYLD = "/opt/homebrew/Cellar/simdjson/4.6.4/lib";
+
 function agentFixture(env: Record<string, string>): string {
   const entries = Object.entries(env)
     .map(([key, value]) => `    <key>${key}</key>\n    <string>${value}</string>`)
@@ -40,6 +43,37 @@ function agentFixture(env: Record<string, string>): string {
   <dict>
     <key>PATH</key>
     <string>/fixture/should-not-win</string>
+    <key>NOT_ARGUS</key>
+    <string>drop-me</string>
+${entries}
+  </dict>
+</dict>
+</plist>
+`;
+}
+
+function agentFixtureWithNode(env: Record<string, string>, nodePath: string, dyld: string): string {
+  const entries = Object.entries(env)
+    .map(([key, value]) => `    <key>${key}</key>\n    <string>${value}</string>`)
+    .join("\n");
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>dev.point-labs.argus</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${nodePath}</string>
+    <string>/fixture/dist/serve.js</string>
+    <string>/fixture/argus.yaml</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/fixture/should-not-win</string>
+    <key>DYLD_FALLBACK_LIBRARY_PATH</key>
+    <string>${dyld}</string>
     <key>NOT_ARGUS</key>
     <string>drop-me</string>
 ${entries}
@@ -76,6 +110,7 @@ type RenderOptions = {
   agentBody?: string;
   seedDaemon?: boolean;
   nodeStubVersion?: string;
+  omitAgentPlist?: boolean;
 };
 
 function writeDscl(bin: string, userHome: string) {
@@ -134,9 +169,11 @@ exit 1
   chmodSync(path.join(sudoHome, "bin", "argus-logrotate.sh"), 0o755);
   const agentBody = options.agentBody ?? agentFixture(FIXTURE_ENV);
   writeFileSync(fixture, agentBody);
-  const agentInHome = path.join(sudoHome, "Library", "LaunchAgents", `${LABEL}.plist`);
-  mkdirSync(path.dirname(agentInHome), { recursive: true });
-  writeFileSync(agentInHome, agentBody);
+  if (!options.omitAgentPlist) {
+    const agentInHome = path.join(sudoHome, "Library", "LaunchAgents", `${LABEL}.plist`);
+    mkdirSync(path.dirname(agentInHome), { recursive: true });
+    writeFileSync(agentInHome, agentBody);
+  }
   if (options.seedDaemon) {
     const dest = path.join(installRoot, "Library/LaunchDaemons", `${LABEL}.plist`);
     mkdirSync(path.dirname(dest), { recursive: true });
@@ -178,6 +215,35 @@ function cleanup(run: {
   if (run.createdServe) rmSync("dist/serve.js", { force: true });
   if (run.createdConfig) rmSync("argus.yaml", { force: true });
   rmSync(run.root, { recursive: true, force: true });
+}
+
+function writtenJob(installRoot: string, domain: "LaunchAgents" | "LaunchDaemons") {
+  return readPlist(path.join(installRoot, "Library", domain, `${LABEL}.plist`));
+}
+
+function expectAgentKeepsNodePin(installRoot: string, commandNode: string) {
+  const agent = writtenJob(installRoot, "LaunchAgents");
+  const daemon = writtenJob(installRoot, "LaunchDaemons");
+  const agentArgs = agent.ProgramArguments as string[];
+  const daemonArgs = daemon.ProgramArguments as string[];
+  const agentEnv = agent.EnvironmentVariables as Record<string, string>;
+  const daemonEnv = daemon.EnvironmentVariables as Record<string, string>;
+
+  expect(agentArgs[0]).toBe(PINNED_NODE);
+  expect(agentEnv.DYLD_FALLBACK_LIBRARY_PATH).toBe(PINNED_DYLD);
+  expect(agentArgs[1]).toMatch(/\/dist\/serve\.js$/);
+  expect(agentArgs[1]).not.toBe("/fixture/dist/serve.js");
+  expect(agentEnv.NOT_ARGUS).toBeUndefined();
+  expect(agentEnv.ARGUS_HAP_BIND).toBe(FIXTURE_ENV.ARGUS_HAP_BIND);
+  expect(agentEnv.PATH?.split(":")[0]).toBe(path.dirname(commandNode));
+
+  expect(daemonArgs[0]).toBe(commandNode);
+  expect(daemonEnv.DYLD_FALLBACK_LIBRARY_PATH).toBeUndefined();
+  expect(daemonEnv.PATH?.split(":")[0]).toBe(path.dirname(commandNode));
+  expect(daemonEnv.ARGUS_HAP_BIND).toBe(FIXTURE_ENV.ARGUS_HAP_BIND);
+  expect(daemonEnv.NOT_ARGUS).toBeUndefined();
+  expect(JSON.stringify(daemon)).not.toContain(PINNED_NODE);
+  expect(JSON.stringify(daemon)).not.toContain(PINNED_DYLD);
 }
 
 describe("install-launchd daemon plist", () => {
@@ -797,6 +863,66 @@ exit 0
       expect(existsSync(agent)).toBe(false);
       expect(readFileSync(disabledAgent, "utf8")).toBe(parkedBody);
       expect(readFileSync(state, "utf8")).toBe("gui/501/dev.point-labs.argus\n");
+    } finally {
+      cleanup(run);
+    }
+  });
+});
+
+describe("install-launchd agent node pin", () => {
+  it("keeps the agent node path and DYLD_FALLBACK_LIBRARY_PATH when command -v node differs", () => {
+    const run = renderDaemon("scripts/install-launchd.sh", {}, true, {
+      includeAgentPlistEnv: false,
+      nodeStubVersion: "24.22.1",
+      agentBody: agentFixtureWithNode(FIXTURE_ENV, PINNED_NODE, PINNED_DYLD),
+    });
+    try {
+      expect(run.result.status, `${run.result.stdout}\n${run.result.stderr}`).toBe(0);
+      expect(run.result.stderr).not.toContain("older than engines");
+      expectAgentKeepsNodePin(run.installRoot, path.join(run.bin, "node"));
+    } finally {
+      cleanup(run);
+    }
+  });
+
+  it("uses command -v node when the agent plist is missing", () => {
+    const run = renderDaemon("scripts/install-launchd.sh", FIXTURE_ENV, true, {
+      includeAgentPlistEnv: false,
+      omitAgentPlist: true,
+      nodeStubVersion: "24.22.1",
+    });
+    try {
+      expect(run.result.status, `${run.result.stdout}\n${run.result.stderr}`).toBe(0);
+      const commandNode = path.join(run.bin, "node");
+      const agent = writtenJob(run.installRoot, "LaunchAgents");
+      const daemon = writtenJob(run.installRoot, "LaunchDaemons");
+      const agentEnv = agent.EnvironmentVariables as Record<string, string>;
+      const daemonEnv = daemon.EnvironmentVariables as Record<string, string>;
+      expect((agent.ProgramArguments as string[])[0]).toBe(commandNode);
+      expect((daemon.ProgramArguments as string[])[0]).toBe(commandNode);
+      expect(agentEnv.DYLD_FALLBACK_LIBRARY_PATH).toBeUndefined();
+      expect(daemonEnv.DYLD_FALLBACK_LIBRARY_PATH).toBeUndefined();
+      expect(agentEnv.ARGUS_HAP_BIND).toBe(FIXTURE_ENV.ARGUS_HAP_BIND);
+      expect(daemonEnv.ARGUS_HAP_BIND).toBe(FIXTURE_ENV.ARGUS_HAP_BIND);
+    } finally {
+      cleanup(run);
+    }
+  });
+
+  it("keeps the agent pin and exits 0 when the resolved node is older than engines", () => {
+    const run = renderDaemon("scripts/install-launchd.sh", {}, true, {
+      includeAgentPlistEnv: false,
+      nodeStubVersion: "24.18.0",
+      agentBody: agentFixtureWithNode(FIXTURE_ENV, PINNED_NODE, PINNED_DYLD),
+    });
+    try {
+      expect(run.result.status, `${run.result.stdout}\n${run.result.stderr}`).toBe(0);
+      expect(run.result.stderr).toContain(
+        "resolved node 24.18.0 is older than engines minimum >=24.22.1",
+      );
+      expect(run.result.stderr).not.toContain("10.0.0.15");
+      expect(run.result.stderr).not.toMatch(/password/i);
+      expectAgentKeepsNodePin(run.installRoot, path.join(run.bin, "node"));
     } finally {
       cleanup(run);
     }
