@@ -196,6 +196,7 @@ export function buildRecordingFfmpegArgs(
     // negotiated length. Each one still begins on an IDR.
     "-c:v", "libx264",
     "-preset", "veryfast",
+    "-x264-params", "sync-lookahead=0",
     "-profile:v", profile,
     "-level", level,
     "-pix_fmt", "yuv420p",
