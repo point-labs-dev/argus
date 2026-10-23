@@ -46,12 +46,60 @@ if [[ "$RENDER_ONLY" != "1" ]]; then
 fi
 
 xml_escape() {
-  local s=$1
-  s=${s//&/&amp;}
-  s=${s//</&lt;}
-  s=${s//>/&gt;}
-  s=${s//\"/&quot;}
-  printf '%s' "$s"
+  local s=$1 out="" ch i
+  for ((i = 0; i < ${#s}; i++)); do
+    ch=${s:i:1}
+    case "$ch" in
+      '&') out+='&amp;' ;;
+      '<') out+='&lt;' ;;
+      '>') out+='&gt;' ;;
+      '"') out+='&quot;' ;;
+      *) out+="$ch" ;;
+    esac
+  done
+  printf '%s' "$out"
+}
+
+agent_pin_warning() {
+  echo "warning: agent node pin unread, using command -v node" >&2
+}
+
+read_agent_pin() {
+  local src=$1
+  PIN_NODE=""
+  PIN_DYLD=""
+  if ! command -v python3 >/dev/null 2>&1; then
+    agent_pin_warning
+    return 1
+  fi
+  local pin_text=""
+  local rc=0
+  pin_text="$(python3 - "$src" 2>/dev/null <<'PY'
+import plistlib, sys
+try:
+    with open(sys.argv[1], "rb") as handle:
+        data = plistlib.load(handle)
+except Exception:
+    sys.exit(1)
+args = data.get("ProgramArguments")
+node = ""
+if isinstance(args, list) and args and isinstance(args[0], str):
+    node = args[0].replace("\n", "").replace("\r", "")
+env = data.get("EnvironmentVariables")
+dyld = ""
+if isinstance(env, dict) and isinstance(env.get("DYLD_FALLBACK_LIBRARY_PATH"), str):
+    dyld = env["DYLD_FALLBACK_LIBRARY_PATH"].replace("\n", "").replace("\r", "")
+sys.stdout.write(node + "\n" + dyld + "\n.\n")
+PY
+)" || rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    agent_pin_warning
+    return 1
+  fi
+  PIN_NODE="${pin_text%%$'\n'*}"
+  local rest="${pin_text#*$'\n'}"
+  PIN_DYLD="${rest%%$'\n'*}"
+  return 0
 }
 
 build_argus_xml() {
@@ -112,8 +160,11 @@ build_argus_xml() {
 }
 
 write_job_plist() {
-  local dest=$1
-  local user_name=${2:-}
+  local dest="$1"
+  local user_name="${2:-}"
+  local node_bin="${3:-$NODE_BIN}"
+  local dyld_fallback="${4:-}"
+  local path_value="${5:-$DAEMON_PATH}"
   mkdir -p "$(dirname "$dest")"
   {
     printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>'
@@ -128,7 +179,7 @@ write_job_plist() {
     fi
     printf '%s\n' '  <key>ProgramArguments</key>'
     printf '%s\n' '  <array>'
-    printf '%s\n' "    <string>${NODE_BIN}</string>"
+    printf '%s\n' "    <string>$(xml_escape "$node_bin")</string>"
     printf '%s\n' "    <string>${REPO_DIR}/dist/serve.js</string>"
     printf '%s\n' "    <string>${REPO_DIR}/argus.yaml</string>"
     printf '%s\n' '  </array>'
@@ -137,7 +188,11 @@ write_job_plist() {
     printf '%s\n' '  <key>EnvironmentVariables</key>'
     printf '%s\n' '  <dict>'
     printf '%s\n' '    <key>PATH</key>'
-    printf '%s\n' "    <string>${DAEMON_PATH}</string>"
+    printf '%s\n' "    <string>$(xml_escape "$path_value")</string>"
+    if [[ -n "$dyld_fallback" ]]; then
+      printf '%s\n' '    <key>DYLD_FALLBACK_LIBRARY_PATH</key>'
+      printf '%s\n' "    <string>$(xml_escape "$dyld_fallback")</string>"
+    fi
     if [[ -n "${ARGUS_XML:-}" ]]; then
       printf '%s\n' "$ARGUS_XML"
     fi
@@ -215,9 +270,10 @@ node_version_older() {
 }
 
 warn_if_node_below_engines() {
+  local bin="${1:-$NODE_BIN}"
   local raw ver min
   min="24.22.1"
-  raw="$("$NODE_BIN" --version 2>/dev/null || true)"
+  raw="$("$bin" --version 2>/dev/null || true)"
   ver="${raw#v}"
   ver="${ver%%[!0-9.]*}"
   [[ "$ver" == *.* ]] || return 0
@@ -225,7 +281,6 @@ warn_if_node_below_engines() {
     echo "warning: resolved node ${ver} is older than engines minimum >=${min}" >&2
   fi
 }
-warn_if_node_below_engines || true
 [[ -x "$FFMPEG_BIN" ]] || { echo "ffmpeg not found in PATH" >&2; exit 1; }
 [[ -f "$REPO_DIR/dist/serve.js" ]] || { echo "dist/serve.js missing. Run npm run build first." >&2; exit 1; }
 [[ -f "$REPO_DIR/argus.yaml" ]] || { echo "argus.yaml missing in $REPO_DIR" >&2; exit 1; }
@@ -252,6 +307,26 @@ if [[ -z "${ARGUS_XML}" ]]; then
   exit 1
 fi
 
+AGENT_NODE_BIN="$NODE_BIN"
+AGENT_DYLD=""
+if [[ -n "$SOURCE_PLIST" ]]; then
+  if read_agent_pin "$SOURCE_PLIST"; then
+    pinned_base="${PIN_NODE##*/}"
+    if [[ -n "$PIN_NODE" && "$pinned_base" == "node" && -x "$PIN_NODE" ]]; then
+      AGENT_NODE_BIN="$PIN_NODE"
+      AGENT_DYLD="$PIN_DYLD"
+    fi
+  fi
+fi
+warn_if_node_below_engines "$AGENT_NODE_BIN" || true
+AGENT_PATH="$DAEMON_PATH"
+if [[ "$AGENT_NODE_BIN" != "$NODE_BIN" ]]; then
+  pin_dir="$(dirname "$AGENT_NODE_BIN")"
+  if [[ "$pin_dir" != "$(dirname "$NODE_BIN")" ]]; then
+    AGENT_PATH="${pin_dir}:${DAEMON_PATH}"
+  fi
+fi
+
 if [[ "$RENDER_ONLY" != "1" ]]; then
   mkdir -p "$REPO_DIR/logs"
 fi
@@ -261,7 +336,7 @@ USER_HOME="$(effective_home)"
 if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" && -z "$INSTALL_ROOT" ]]; then
   write_job_plist "$DAEMON_PLIST" "$USER_NAME"
 else
-  write_job_plist "$AGENT_PLIST" ""
+  write_job_plist "$AGENT_PLIST" "" "$AGENT_NODE_BIN" "$AGENT_DYLD" "$AGENT_PATH"
   write_job_plist "$DAEMON_PLIST" "$USER_NAME"
 fi
 write_logrotate_plist "$(dirname "$DAEMON_PLIST")/${LOGROTATE_LABEL}.plist" "$USER_NAME" "$USER_HOME"
