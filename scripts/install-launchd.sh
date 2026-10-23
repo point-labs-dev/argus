@@ -54,6 +54,34 @@ xml_escape() {
   printf '%s' "$s"
 }
 
+plist_program_node() {
+  local src=$1
+  python3 - "$src" <<'PY'
+import plistlib, sys
+with open(sys.argv[1], "rb") as handle:
+    data = plistlib.load(handle)
+args = data.get("ProgramArguments")
+node = ""
+if isinstance(args, list) and args and isinstance(args[0], str):
+    node = args[0]
+sys.stdout.write(node)
+PY
+}
+
+plist_dyld_fallback() {
+  local src=$1
+  python3 - "$src" <<'PY'
+import plistlib, sys
+with open(sys.argv[1], "rb") as handle:
+    data = plistlib.load(handle)
+env = data.get("EnvironmentVariables")
+dyld = ""
+if isinstance(env, dict) and isinstance(env.get("DYLD_FALLBACK_LIBRARY_PATH"), str):
+    dyld = env["DYLD_FALLBACK_LIBRARY_PATH"]
+sys.stdout.write(dyld)
+PY
+}
+
 build_argus_xml() {
   local src_plist=$1
   local tmp var
@@ -112,8 +140,10 @@ build_argus_xml() {
 }
 
 write_job_plist() {
-  local dest=$1
-  local user_name=${2:-}
+  local dest="$1"
+  local user_name="${2:-}"
+  local node_bin="${3:-$NODE_BIN}"
+  local dyld_fallback="${4:-}"
   mkdir -p "$(dirname "$dest")"
   {
     printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>'
@@ -128,7 +158,7 @@ write_job_plist() {
     fi
     printf '%s\n' '  <key>ProgramArguments</key>'
     printf '%s\n' '  <array>'
-    printf '%s\n' "    <string>${NODE_BIN}</string>"
+    printf '%s\n' "    <string>$(xml_escape "$node_bin")</string>"
     printf '%s\n' "    <string>${REPO_DIR}/dist/serve.js</string>"
     printf '%s\n' "    <string>${REPO_DIR}/argus.yaml</string>"
     printf '%s\n' '  </array>'
@@ -138,6 +168,10 @@ write_job_plist() {
     printf '%s\n' '  <dict>'
     printf '%s\n' '    <key>PATH</key>'
     printf '%s\n' "    <string>${DAEMON_PATH}</string>"
+    if [[ -n "$dyld_fallback" ]]; then
+      printf '%s\n' '    <key>DYLD_FALLBACK_LIBRARY_PATH</key>'
+      printf '%s\n' "    <string>$(xml_escape "$dyld_fallback")</string>"
+    fi
     if [[ -n "${ARGUS_XML:-}" ]]; then
       printf '%s\n' "$ARGUS_XML"
     fi
@@ -252,6 +286,17 @@ if [[ -z "${ARGUS_XML}" ]]; then
   exit 1
 fi
 
+AGENT_NODE_BIN="$NODE_BIN"
+AGENT_DYLD=""
+if [[ -n "$SOURCE_PLIST" ]]; then
+  pinned_node="$(plist_program_node "$SOURCE_PLIST")"
+  pinned_base="${pinned_node##*/}"
+  if [[ -n "$pinned_node" && "$pinned_base" == "node" ]]; then
+    AGENT_NODE_BIN="$pinned_node"
+  fi
+  AGENT_DYLD="$(plist_dyld_fallback "$SOURCE_PLIST")"
+fi
+
 if [[ "$RENDER_ONLY" != "1" ]]; then
   mkdir -p "$REPO_DIR/logs"
 fi
@@ -261,7 +306,7 @@ USER_HOME="$(effective_home)"
 if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" && -z "$INSTALL_ROOT" ]]; then
   write_job_plist "$DAEMON_PLIST" "$USER_NAME"
 else
-  write_job_plist "$AGENT_PLIST" ""
+  write_job_plist "$AGENT_PLIST" "" "$AGENT_NODE_BIN" "$AGENT_DYLD"
   write_job_plist "$DAEMON_PLIST" "$USER_NAME"
 fi
 write_logrotate_plist "$(dirname "$DAEMON_PLIST")/${LOGROTATE_LABEL}.plist" "$USER_NAME" "$USER_HOME"
