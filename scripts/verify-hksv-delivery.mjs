@@ -5,9 +5,10 @@
 // HAP-NodeJS would put it on the wire to the Home Hub.
 //
 // What to look for: the init segment (ftyp+moov) should leave as soon as ffmpeg
-// emits it (sub-second), and fragment N should leave at its own fragment
-// boundary (~N*4s), NOT one fragment later. The pre-1.3.15 hold-one-back
-// pattern delayed every packet by a full 4s fragment.
+// emits it (sub-second). The first media fragment closes at about 1s. The next
+// one closes one negotiated fragment later (about +4s, so about +5s from
+// start). The pre-1.3.15 hold-one-back pattern delayed every packet by a full
+// 4s fragment.
 //
 // Usage: npm run build && node scripts/verify-hksv-delivery.mjs
 import { spawn } from "node:child_process";

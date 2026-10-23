@@ -97,6 +97,21 @@ function requireAspect(aspect: unknown, label: string): CameraAspect {
   return aspect;
 }
 
+const FIRST_FRAGMENT_SEC = 1;
+
+/**
+ * The first media fragment is closed by the second forced keyframe. On a
+ * realtime source that interval is the wall clock. One second for the first
+ * interval, then the negotiated fragment length. A negotiated length of one
+ * second or less stays on that single interval.
+ */
+function recordingKeyframeExpr(fragmentSec: number): string {
+  if (fragmentSec <= FIRST_FRAGMENT_SEC) {
+    return `expr:gte(t,n_forced*${fragmentSec})`;
+  }
+  return `expr:gte(t,if(eq(n_forced,0),0,${FIRST_FRAGMENT_SEC}+(n_forced-1)*${fragmentSec}))`;
+}
+
 /** Recording options Argus offers to HomeKit (resolutions cover the required set). */
 export function buildRecordingOptions(): CameraRecordingOptions {
   return {
@@ -144,8 +159,9 @@ function recordingVideoFilter(width: number, height: number, aspect: CameraAspec
 
 /**
  * Pure builder for the FFmpeg fragmented-MP4 command HKSV records from. Unlike live
- * view, recording uses the full-res MAIN stream (transcoded H.264 + AAC-LC), with
- * keyframes aligned to the fragment length so each fragment starts on an IDR.
+ * view, recording uses the full-res MAIN stream (transcoded H.264 + AAC-LC).
+ * Each fragment starts on an IDR. The first interval is 1s and later intervals
+ * follow the negotiated fragment length.
  */
 export function buildRecordingFfmpegArgs(
   mainUrl: string,
@@ -159,6 +175,7 @@ export function buildRecordingFfmpegArgs(
   const level = LEVEL_TO_X264[params.level] ?? "4.0";
   const fragmentSec = Math.max(config.mediaContainerConfiguration.fragmentLength / 1000, 1);
   const audioHz = SAMPLERATE_TO_HZ[config.audioCodec.samplerate] ?? 32000;
+  const keyframeExpr = recordingKeyframeExpr(fragmentSec);
 
   return [
     "-hide_banner",
@@ -175,7 +192,8 @@ export function buildRecordingFfmpegArgs(
 
     // ONE output carrying BOTH streams (unlike live view's two separate SRTP outputs,
     // so no -an/-vn here). Video: transcode the main stream to the negotiated H.264
-    // envelope; keyframes every fragment so each fMP4 fragment begins with an IDR.
+    // envelope. The first fragment closes at 1s. Later fragments stay on the
+    // negotiated length. Each one still begins on an IDR.
     "-c:v", "libx264",
     "-preset", "veryfast",
     "-profile:v", profile,
@@ -187,7 +205,7 @@ export function buildRecordingFfmpegArgs(
     "-b:v", `${params.bitRate}k`,
     "-maxrate", `${params.bitRate}k`,
     "-bufsize", `${2 * params.bitRate}k`,
-    "-force_key_frames", `expr:gte(t,n_forced*${fragmentSec})`,
+    "-force_key_frames", keyframeExpr,
 
     // audio: AAC-LC (ffmpeg native — no libfdk needed) at the negotiated rate.
     "-c:a", "aac",
