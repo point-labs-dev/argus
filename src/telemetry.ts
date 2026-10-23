@@ -16,6 +16,7 @@ export type TelemetryEventType =
   | "live_session_start"
   | "live_session_stop"
   | "live_session_first_frame"
+  | "rtcp_after_first_frame"
   | "hksv_recording_start"
   | "hksv_first_fragment"
   | "hksv_recording_stop"

@@ -245,6 +245,9 @@ describe("RTCP after the first frame", () => {
     socket.emit("message", Buffer.from([0x80, 0xc9, 0x00, 0x01, 0x00]));
     expect(logs).toEqual(["RTCP arrived on video return port (4 bytes)"]);
     expect(packets.map((event) => event.size)).toEqual([4, 5]);
+    expect(rtcp.packetsSeen()).toBe(2);
+    expect(rtcp.lastPacketAt()).toEqual(expect.any(Number));
+    expect(rtcp.socketLabel()).toBe("video");
   });
 
   it("counts packets after the first frame on the start spawn", async () => {
