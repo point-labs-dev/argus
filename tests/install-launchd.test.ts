@@ -5,7 +5,9 @@ import {
   mkdtempSync,
   mkdirSync,
   readFileSync,
+  readdirSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -26,8 +28,29 @@ const FIXTURE_ENV: Record<string, string> = {
   ARGUS_FFMPEG: "/usr/local/bin/ffmpeg-homebridge",
 };
 
-const PINNED_NODE = "/opt/rollback/node@24/24.18.0/bin/node";
 const PINNED_DYLD = "/opt/homebrew/Cellar/simdjson/4.6.4/lib";
+const PIN_UNREAD_WARNING = "warning: agent node pin unread, using command -v node";
+
+const agentNodePinAcceptance = {
+  malformedPlist:
+    "A malformed existing plist falls back to command -v node, with a warning, and exits 0.",
+  missingPython:
+    "A missing python3 falls back to command -v node, with that same warning, and exits 0.",
+  notExecutable: "A node path that is not executable is not pinned.",
+  agentPath:
+    "The pinned node's directory is first in the agent PATH, ahead of the command -v node directory.",
+  enginesWarning: "The engines warning runs against the pinned binary and still exits 0.",
+  basename: "An executable program whose basename is not node is not pinned.",
+  xmlEscape: "The rewritten agent plist XML-escapes the node path.",
+} as const;
+
+function xmlText(value: string): string {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;");
+}
 
 function agentFixture(env: Record<string, string>): string {
   const entries = Object.entries(env)
@@ -64,7 +87,7 @@ function agentFixtureWithNode(env: Record<string, string>, nodePath: string, dyl
   <string>dev.point-labs.argus</string>
   <key>ProgramArguments</key>
   <array>
-    <string>${nodePath}</string>
+    <string>${xmlText(nodePath)}</string>
     <string>/fixture/dist/serve.js</string>
     <string>/fixture/argus.yaml</string>
   </array>
@@ -73,7 +96,7 @@ function agentFixtureWithNode(env: Record<string, string>, nodePath: string, dyl
     <key>PATH</key>
     <string>/fixture/should-not-win</string>
     <key>DYLD_FALLBACK_LIBRARY_PATH</key>
-    <string>${dyld}</string>
+    <string>${xmlText(dyld)}</string>
     <key>NOT_ARGUS</key>
     <string>drop-me</string>
 ${entries}
@@ -104,6 +127,14 @@ const CRED_FILE = "/tmp/argus-streams.json";
 const LABEL = "dev.point-labs.argus";
 const LOGROTATE_LABEL = "dev.point-labs.argus.logrotate";
 
+type PrepareLayout = {
+  root: string;
+  bin: string;
+  home: string;
+  sudoHome: string;
+  fixture: string;
+};
+
 type RenderOptions = {
   includeAgentPlistEnv?: boolean;
   separateSudoHome?: boolean;
@@ -111,7 +142,57 @@ type RenderOptions = {
   seedDaemon?: boolean;
   nodeStubVersion?: string;
   omitAgentPlist?: boolean;
+  hidePython3?: boolean;
+  prepare?: (layout: PrepareLayout) => void;
 };
+
+function writeNodeStub(file: string, version: string, mode = 0o755) {
+  mkdirSync(path.dirname(file), { recursive: true });
+  writeFileSync(
+    file,
+    `#!/bin/bash
+if [[ "\${1:-}" == "--version" ]]; then
+  printf '%s\\n' "v${version}"
+  exit 0
+fi
+echo "unexpected node invocation" >&2
+exit 1
+`,
+  );
+  chmodSync(file, mode);
+}
+
+function installAgentBody(layout: PrepareLayout, body: string) {
+  writeFileSync(layout.fixture, body);
+  const agent = path.join(layout.sudoHome, "Library", "LaunchAgents", `${LABEL}.plist`);
+  mkdirSync(path.dirname(agent), { recursive: true });
+  writeFileSync(agent, body);
+}
+
+function pathWithoutPython(extraBin: string, root: string): string {
+  const dir = path.join(root, "nopython");
+  mkdirSync(dir, { recursive: true });
+  const sources = (process.env.PATH ?? "").split(":").filter((part) => part && part !== extraBin);
+  for (const source of sources) {
+    let names: string[];
+    try {
+      names = readdirSync(source);
+    } catch {
+      continue;
+    }
+    for (const name of names) {
+      if (name === "python" || name.startsWith("python")) continue;
+      const dest = path.join(dir, name);
+      if (existsSync(dest)) continue;
+      try {
+        symlinkSync(path.join(source, name), dest);
+      } catch {
+        continue;
+      }
+    }
+  }
+  return `${extraBin}:${dir}`;
+}
 
 function writeDscl(bin: string, userHome: string) {
   writeFileSync(
@@ -182,11 +263,13 @@ exit 1
   const createdServe = ensureRepoFile("dist/serve.js", "");
   const createdConfig = ensureRepoFile("argus.yaml", "cameras: []\n");
   const includeAgentPlistEnv = options.includeAgentPlistEnv ?? true;
+  options.prepare?.({ root, bin, home, sudoHome, fixture });
+  const commandPath = options.hidePython3 ? pathWithoutPython(bin, root) : `${bin}:${process.env.PATH ?? ""}`;
   try {
     const result = spawnSync("bash", [script], {
       encoding: "utf8",
       env: {
-        PATH: `${bin}:${process.env.PATH ?? ""}`,
+        PATH: commandPath,
         HOME: home,
         TMPDIR: root,
         USER: "ubuntu",
@@ -221,28 +304,31 @@ function writtenJob(installRoot: string, domain: "LaunchAgents" | "LaunchDaemons
   return readPlist(path.join(installRoot, "Library", domain, `${LABEL}.plist`));
 }
 
-function expectAgentKeepsNodePin(installRoot: string, commandNode: string) {
+function expectAgentKeepsNodePin(installRoot: string, commandNode: string, pinnedNode: string) {
   const agent = writtenJob(installRoot, "LaunchAgents");
   const daemon = writtenJob(installRoot, "LaunchDaemons");
   const agentArgs = agent.ProgramArguments as string[];
   const daemonArgs = daemon.ProgramArguments as string[];
   const agentEnv = agent.EnvironmentVariables as Record<string, string>;
   const daemonEnv = daemon.EnvironmentVariables as Record<string, string>;
+  const agentPath = agentEnv.PATH?.split(":") ?? [];
+  const daemonPath = daemonEnv.PATH?.split(":") ?? [];
 
-  expect(agentArgs[0]).toBe(PINNED_NODE);
+  expect(agentArgs[0]).toBe(pinnedNode);
   expect(agentEnv.DYLD_FALLBACK_LIBRARY_PATH).toBe(PINNED_DYLD);
   expect(agentArgs[1]).toMatch(/\/dist\/serve\.js$/);
   expect(agentArgs[1]).not.toBe("/fixture/dist/serve.js");
   expect(agentEnv.NOT_ARGUS).toBeUndefined();
   expect(agentEnv.ARGUS_HAP_BIND).toBe(FIXTURE_ENV.ARGUS_HAP_BIND);
-  expect(agentEnv.PATH?.split(":")[0]).toBe(path.dirname(commandNode));
+  expect(agentPath[0]).toBe(path.dirname(pinnedNode));
+  expect(agentPath[1]).toBe(path.dirname(commandNode));
 
   expect(daemonArgs[0]).toBe(commandNode);
   expect(daemonEnv.DYLD_FALLBACK_LIBRARY_PATH).toBeUndefined();
-  expect(daemonEnv.PATH?.split(":")[0]).toBe(path.dirname(commandNode));
+  expect(daemonPath[0]).toBe(path.dirname(commandNode));
   expect(daemonEnv.ARGUS_HAP_BIND).toBe(FIXTURE_ENV.ARGUS_HAP_BIND);
   expect(daemonEnv.NOT_ARGUS).toBeUndefined();
-  expect(JSON.stringify(daemon)).not.toContain(PINNED_NODE);
+  expect(JSON.stringify(daemon)).not.toContain(pinnedNode);
   expect(JSON.stringify(daemon)).not.toContain(PINNED_DYLD);
 }
 
@@ -871,15 +957,20 @@ exit 0
 
 describe("install-launchd agent node pin", () => {
   it("keeps the agent node path and DYLD_FALLBACK_LIBRARY_PATH when command -v node differs", () => {
+    let pinned = "";
     const run = renderDaemon("scripts/install-launchd.sh", {}, true, {
       includeAgentPlistEnv: false,
       nodeStubVersion: "24.22.1",
-      agentBody: agentFixtureWithNode(FIXTURE_ENV, PINNED_NODE, PINNED_DYLD),
+      prepare(layout) {
+        pinned = path.join(layout.root, "rollback", "bin", "node");
+        writeNodeStub(pinned, "24.22.1");
+        installAgentBody(layout, agentFixtureWithNode(FIXTURE_ENV, pinned, PINNED_DYLD));
+      },
     });
     try {
       expect(run.result.status, `${run.result.stdout}\n${run.result.stderr}`).toBe(0);
       expect(run.result.stderr).not.toContain("older than engines");
-      expectAgentKeepsNodePin(run.installRoot, path.join(run.bin, "node"));
+      expectAgentKeepsNodePin(run.installRoot, path.join(run.bin, "node"), pinned);
     } finally {
       cleanup(run);
     }
@@ -909,11 +1000,133 @@ describe("install-launchd agent node pin", () => {
     }
   });
 
-  it("keeps the agent pin and exits 0 when the resolved node is older than engines", () => {
+  it(agentNodePinAcceptance.malformedPlist, () => {
+    const malformed = `<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/rollback/node@24/24.18.0/bin/node
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>ARGUS_HAP_BIND</key>
+    <string>10.0.0.8</string>
+    <key>DYLD_FALLBACK_LIBRARY_PATH</key>
+    <string>${PINNED_DYLD}</string>
+  </dict>
+</dict>
+</plist>
+`;
     const run = renderDaemon("scripts/install-launchd.sh", {}, true, {
       includeAgentPlistEnv: false,
-      nodeStubVersion: "24.18.0",
-      agentBody: agentFixtureWithNode(FIXTURE_ENV, PINNED_NODE, PINNED_DYLD),
+      nodeStubVersion: "24.22.1",
+      agentBody: malformed,
+    });
+    try {
+      expect(run.result.status, `${run.result.stdout}\n${run.result.stderr}`).toBe(0);
+      expect(run.result.stderr).toContain(PIN_UNREAD_WARNING);
+      expect(run.result.stderr).not.toContain(PINNED_DYLD);
+      const commandNode = path.join(run.bin, "node");
+      const agent = writtenJob(run.installRoot, "LaunchAgents");
+      const daemon = writtenJob(run.installRoot, "LaunchDaemons");
+      expect((agent.ProgramArguments as string[])[0]).toBe(commandNode);
+      expect((daemon.ProgramArguments as string[])[0]).toBe(commandNode);
+      expect((agent.EnvironmentVariables as Record<string, string>).DYLD_FALLBACK_LIBRARY_PATH).toBeUndefined();
+      expect((agent.EnvironmentVariables as Record<string, string>).ARGUS_HAP_BIND).toBe("10.0.0.8");
+    } finally {
+      cleanup(run);
+    }
+  });
+
+  it(agentNodePinAcceptance.missingPython, () => {
+    let pinned = "";
+    const run = renderDaemon("scripts/install-launchd.sh", {}, true, {
+      includeAgentPlistEnv: false,
+      nodeStubVersion: "24.22.1",
+      hidePython3: true,
+      prepare(layout) {
+        pinned = path.join(layout.root, "rollback", "bin", "node");
+        writeNodeStub(pinned, "24.18.0");
+        installAgentBody(layout, agentFixtureWithNode(FIXTURE_ENV, pinned, PINNED_DYLD));
+      },
+    });
+    try {
+      expect(run.result.status, `${run.result.stdout}\n${run.result.stderr}`).toBe(0);
+      expect(run.result.stderr).toContain(PIN_UNREAD_WARNING);
+      expect(run.result.stderr).not.toContain("older than engines");
+      const commandNode = path.join(run.bin, "node");
+      const agent = writtenJob(run.installRoot, "LaunchAgents");
+      expect((agent.ProgramArguments as string[])[0]).toBe(commandNode);
+      expect((agent.ProgramArguments as string[])[0]).not.toBe(pinned);
+      expect((agent.EnvironmentVariables as Record<string, string>).DYLD_FALLBACK_LIBRARY_PATH).toBeUndefined();
+    } finally {
+      cleanup(run);
+    }
+  });
+
+  it(agentNodePinAcceptance.notExecutable, () => {
+    let pinned = "";
+    const run = renderDaemon("scripts/install-launchd.sh", {}, true, {
+      includeAgentPlistEnv: false,
+      nodeStubVersion: "24.22.1",
+      prepare(layout) {
+        pinned = path.join(layout.root, "rollback", "bin", "node");
+        writeNodeStub(pinned, "24.18.0", 0o644);
+        installAgentBody(layout, agentFixtureWithNode(FIXTURE_ENV, pinned, PINNED_DYLD));
+      },
+    });
+    try {
+      expect(run.result.status, `${run.result.stdout}\n${run.result.stderr}`).toBe(0);
+      expect(run.result.stderr).not.toContain(PIN_UNREAD_WARNING);
+      expect(run.result.stderr).not.toContain("older than engines");
+      const commandNode = path.join(run.bin, "node");
+      const agent = writtenJob(run.installRoot, "LaunchAgents");
+      const daemon = writtenJob(run.installRoot, "LaunchDaemons");
+      expect((agent.ProgramArguments as string[])[0]).toBe(commandNode);
+      expect((daemon.ProgramArguments as string[])[0]).toBe(commandNode);
+      expect((agent.EnvironmentVariables as Record<string, string>).DYLD_FALLBACK_LIBRARY_PATH).toBeUndefined();
+      expect(JSON.stringify(agent)).not.toContain(pinned);
+    } finally {
+      cleanup(run);
+    }
+  });
+
+  it(agentNodePinAcceptance.agentPath, () => {
+    let pinned = "";
+    const run = renderDaemon("scripts/install-launchd.sh", {}, true, {
+      includeAgentPlistEnv: false,
+      nodeStubVersion: "24.22.1",
+      prepare(layout) {
+        pinned = path.join(layout.root, "rollback", "bin", "node");
+        writeNodeStub(pinned, "24.22.1");
+        installAgentBody(layout, agentFixtureWithNode(FIXTURE_ENV, pinned, PINNED_DYLD));
+      },
+    });
+    try {
+      expect(run.result.status, `${run.result.stdout}\n${run.result.stderr}`).toBe(0);
+      const commandNode = path.join(run.bin, "node");
+      const agentEnv = writtenJob(run.installRoot, "LaunchAgents").EnvironmentVariables as Record<string, string>;
+      const daemonEnv = writtenJob(run.installRoot, "LaunchDaemons").EnvironmentVariables as Record<string, string>;
+      const agentPath = agentEnv.PATH?.split(":") ?? [];
+      expect(agentPath[0]).toBe(path.dirname(pinned));
+      expect(agentPath[1]).toBe(path.dirname(commandNode));
+      expect(daemonEnv.PATH?.split(":")[0]).toBe(path.dirname(commandNode));
+    } finally {
+      cleanup(run);
+    }
+  });
+
+  it(agentNodePinAcceptance.enginesWarning, () => {
+    let pinned = "";
+    const run = renderDaemon("scripts/install-launchd.sh", {}, true, {
+      includeAgentPlistEnv: false,
+      nodeStubVersion: "24.22.1",
+      prepare(layout) {
+        pinned = path.join(layout.root, "rollback", "bin", "node");
+        writeNodeStub(pinned, "24.18.0");
+        installAgentBody(layout, agentFixtureWithNode(FIXTURE_ENV, pinned, PINNED_DYLD));
+      },
     });
     try {
       expect(run.result.status, `${run.result.stdout}\n${run.result.stderr}`).toBe(0);
@@ -922,7 +1135,56 @@ describe("install-launchd agent node pin", () => {
       );
       expect(run.result.stderr).not.toContain("10.0.0.15");
       expect(run.result.stderr).not.toMatch(/password/i);
-      expectAgentKeepsNodePin(run.installRoot, path.join(run.bin, "node"));
+      expectAgentKeepsNodePin(run.installRoot, path.join(run.bin, "node"), pinned);
+    } finally {
+      cleanup(run);
+    }
+  });
+
+  it(agentNodePinAcceptance.basename, () => {
+    let other = "";
+    const run = renderDaemon("scripts/install-launchd.sh", {}, true, {
+      includeAgentPlistEnv: false,
+      nodeStubVersion: "24.22.1",
+      prepare(layout) {
+        other = path.join(layout.root, "rollback", "bin", "nodejs");
+        writeNodeStub(other, "24.18.0");
+        installAgentBody(layout, agentFixtureWithNode(FIXTURE_ENV, other, PINNED_DYLD));
+      },
+    });
+    try {
+      expect(run.result.status, `${run.result.stdout}\n${run.result.stderr}`).toBe(0);
+      expect(run.result.stderr).not.toContain("older than engines");
+      const commandNode = path.join(run.bin, "node");
+      const agent = writtenJob(run.installRoot, "LaunchAgents");
+      expect((agent.ProgramArguments as string[])[0]).toBe(commandNode);
+      expect((agent.ProgramArguments as string[])[0]).not.toBe(other);
+      expect((agent.EnvironmentVariables as Record<string, string>).DYLD_FALLBACK_LIBRARY_PATH).toBeUndefined();
+    } finally {
+      cleanup(run);
+    }
+  });
+
+  it(agentNodePinAcceptance.xmlEscape, () => {
+    let pinned = "";
+    const run = renderDaemon("scripts/install-launchd.sh", {}, true, {
+      includeAgentPlistEnv: false,
+      nodeStubVersion: "24.22.1",
+      prepare(layout) {
+        pinned = path.join(layout.root, "a&b<c", "node");
+        writeNodeStub(pinned, "24.22.1");
+        installAgentBody(layout, agentFixtureWithNode(FIXTURE_ENV, pinned, PINNED_DYLD));
+      },
+    });
+    try {
+      expect(run.result.status, `${run.result.stdout}\n${run.result.stderr}`).toBe(0);
+      const agentFile = path.join(run.installRoot, "Library", "LaunchAgents", `${LABEL}.plist`);
+      const raw = readFileSync(agentFile, "utf8");
+      expect(raw).toContain("a&amp;b&lt;c");
+      expect(raw).not.toContain("a&b<c");
+      const agent = writtenJob(run.installRoot, "LaunchAgents");
+      expect((agent.ProgramArguments as string[])[0]).toBe(pinned);
+      expect((agent.EnvironmentVariables as Record<string, string>).PATH?.split(":")[0]).toBe(path.dirname(pinned));
     } finally {
       cleanup(run);
     }
