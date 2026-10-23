@@ -31,3 +31,21 @@ export function buildAspectScaleFilter(input: AspectScaleFilterInput): string {
   }
   return `scale=${width}:${height}:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2`;
 }
+
+export interface LiveVideoFilterInput extends AspectScaleFilterInput {
+  /** True for a MAIN source. Sub sessions leave this false. */
+  holdForKeyframe?: boolean;
+}
+
+/**
+ * Drop decoded frames until the first keyframe, then keep every frame.
+ * `key` is 1 on that frame. `st` and `ld` remember it. Escaped commas keep
+ * the expression in one filter. The kept frame stays on the source clock.
+ */
+export const MAIN_KEYFRAME_GATE = "select=if(eq(key\\,1)\\,st(1\\,1)\\,ld(1))";
+
+export function buildLiveVideoFilter(input: LiveVideoFilterInput): string {
+  const scale = buildAspectScaleFilter(input);
+  if (!input.holdForKeyframe) return scale;
+  return `${MAIN_KEYFRAME_GATE},${scale}`;
+}

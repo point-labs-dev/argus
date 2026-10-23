@@ -534,6 +534,7 @@ describe("ArgusStreamingDelegate", () => {
     const args = (spawnFn as unknown as { mock: { calls: [string, string[]][] } }).mock.calls[0]![1].join(" ");
     expect(args).toContain("-i rtsp://127.0.0.1:8554/backyard-left ");
     expect(args).toContain("scale=854:480:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=854:480");
+    expect(args).toContain("select=if(eq(key\\,1)\\,st(1\\,1)\\,ld(1))");
     stopSession(delegate, "s3");
   });
 
@@ -550,6 +551,7 @@ describe("ArgusStreamingDelegate", () => {
 
     const args = (spawnFn as unknown as { mock: { calls: [string, string[]][] } }).mock.calls[0]![1].join(" ");
     expect(args).toContain("-i rtsp://127.0.0.1:8554/backyard-left-sub");
+    expect(args).not.toContain("select=");
     stopSession(delegate, "s4");
   });
 
@@ -566,6 +568,7 @@ describe("ArgusStreamingDelegate", () => {
 
     const args = (spawnFn as unknown as { mock: { calls: [string, string[]][] } }).mock.calls[0]![1].join(" ");
     expect(args).toContain("-i rtsp://127.0.0.1:8554/backyard-left-sub");
+    expect(args).not.toContain("select=");
     expect(args).toContain("scale=854:480:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=854:480");
     stopSession(delegate, "s5");
   });
@@ -594,8 +597,12 @@ describe("ArgusStreamingDelegate", () => {
     });
 
     expect(spawnFn).toHaveBeenCalledTimes(2);
-    const secondArgs = (spawnFn as unknown as { mock: { calls: [string, string[]][] } }).mock.calls[1]![1].join(" ");
+    const calls = (spawnFn as unknown as { mock: { calls: [string, string[]][] } }).mock.calls;
+    const firstArgs = calls[0]![1].join(" ");
+    const secondArgs = calls[1]![1].join(" ");
+    expect(firstArgs).not.toContain("select=");
     expect(secondArgs).toContain("-i rtsp://127.0.0.1:8554/backyard-left ");
+    expect(secondArgs).toContain("select=if(eq(key\\,1)\\,st(1\\,1)\\,ld(1))");
     expect(secondArgs).toContain("scale=854:480:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=854:480");
     stopSession(delegate, "s6");
   });
