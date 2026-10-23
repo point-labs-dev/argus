@@ -16,9 +16,20 @@
  *    packets do not log that line again. Every packet still emits "packet".
  * 5. The abandon timer stays 900000 ms. Firmware stays 1.3.16. A counted
  *    packet does not stop ffmpeg. Stop still uses SIGKILL.
+ * 6. scripts/rtcp-counts.mjs prints log=missing and exits 1 when the log
+ *    path is absent. That output does not contain events=0. When the file
+ *    exists and has no rtcp_after_first_frame lines, the script exits 0 and
+ *    prints events=0.
+ * 7. After START is answered, an ffmpeg exit with code 1 and no signal, and
+ *    no STOP request, calls forceStopStreamingSession once for that session.
+ *    The delegate does not kill the process.
  */
+import { execFileSync } from "node:child_process";
 import { createSocket } from "node:dgram";
 import { EventEmitter } from "node:events";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { describe, expect, it, vi } from "vitest";
 
@@ -366,4 +377,80 @@ describe("RTCP after the first frame", () => {
       },
     ]);
   });
+
+  it("tells a missing log apart from a log with zero RTCP events", () => {
+    const missing = runCounts([join(mkdtempSync(join(tmpdir(), "argus-rtcp-missing-")), "serve.err.log")]);
+    expect(missing.status).toBe(1);
+    expect(missing.stdout).toBe("log=missing\n");
+    expect(missing.stdout).not.toContain("events=0");
+
+    const directory = mkdtempSync(join(tmpdir(), "argus-rtcp-"));
+    const empty = join(directory, "serve.err.log");
+    writeFileSync(empty, [
+      "noise rtsp://admin:s3cret@10.9.9.9/main",
+      'ARGUS_TELEMETRY: {"timestamp":1,"camera":"Garage Door","event":"live_session_stop","metadata":{"sessionId":"s"}}',
+      "",
+    ].join("\n"));
+    const quiet = runCounts([empty]);
+    expect(quiet.status).toBe(0);
+    expect(quiet.stdout).toBe([
+      "events=0",
+      "start_events=0",
+      "reconfigure_events=0",
+      "video_packets=0",
+      "audio_packets=0",
+      "zero_events=0",
+      "",
+    ].join("\n"));
+    expect(quiet.stdout).not.toContain("s3cret");
+    expect(quiet.stdout).not.toContain("rtsp://");
+    expect(quiet.stdout).not.toContain("10.9.9.9");
+
+    const counted = join(directory, "counted.log");
+    writeFileSync(counted, [
+      'ARGUS_TELEMETRY: {"event":"rtcp_after_first_frame","metadata":{"spawn":"start","videoPackets":2,"audioPackets":0}}',
+      'ARGUS_TELEMETRY: {"event":"rtcp_after_first_frame","metadata":{"spawn":"reconfigure","videoPackets":0,"audioPackets":0}}',
+      'ARGUS_TELEMETRY: {"event":"rtcp_after_first_frame","metadata":{"spawn":"reconfigure","videoPackets":1,"audioPackets":3}}',
+      "",
+    ].join("\n"));
+    expect(runCounts([counted]).stdout).toBe([
+      "events=3",
+      "start_events=1",
+      "reconfigure_events=2",
+      "video_packets=3",
+      "audio_packets=3",
+      "zero_events=1",
+      "",
+    ].join("\n"));
+  });
+
+  it("calls forceStop when ffmpeg exits and nobody sent STOP", async () => {
+    const forceStop = vi.fn();
+    const started = await startLive("exit-no-stop");
+    started.delegate.controller = { forceStopStreamingSession: forceStop } as never;
+    try {
+      emitFrame(started.procs[0]!);
+      expect(forceStop).not.toHaveBeenCalled();
+      expect(started.procs[0]!.kill).not.toHaveBeenCalled();
+      const log = await capture(async () => {
+        started.procs[0]!.emit("exit", 1, null);
+      });
+      expect(forceStop).toHaveBeenCalledTimes(1);
+      expect(forceStop).toHaveBeenCalledWith("exit-no-stop");
+      expect(started.procs[0]!.kill).not.toHaveBeenCalled();
+      expect(rtcpReports(log)).toEqual([]);
+    } finally {
+      stop(started.delegate, started.sessionID);
+    }
+  });
 });
+
+function runCounts(args: string[]): { status: number; stdout: string } {
+  try {
+    const stdout = execFileSync(process.execPath, ["scripts/rtcp-counts.mjs", ...args], { encoding: "utf8" });
+    return { status: 0, stdout };
+  } catch (error) {
+    const failed = error as { status?: number; stdout?: string };
+    return { status: failed.status ?? 1, stdout: failed.stdout ?? "" };
+  }
+}
