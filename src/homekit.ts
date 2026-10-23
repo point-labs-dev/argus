@@ -482,6 +482,16 @@ interface ActiveSession {
   noRtcpConsumerTimer?: ReturnType<typeof setTimeout>;
   rtcpSockets?: ObservableRtcpSocket[];
   rtcpWindow?: RtcpAfterFrameWindow;
+  ffmpeg?: ChildProcess;
+  ended?: boolean;
+  exited?: boolean;
+}
+
+const FORCE_STOP_WRAPPED = Symbol("argus.forceStopWrapped");
+
+interface WrappedForceStop {
+  (sessionId: string): void;
+  [FORCE_STOP_WRAPPED]?: true;
 }
 
 export const NO_RTCP_CONSUMER_ABANDON_MS = 15 * 60 * 1000;
@@ -531,7 +541,30 @@ export interface StreamingDelegateOptions {
  * SnapshotCache; live view spawns FFmpeg to push SRTP from the go2rtc restream.
  */
 export class ArgusStreamingDelegate implements CameraStreamingDelegate {
-  public controller?: CameraController;
+  private cameraController: CameraController | undefined = undefined;
+  private hapForceStop: ((sessionId: string) => void) | undefined = undefined;
+  private readonly hapTold = new Set<string>();
+
+  public get controller(): CameraController | undefined {
+    return this.cameraController;
+  }
+
+  public set controller(controller: CameraController | undefined) {
+    this.cameraController = controller;
+    if (!controller) {
+      this.hapForceStop = undefined;
+      return;
+    }
+    const current = controller.forceStopStreamingSession as WrappedForceStop;
+    if (current[FORCE_STOP_WRAPPED]) return;
+    const original = current.bind(controller);
+    this.hapForceStop = original;
+    const wrapped: WrappedForceStop = (sessionId: string) => {
+      if (this.endSession(sessionId)) this.notifyHomeKit(sessionId);
+    };
+    wrapped[FORCE_STOP_WRAPPED] = true;
+    controller.forceStopStreamingSession = wrapped;
+  }
 
   private readonly sessions = new Map<string, ActiveSession>();
   private readonly policyEngine: SessionPolicyEngine;
@@ -601,8 +634,11 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
   public prepareStream(request: PrepareStreamRequest, callback: PrepareStreamCallback): void {
     const existing = this.sessions.get(request.sessionID);
     if (existing) {
-      existing.stateMachine.answerPrepareCallback();
-      return;
+      if (existing.stateMachine.getState().tag !== "STREAMING") {
+        existing.stateMachine.answerPrepareCallback();
+        return;
+      }
+      this.endSession(request.sessionID);
     }
     emitTiming({ stage: "prepare_stream_enter", camera: this.cameraName, sessionId: request.sessionID });
     void this.prepareStreamAsync(request, callback);
@@ -612,6 +648,7 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
     request: PrepareStreamRequest,
     callback: PrepareStreamCallback,
   ): Promise<void> {
+    this.hapTold.delete(request.sessionID);
     const stateMachine = new SessionStateMachine(request.sessionID);
     
     const answer = (error?: Error, response?: PrepareStreamResponse): void => {
@@ -700,7 +737,7 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
     }
     if (request.type === StreamRequestTypes.STOP) {
       emitTelemetry(this.cameraName, "live_session_stop", { sessionId: request.sessionID });
-      this.stopStream(request.sessionID);
+      this.endSession(request.sessionID);
       callback();
       return;
     }
@@ -763,8 +800,10 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
     );
     this.logLine(`Policy: ${plan.policy.reasoning}`);
 
-    // SIGKILL the old ffmpeg (the teardown signal the exit handler ignores)
-    state.streaming.ffmpeg?.kill("SIGKILL");
+    // Retire the old encoder before its exit event can see the replacement.
+    const previous = session.ffmpeg ?? state.streaming.ffmpeg;
+    delete session.ffmpeg;
+    previous?.kill("SIGKILL");
 
     // Spawn new ffmpeg and update state machine
     this.spawnLiveForReconfigure(request.sessionID, session, next);
@@ -782,6 +821,8 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
     log(`ffmpeg ${this.ffmpegPath} ${redactFfmpegArgsForLog(args)}`);
 
     const ffmpeg = this.spawnFn(this.ffmpegPath, args, { stdio: ["ignore", "ignore", "pipe"] });
+    session.ffmpeg = ffmpeg;
+    session.exited = false;
     emitTiming({ stage: "live_ffmpeg_spawn", camera: this.cameraName, sessionId: sessionID });
 
     // Use state machine's reconfigure() to update live input and ffmpeg
@@ -809,10 +850,7 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
       log(`ffmpeg spawn error: ${error.message}`);
     });
     ffmpeg.once("exit", (code, signal) => {
-      log(`ffmpeg exited code=${code} signal=${signal}`);
-      if (code !== 0 && signal !== "SIGKILL") {
-        this.controller?.forceStopStreamingSession(sessionID);
-      }
+      this.onLiveFfmpegExit(session, sessionID, ffmpeg, code, signal, () => true, () => {});
     });
   }
 
@@ -918,6 +956,8 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
     log(`ffmpeg ${this.ffmpegPath} ${redactFfmpegArgsForLog(args)}`);
 
     const ffmpeg = this.spawnFn(this.ffmpegPath, args, { stdio: ["ignore", "ignore", "pipe"] });
+    session.ffmpeg = ffmpeg;
+    session.exited = false;
     emitTiming({ stage: "live_ffmpeg_spawn", camera: this.cameraName, sessionId: sessionID });
 
     const videoSocket = createSocket("udp4");
@@ -981,17 +1021,7 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
       answer(error);
     });
     ffmpeg.once("exit", (code, signal) => {
-      log(`ffmpeg exited code=${code} signal=${signal}`);
-      if (!answered) {
-        // Died before we acknowledged START — report failure to HomeKit.
-        answer(new Error(`ffmpeg exited code=${code} signal=${signal}`));
-        return;
-      }
-      // A non-zero exit that isn't from our SIGKILL teardown means the stream broke.
-      // (SIGKILL is how stopStream and reconfigure respawns retire an encoder.)
-      if (code !== 0 && signal !== "SIGKILL") {
-        this.controller?.forceStopStreamingSession(sessionID);
-      }
+      this.onLiveFfmpegExit(session, sessionID, ffmpeg, code, signal, () => answered, answer);
     });
 
     // Give FFmpeg 100ms to fail fast (bad args / unreachable source) before we tell
@@ -1024,7 +1054,7 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
 
   private reapAbandonedLiveSession(sessionID: string): void {
     const session = this.sessions.get(sessionID);
-    if (!session || session.stateMachine.getState().tag !== "STREAMING") return;
+    if (!session || session.ended || session.stateMachine.getState().tag !== "STREAMING") return;
     this.logLine(
       `no RTCP consumer for ${NO_RTCP_CONSUMER_ABANDON_MS}ms, tearing down live session ${sessionID}`,
     );
@@ -1032,8 +1062,7 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
       sessionId: sessionID,
       reason: "no_rtcp_consumer",
     });
-    this.stopStream(sessionID);
-    this.controller?.forceStopStreamingSession(sessionID);
+    if (this.endSession(sessionID)) this.notifyHomeKit(sessionID);
   }
 
   private beginRtcpAfterFirstFrame(
@@ -1080,21 +1109,57 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
     });
   }
 
-  private stopStream(sessionID: string): void {
-    const session = this.sessions.get(sessionID);
-    if (!session) {
+  /**
+   * A non-zero exit that is not our SIGKILL means the stream broke.
+   * SIGKILL is how STOP, abandon, and reconfigure retire an encoder.
+   * Exit code 0 is a clean encoder exit and stays local.
+   */
+  private ffmpegExitNotifiesHomeKit(code: number | null, signal: NodeJS.Signals | null): boolean {
+    return code !== 0 && signal !== "SIGKILL";
+  }
+
+  private onLiveFfmpegExit(
+    session: ActiveSession,
+    sessionID: string,
+    ffmpeg: ChildProcess,
+    code: number | null,
+    signal: NodeJS.Signals | null,
+    acknowledged: () => boolean,
+    answer: (error?: Error) => void,
+  ): void {
+    this.logLine(`ffmpeg exited code=${code} signal=${signal}`);
+    if (session.ended || session.ffmpeg !== ffmpeg) return;
+    if (!acknowledged()) {
+      session.exited = true;
+      answer(new Error(`ffmpeg exited code=${code} signal=${signal}`));
+      this.endSession(sessionID);
       return;
     }
-    this.recordRtcpAfterFirstFrame(session);
-    if (session.noRtcpConsumerTimer) clearTimeout(session.noRtcpConsumerTimer);
+    session.exited = true;
+    if (!this.endSession(sessionID)) return;
+    if (this.ffmpegExitNotifiesHomeKit(code, signal)) this.notifyHomeKit(sessionID);
+  }
 
-    // Use state machine's idempotent stop() to get resources to clean up
+  private notifyHomeKit(sessionID: string): void {
+    if (this.hapTold.has(sessionID)) return;
+    this.hapTold.add(sessionID);
+    this.hapForceStop?.(sessionID);
+  }
+
+  /** Tear the session down once. Later STOP, exit, abandon, and forceStop calls return false. */
+  private endSession(sessionID: string): boolean {
+    const session = this.sessions.get(sessionID);
+    if (!session || session.ended) return false;
+    session.ended = true;
+    this.recordRtcpAfterFirstFrame(session);
+    if (session.noRtcpConsumerTimer) {
+      clearTimeout(session.noRtcpConsumerTimer);
+      delete session.noRtcpConsumerTimer;
+    }
+
     const resources = session.stateMachine.stop();
     if (resources) {
-      // Kill FFmpeg process
-      resources.ffmpeg?.kill("SIGKILL");
-      
-      // Close RTCP return sockets (bind failures already closed themselves via ObservableRtcpSocket)
+      if (!session.exited) resources.ffmpeg?.kill("SIGKILL");
       for (const socket of [resources.videoReturnSocket, resources.audioReturnSocket]) {
         try {
           socket?.close();
@@ -1105,6 +1170,7 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
     }
 
     this.sessions.delete(sessionID);
+    return true;
   }
 }
 
