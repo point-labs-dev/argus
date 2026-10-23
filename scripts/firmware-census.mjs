@@ -47,13 +47,34 @@ export function advertisement(src) {
   return lines.join("\n");
 }
 
+export function recordingOffer(src) {
+  const marker = "export function buildRecordingOptions";
+  const start = src.indexOf(marker);
+  if (start < 0) {
+    return "";
+  }
+  const stripped = src
+    .slice(start)
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/\/\/.*$/gm, "");
+  const boundary = stripped.slice(marker.length).search(/\n(?:export |function )/);
+  const body = boundary < 0 ? stripped : stripped.slice(0, marker.length + boundary);
+  return body
+    .split("\n")
+    .map((line) => line.trim().replace(/\s+/g, " "))
+    .filter((line) => line.length > 0)
+    .join("\n");
+}
+
 export function classifyFirmwareChange(before, after) {
   const beforeFirmware = firmwareRevision(before);
   const afterFirmware = firmwareRevision(after);
   const sameAdvertisement = advertisement(before) === advertisement(after);
   let verdict = "justified";
-  if (beforeFirmware === afterFirmware) {
+  if (beforeFirmware === afterFirmware && sameAdvertisement) {
     verdict = "unchanged";
+  } else if (beforeFirmware === afterFirmware) {
+    verdict = "stale";
   } else if (sameAdvertisement) {
     verdict = "churn";
   }
@@ -67,22 +88,54 @@ function gitShow(spec) {
   });
 }
 
+function gitShowIfPresent(spec) {
+  try {
+    execFileSync("git", ["cat-file", "-e", spec], { stdio: "ignore" });
+  } catch {
+    return "";
+  }
+  return gitShow(spec);
+}
+
 function parseArgs(argv) {
-  const args = { before: null, after: null, commit: null };
+  const args = {
+    before: null,
+    after: null,
+    commit: null,
+    beforeRecording: null,
+    afterRecording: null,
+  };
+  const keys = {
+    "--before": "before",
+    "--after": "after",
+    "--commit": "commit",
+    "--before-recording": "beforeRecording",
+    "--after-recording": "afterRecording",
+  };
   for (let i = 0; i < argv.length; i += 1) {
     const flag = argv[i];
-    const value = argv[i + 1];
-    if (flag === "--before" || flag === "--after" || flag === "--commit") {
-      if (value === undefined) {
-        throw new Error(`${flag} needs a value`);
-      }
-      args[flag.slice(2)] = value;
-      i += 1;
-    } else {
+    const key = keys[flag];
+    if (key === undefined) {
       throw new Error(`unknown argument ${flag}`);
     }
+    const value = argv[i + 1];
+    if (value === undefined) {
+      throw new Error(`${flag} needs a value`);
+    }
+    args[key] = value;
+    i += 1;
   }
   return args;
+}
+
+function readRecordingFiles(beforePath, afterPath) {
+  if (beforePath === null && afterPath === null) {
+    return [null, null];
+  }
+  if (beforePath === null || afterPath === null) {
+    throw new Error("--before-recording and --after-recording are a pair");
+  }
+  return [readFileSync(beforePath, "utf8"), readFileSync(afterPath, "utf8")];
 }
 
 function pair(args) {
@@ -90,29 +143,68 @@ function pair(args) {
     if (args.before === null || args.after === null) {
       throw new Error("--before and --after are a pair");
     }
-    return [readFileSync(args.before, "utf8"), readFileSync(args.after, "utf8")];
+    const [beforeRecording, afterRecording] = readRecordingFiles(
+      args.beforeRecording,
+      args.afterRecording,
+    );
+    return {
+      before: readFileSync(args.before, "utf8"),
+      after: readFileSync(args.after, "utf8"),
+      beforeRecording,
+      afterRecording,
+    };
+  }
+  if (args.beforeRecording !== null || args.afterRecording !== null) {
+    throw new Error("--before-recording requires --before and --after");
   }
   if (args.commit !== null) {
     const parent = execFileSync("git", ["rev-parse", `${args.commit}^`], {
       encoding: "utf8",
     }).trim();
-    return [gitShow(`${parent}:src/homekit.ts`), gitShow(`${args.commit}:src/homekit.ts`)];
+    return {
+      before: gitShow(`${parent}:src/homekit.ts`),
+      after: gitShow(`${args.commit}:src/homekit.ts`),
+      beforeRecording: gitShowIfPresent(`${parent}:src/recording.ts`),
+      afterRecording: gitShowIfPresent(`${args.commit}:src/recording.ts`),
+    };
   }
   const base = process.env.CENSUS_BASE || "origin/main";
-  return [gitShow(`${base}:src/homekit.ts`), readFileSync("src/homekit.ts", "utf8")];
+  return {
+    before: gitShow(`${base}:src/homekit.ts`),
+    after: readFileSync("src/homekit.ts", "utf8"),
+    beforeRecording: gitShowIfPresent(`${base}:src/recording.ts`),
+    afterRecording: readFileSync("src/recording.ts", "utf8"),
+  };
 }
 
-function report(result) {
+function recordingOfferChanged(beforeRecording, afterRecording) {
+  if (beforeRecording === null || afterRecording === null) {
+    return false;
+  }
+  return recordingOffer(beforeRecording) !== recordingOffer(afterRecording);
+}
+
+function report(result, recordingChanged) {
   process.stdout.write(
     `verdict=${result.verdict}\nbefore_firmware=${result.beforeFirmware}\nafter_firmware=${result.afterFirmware}\n`,
   );
-  return result.verdict === "churn" ? 1 : 0;
+  if (recordingChanged) {
+    process.stderr.write(
+      "warning: recording offer changed in src/recording.ts. A recording-offer change is not a live-ladder change.\n",
+    );
+  }
+  return result.verdict === "churn" || result.verdict === "stale" ? 1 : 0;
 }
 
 const invoked = process.argv[1] && process.argv[1].endsWith("firmware-census.mjs");
 if (invoked) {
   try {
-    process.exitCode = report(classifyFirmwareChange(...pair(parseArgs(process.argv.slice(2)))));
+    const loaded = pair(parseArgs(process.argv.slice(2)));
+    const result = classifyFirmwareChange(loaded.before, loaded.after);
+    process.exitCode = report(
+      result,
+      recordingOfferChanged(loaded.beforeRecording, loaded.afterRecording),
+    );
   } catch (error) {
     process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
     process.exitCode = 2;
