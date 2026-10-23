@@ -8,6 +8,7 @@ import { describe, expect, it, vi } from "vitest";
 import { parseArgusConfig } from "../src/config.js";
 import {
   createGo2RtcSupervisor,
+  getGo2RtcHealth,
   Go2RtcSupervisorError,
   writeGo2RtcConfigFile,
 } from "../src/go2rtc-supervisor.js";
@@ -64,7 +65,9 @@ class FakeChildProcess extends EventEmitter implements Go2RtcChildProcess {
   });
 }
 
-function okStreamsResponse(streams: Record<string, unknown> = { "front-door": {} }): Response {
+function okStreamsResponse(
+  streams: Record<string, unknown> = { "front-door": {}, "front-door-sub": {} },
+): Response {
   return new Response(JSON.stringify(streams), {
     status: 200,
     headers: {
@@ -89,6 +92,8 @@ describe("go2rtc supervisor", () => {
     expect(result.bytes).toBe(Buffer.byteLength(contents, "utf8"));
     expect(contents).toContain("listen: 127.0.0.1:1984");
     expect(contents).toContain("front-door:");
+    expect(contents).toContain("front-door-sub:");
+    expect(result.streamCount).toBe(2);
     expect(contents.endsWith("\n")).toBe(true);
   });
 
@@ -155,6 +160,101 @@ describe("go2rtc supervisor", () => {
 
     expect(child.kill).toHaveBeenCalledWith("SIGTERM");
     expect(child.killed).toBe(true);
+    expect(supervisor.process).toBeUndefined();
+  });
+
+  it("treats a 2xx response with no JSON stream list as unhealthy", async () => {
+    const health = await getGo2RtcHealth({
+      fetch: vi.fn(async () => new Response("not-json", { status: 200 })) as unknown as typeof fetch,
+    });
+
+    expect(health).toEqual({
+      ok: false,
+      apiBaseUrl: "http://127.0.0.1:1984",
+      statusCode: 200,
+    });
+  });
+
+  it("treats a 2xx JSON value that is not a stream object as unhealthy", async () => {
+    const health = await getGo2RtcHealth({
+      fetch: vi.fn(async () => new Response("[]", { status: 200, headers: { "content-type": "application/json" } })) as unknown as typeof fetch,
+    });
+
+    expect(health).toEqual({
+      ok: false,
+      apiBaseUrl: "http://127.0.0.1:1984",
+      statusCode: 200,
+    });
+  });
+
+  it("rejects a stream list shorter than the generated config", async () => {
+    const health = await getGo2RtcHealth({
+      fetch: vi.fn(async () => okStreamsResponse({})) as unknown as typeof fetch,
+      expectedStreamCount: 2,
+    });
+
+    expect(health).toEqual({
+      ok: false,
+      apiBaseUrl: "http://127.0.0.1:1984",
+      statusCode: 200,
+      streamCount: 0,
+      streams: {},
+    });
+  });
+
+  it("accepts a stream list whose count matches the generated config", async () => {
+    const streams = { "front-door": {}, "front-door-sub": {} };
+    const health = await getGo2RtcHealth({
+      fetch: vi.fn(async () => okStreamsResponse(streams)) as unknown as typeof fetch,
+      expectedStreamCount: 2,
+    });
+
+    expect(health).toEqual({
+      ok: true,
+      apiBaseUrl: "http://127.0.0.1:1984",
+      statusCode: 200,
+      streamCount: 2,
+      streams,
+    });
+  });
+
+  it("fails startup when go2rtc returns 2xx without a JSON stream list", async () => {
+    const child = new FakeChildProcess();
+    const supervisor = createGo2RtcSupervisor(createConfig(), {
+      configPath: await tempPath("go2rtc.generated.yaml"),
+      spawn: vi.fn(() => child) satisfies Go2RtcSpawn,
+      fetch: vi.fn(async () => new Response("not-json", { status: 200 })) as unknown as typeof fetch,
+      startupTimeoutMs: 20,
+      healthIntervalMs: 1,
+      healthRequestTimeoutMs: 20,
+      shutdownTimeoutMs: 20,
+    });
+
+    await expect(supervisor.start()).rejects.toMatchObject({
+      code: "HEALTH_TIMEOUT",
+      message: expect.stringContaining("No stream list."),
+    });
+    expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+    expect(supervisor.process).toBeUndefined();
+  });
+
+  it("fails startup when go2rtc lists fewer streams than the generated config", async () => {
+    const child = new FakeChildProcess();
+    const supervisor = createGo2RtcSupervisor(createConfig(), {
+      configPath: await tempPath("go2rtc.generated.yaml"),
+      spawn: vi.fn(() => child) satisfies Go2RtcSpawn,
+      fetch: vi.fn(async () => okStreamsResponse({})) as unknown as typeof fetch,
+      startupTimeoutMs: 20,
+      healthIntervalMs: 1,
+      healthRequestTimeoutMs: 20,
+      shutdownTimeoutMs: 20,
+    });
+
+    await expect(supervisor.start()).rejects.toMatchObject({
+      code: "HEALTH_TIMEOUT",
+      message: expect.stringContaining("Stream count 0 is below expected 2."),
+    });
+    expect(child.kill).toHaveBeenCalledWith("SIGTERM");
     expect(supervisor.process).toBeUndefined();
   });
 

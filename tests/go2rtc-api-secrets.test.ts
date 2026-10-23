@@ -162,7 +162,7 @@ describe("go2rtc API credentials", () => {
     const child = new FakeChildProcess();
     const spawnMock = vi.fn(() => child) satisfies Go2RtcSpawn;
     const fetchMock = vi.fn(async (_input: unknown, _init?: RequestInit) =>
-      new Response(JSON.stringify({ "front-door": {} }), { status: 200 }),
+      new Response(JSON.stringify({ "front-door": {}, "front-door-sub": {} }), { status: 200 }),
     );
     const directory = await tempDirectory();
     const configPath = path.join(directory, "go2rtc.generated.yaml");

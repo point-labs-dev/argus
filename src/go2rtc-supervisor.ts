@@ -39,6 +39,7 @@ export interface WriteGo2RtcConfigFileResult {
   path: string;
   bytes: number;
   api: Go2RtcApiCredentials;
+  streamCount: number;
 }
 
 export interface Go2RtcHealthStatus {
@@ -54,6 +55,7 @@ export interface Go2RtcHealthOptions {
   fetch?: typeof fetch;
   requestTimeoutMs?: number;
   apiCredentials?: Go2RtcApiCredentials;
+  expectedStreamCount?: number;
 }
 
 export interface WaitForGo2RtcHealthOptions extends Go2RtcHealthOptions {
@@ -184,6 +186,7 @@ export async function writeGo2RtcConfigFile(
       username: generated.api.username,
       password: generated.api.password,
     },
+    streamCount: Object.keys(generated.streams).length,
   };
 }
 
@@ -217,22 +220,32 @@ export async function getGo2RtcHealth(options: Go2RtcHealthOptions): Promise<Go2
         streams = body;
       }
     } catch {
-      // Health only needs a reachable go2rtc API. Some test doubles or future
-      // endpoints may not return JSON, so keep a 2xx response healthy.
+      return {
+        ok: false,
+        apiBaseUrl,
+        statusCode: response.status,
+      };
     }
 
-    const status: Go2RtcHealthStatus = {
-      ok: true,
+    if (!streams) {
+      return {
+        ok: false,
+        apiBaseUrl,
+        statusCode: response.status,
+      };
+    }
+
+    const streamCount = Object.keys(streams).length;
+    const expectedStreamCount = options.expectedStreamCount;
+    const countIsEnough = expectedStreamCount === undefined || streamCount >= expectedStreamCount;
+
+    return {
+      ok: countIsEnough,
       apiBaseUrl,
       statusCode: response.status,
+      streams,
+      streamCount,
     };
-
-    if (streams) {
-      status.streams = streams;
-      status.streamCount = Object.keys(streams).length;
-    }
-
-    return status;
   } finally {
     clearTimeout(timeout);
   }
@@ -259,6 +272,9 @@ export async function waitForGo2RtcHealth(options: WaitForGo2RtcHealthOptions): 
       if (options.apiCredentials !== undefined) {
         healthOptions.apiCredentials = options.apiCredentials;
       }
+      if (options.expectedStreamCount !== undefined) {
+        healthOptions.expectedStreamCount = options.expectedStreamCount;
+      }
 
       const status = await getGo2RtcHealth(healthOptions);
 
@@ -279,12 +295,38 @@ export async function waitForGo2RtcHealth(options: WaitForGo2RtcHealthOptions): 
     await sleep(Math.min(intervalMs, remainingMs));
   }
 
-  const detail = lastStatus ? ` Last status code: ${lastStatus.statusCode ?? "unknown"}.` : "";
+  const detail = formatHealthTimeoutDetail(lastStatus, options.expectedStreamCount);
   throw new Go2RtcSupervisorError(
     "HEALTH_TIMEOUT",
     `Timed out waiting ${timeoutMs}ms for go2rtc API health.${detail}`,
     { cause: lastError },
   );
+}
+
+function formatHealthTimeoutDetail(
+  lastStatus: Go2RtcHealthStatus | undefined,
+  expectedStreamCount: number | undefined,
+): string {
+  if (!lastStatus) {
+    return "";
+  }
+
+  const statusCode = lastStatus.statusCode ?? "unknown";
+  let detail = ` Last status code: ${statusCode}.`;
+  const answered = lastStatus.statusCode !== undefined && lastStatus.statusCode >= 200 && lastStatus.statusCode < 300;
+  if (!answered) {
+    return detail;
+  }
+
+  if (lastStatus.streamCount === undefined) {
+    return `${detail} No stream list.`;
+  }
+
+  if (expectedStreamCount !== undefined && lastStatus.streamCount < expectedStreamCount) {
+    return `${detail} Stream count ${lastStatus.streamCount} is below expected ${expectedStreamCount}.`;
+  }
+
+  return detail;
 }
 
 async function terminateProcess(
@@ -455,6 +497,7 @@ export class Go2RtcSupervisor {
       const waitOptions: WaitForGo2RtcHealthOptions = {
         apiBaseUrl: this.apiBaseUrl,
         apiCredentials: writeResult.api,
+        expectedStreamCount: writeResult.streamCount,
       };
       if (this.options.fetch !== undefined) {
         waitOptions.fetch = this.options.fetch;
