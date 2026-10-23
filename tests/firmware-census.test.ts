@@ -1,4 +1,4 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -9,16 +9,15 @@ const JUSTIFIED = "2312c702ccedb8d0587fff0bebe3f269765143b6";
 const LADDER_BEFORE = "96174fd3a6839b67eaa266c2a2c03b88d9a95f32";
 const LADDER_AFTER = "87fe4edf22e25a9f15b17ae705bcdd7b98901944";
 
-function census(args: string[]): { status: number; stdout: string } {
-  try {
-    const stdout = execFileSync("node", ["scripts/firmware-census.mjs", ...args], {
-      encoding: "utf8",
-    });
-    return { status: 0, stdout };
-  } catch (error) {
-    const failed = error as { status?: number; stdout?: string };
-    return { status: failed.status ?? 1, stdout: failed.stdout ?? "" };
-  }
+function census(args: string[]): { status: number; stdout: string; stderr: string } {
+  const result = spawnSync("node", ["scripts/firmware-census.mjs", ...args], {
+    encoding: "utf8",
+  });
+  return {
+    status: result.status ?? 1,
+    stdout: result.stdout ?? "",
+    stderr: result.stderr ?? "",
+  };
 }
 
 function show(spec: string): string {
@@ -129,5 +128,156 @@ describe("firmware census", () => {
     const result = census([]);
     expect(result.status).toBe(0);
     expect(result.stdout).toContain("verdict=unchanged");
+    expect(result.stdout).toContain("before_firmware=1.3.16");
+    expect(result.stdout).toContain("after_firmware=1.3.16");
+    expect(result.stderr).not.toContain("warning:");
+  });
+
+  it("fails when the advertised ladder changes and the firmware string stays 1.3.16", () => {
+    const source = readFileSync("src/homekit.ts", "utf8");
+    const directory = mkdtempSync(join(tmpdir(), "argus-census-stale-"));
+    const before = join(directory, "before.ts");
+    const after = join(directory, "after.ts");
+    const changed = source.replace("[854, 480, 30]", "[854, 450, 30]");
+    writeFileSync(before, source);
+    writeFileSync(after, changed);
+    expect(changed).toContain('export const ARGUS_FIRMWARE_REVISION = "1.3.16"');
+
+    const result = census(["--before", before, "--after", after]);
+    expect(result.status).toBe(1);
+    expect(result.stdout).toContain("verdict=stale");
+    expect(result.stdout).toContain("before_firmware=1.3.16");
+    expect(result.stdout).toContain("after_firmware=1.3.16");
+    expect(result.stderr).not.toContain("warning:");
+  });
+
+  it("fails a rename inside buildCameraControllerOptions when the firmware string stays 1.3.16", () => {
+    const source = readFileSync("src/homekit.ts", "utf8");
+    const directory = mkdtempSync(join(tmpdir(), "argus-census-rename-"));
+    const before = join(directory, "before.ts");
+    const after = join(directory, "after.ts");
+    const renamed = source.replaceAll("wifiSet", "lanSet");
+    writeFileSync(before, source);
+    writeFileSync(after, renamed);
+    expect(renamed).toContain("lanSet");
+    expect(renamed).toContain('export const ARGUS_FIRMWARE_REVISION = "1.3.16"');
+
+    const result = census(["--before", before, "--after", after]);
+    expect(result.status).toBe(1);
+    expect(result.stdout).toContain("verdict=stale");
+    expect(result.stdout).toContain("before_firmware=1.3.16");
+    expect(result.stdout).toContain("after_firmware=1.3.16");
+  });
+
+  it("warns and exits zero when only the recording offer changes", () => {
+    const directory = mkdtempSync(join(tmpdir(), "argus-census-recording-"));
+    const before = join(directory, "before.ts");
+    const after = join(directory, "after.ts");
+    const beforeRecording = join(directory, "before-recording.ts");
+    const afterRecording = join(directory, "after-recording.ts");
+    const homekit = readFileSync("src/homekit.ts", "utf8");
+    const recording = readFileSync("src/recording.ts", "utf8");
+    const offered = recording.replace("fragmentLength: 4000", "fragmentLength: 2000");
+    writeFileSync(before, homekit);
+    writeFileSync(after, homekit);
+    writeFileSync(beforeRecording, recording);
+    writeFileSync(afterRecording, offered);
+    expect(homekit).toContain('export const ARGUS_FIRMWARE_REVISION = "1.3.16"');
+    expect(offered).toContain("fragmentLength: 2000");
+
+    const quiet = census([
+      "--before",
+      before,
+      "--after",
+      after,
+      "--before-recording",
+      beforeRecording,
+      "--after-recording",
+      beforeRecording,
+    ]);
+    expect(quiet.status).toBe(0);
+    expect(quiet.stdout).toContain("verdict=unchanged");
+    expect(quiet.stderr).not.toContain("warning:");
+
+    const result = census([
+      "--before",
+      before,
+      "--after",
+      after,
+      "--before-recording",
+      beforeRecording,
+      "--after-recording",
+      afterRecording,
+    ]);
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain("verdict=unchanged");
+    expect(result.stdout).toContain("before_firmware=1.3.16");
+    expect(result.stdout).toContain("after_firmware=1.3.16");
+    expect(result.stderr).toContain(
+      "warning: recording offer changed in src/recording.ts. A recording-offer change is not a live-ladder change.",
+    );
+  });
+
+  it("exits zero without a warning when recording.ts changes outside the offer", () => {
+    const directory = mkdtempSync(join(tmpdir(), "argus-census-recording-filter-"));
+    const before = join(directory, "before.ts");
+    const after = join(directory, "after.ts");
+    const beforeRecording = join(directory, "before-recording.ts");
+    const afterRecording = join(directory, "after-recording.ts");
+    const homekit = readFileSync("src/homekit.ts", "utf8");
+    const recording = readFileSync("src/recording.ts", "utf8");
+    const outside = recording.replace(
+      "return `scale=${width}:${height}`;",
+      "return `scale=${width}:${height}:flags=neighbor`;",
+    );
+    writeFileSync(before, homekit);
+    writeFileSync(after, homekit);
+    writeFileSync(beforeRecording, recording);
+    writeFileSync(afterRecording, outside);
+    expect(outside).toContain("flags=neighbor");
+
+    const result = census([
+      "--before",
+      before,
+      "--after",
+      after,
+      "--before-recording",
+      beforeRecording,
+      "--after-recording",
+      afterRecording,
+    ]);
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain("verdict=unchanged");
+    expect(result.stderr).not.toContain("warning:");
+  });
+
+  it("fails a ladder change at 1.3.16 when the recording offer also changes", () => {
+    const directory = mkdtempSync(join(tmpdir(), "argus-census-both-"));
+    const before = join(directory, "before.ts");
+    const after = join(directory, "after.ts");
+    const beforeRecording = join(directory, "before-recording.ts");
+    const afterRecording = join(directory, "after-recording.ts");
+    const homekit = readFileSync("src/homekit.ts", "utf8");
+    const recording = readFileSync("src/recording.ts", "utf8");
+    writeFileSync(before, homekit);
+    writeFileSync(after, homekit.replace("[854, 480, 30]", "[854, 450, 30]"));
+    writeFileSync(beforeRecording, recording);
+    writeFileSync(afterRecording, recording.replace("fragmentLength: 4000", "fragmentLength: 2000"));
+
+    const result = census([
+      "--before",
+      before,
+      "--after",
+      after,
+      "--before-recording",
+      beforeRecording,
+      "--after-recording",
+      afterRecording,
+    ]);
+    expect(result.status).toBe(1);
+    expect(result.stdout).toContain("verdict=stale");
+    expect(result.stdout).toContain("before_firmware=1.3.16");
+    expect(result.stdout).toContain("after_firmware=1.3.16");
+    expect(result.stderr).toContain("warning: recording offer changed in src/recording.ts");
   });
 });
