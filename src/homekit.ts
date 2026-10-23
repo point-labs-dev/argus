@@ -84,7 +84,7 @@ import {
 import type { CameraAspect, CameraConfig } from "./config.js";
 import { prepareAnswer } from "./homekit/prepare-answer.js";
 import { ArgusRecordingDelegate, buildRecordingOptions } from "./recording.js";
-import { buildAspectScaleFilter } from "./video-filter.js";
+import { buildLiveVideoFilter } from "./video-filter.js";
 import type { SnapshotCache, SnapshotProfile } from "./snapshot-cache.js";
 import { emitSpan, emitTelemetry } from "./telemetry.js";
 import { emitTiming } from "./timing.js";
@@ -169,6 +169,12 @@ export interface LiveFfmpegInput {
     srtpParams: string;
   };
   aspect: CameraAspect;
+  /**
+   * "main" drops decoded frames until the first source keyframe.
+   * An HEVC main join starts mid-GOP and would otherwise deliver gray frames.
+   * Omit this for a sub session. The scale filter stays as it is.
+   */
+  sourceTier?: "main" | "sub";
   audio: {
       port: number;
       localRtcpPort: number;
@@ -278,11 +284,12 @@ export function buildLiveFfmpegArgs(input: LiveFfmpegInput, includeAudio = true)
           "-pix_fmt", "yuv420p",
           "-color_range", "tv",
           "-r", String(video.fps),
-          "-vf", buildAspectScaleFilter({
+          "-vf", buildLiveVideoFilter({
             width: boxWidth,
             height: boxHeight,
             aspect: input.aspect,
             fit: input.aspect === "4:3" ? "crop" : "pad",
+            holdForKeyframe: input.sourceTier === "main",
           }),
           "-bf", "0",
           ...keyframeArgs,
@@ -738,6 +745,7 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
     const next: LiveFfmpegInput = {
       ...liveInput,
       inputUrl: plan.policy.source.streamUrl,
+      sourceTier: plan.policy.source.tier,
       video: {
         ...liveInput.video,
         width: plan.policy.encode.width,
@@ -860,6 +868,7 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
 
     const liveInputBase = {
       inputUrl: plan.policy.source.streamUrl,
+      sourceTier: plan.policy.source.tier,
       targetAddress: prepared.targetAddress,
       videoMode: this.videoMode,
       aspect: this.aspect,
