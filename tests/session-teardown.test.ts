@@ -3,7 +3,8 @@
  *
  * 1. STOP, an ffmpeg exit, the abandon timer, and forceStop each tear a
  *    session down. Whichever arrives first does the work. The later three
- *    leave the kill count and the forceStop count unchanged.
+ *    leave the kill count and the forceStop count unchanged. The exit in
+ *    that order is exit 0, exit 1, or a signal exit.
  * 2. The first event closes the RTCP window. A packet that arrives after
  *    that event stays out of rtcp_after_first_frame.
  * 3. STOP kills a running ffmpeg with SIGKILL and does not call forceStop.
@@ -29,8 +30,10 @@ import { ArgusStreamingDelegate, NO_RTCP_CONSUMER_ABANDON_MS } from "../src/home
 import { SnapshotCache } from "../src/snapshot-cache.js";
 
 const TEARDOWN_EVENTS = ["stop", "exit", "abandon", "forceStop"] as const;
+const EXIT_KINDS = ["code0", "code1", "signal"] as const;
 
 type TeardownEvent = (typeof TEARDOWN_EVENTS)[number];
+type ExitKind = (typeof EXIT_KINDS)[number];
 
 interface Proc extends EventEmitter {
   stderr: PassThrough;
@@ -88,9 +91,9 @@ function permutations(events: readonly TeardownEvent[]): TeardownEvent[][] {
   });
 }
 
-function expectedCalls(first: TeardownEvent): { kill: number; forceStop: number } {
+function expectedCalls(first: TeardownEvent, exitKind: ExitKind): { kill: number; forceStop: number } {
   if (first === "stop") return { kill: 1, forceStop: 0 };
-  if (first === "exit") return { kill: 0, forceStop: 1 };
+  if (first === "exit") return { kill: 0, forceStop: exitKind === "code1" ? 1 : 0 };
   return { kill: 1, forceStop: 1 };
 }
 
@@ -257,13 +260,15 @@ async function reconfigure(live: Live): Promise<Proc> {
   return next;
 }
 
-async function apply(live: Live, event: TeardownEvent): Promise<void> {
+async function apply(live: Live, event: TeardownEvent, exitKind: ExitKind): Promise<void> {
   if (event === "stop") {
     stop(live.delegate, live.sessionID);
     return;
   }
   if (event === "exit") {
-    live.procs[0]!.emit("exit", 1, null);
+    if (exitKind === "code0") live.procs[0]!.emit("exit", 0, null);
+    else if (exitKind === "signal") live.procs[0]!.emit("exit", null, "SIGKILL");
+    else live.procs[0]!.emit("exit", 1, null);
     return;
   }
   if (event === "abandon") {
@@ -281,27 +286,28 @@ async function sendAfterClose(port: number): Promise<void> {
   }
 }
 
-const orders = permutations(TEARDOWN_EVENTS).map((order) => ({
-  label: order.join(" then "),
+const orders = permutations(TEARDOWN_EVENTS).flatMap((order) => EXIT_KINDS.map((exitKind) => ({
+  label: `${order.join(" then ")} (${exitKind})`,
   order,
-}));
+  exitKind,
+})));
 
 describe("live session teardown", () => {
   afterEach(() => {
     vi.useRealTimers();
   });
 
-  it.each(orders)("tears a session down once when $label arrives", async ({ label, order }) => {
+  it.each(orders)("tears a session down once when $label arrives", async ({ label, order, exitKind }) => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     const live = await startLive(label);
     const first = order[0]!;
-    const expected = expectedCalls(first);
+    const expected = expectedCalls(first, exitKind);
     try {
       emitFrame(live.procs[0]!);
       await sendRtcp(live.videoPort, 1);
       const log = await capture(async () => {
         for (let index = 0; index < order.length; index += 1) {
-          await apply(live, order[index]!);
+          await apply(live, order[index]!, exitKind);
           if (index === 0) await sendAfterClose(live.videoPort);
         }
       });

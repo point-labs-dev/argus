@@ -55,15 +55,18 @@ function summarize(text) {
   for (const count of open.values()) {
     if (count > 0) leaked += count;
   }
-  return [
-    `events=${events}`,
-    `start_events=${startEvents}`,
-    `reconfigure_events=${reconfigureEvents}`,
-    `video_packets=${videoPackets}`,
-    `audio_packets=${audioPackets}`,
-    `zero_events=${zeroEvents}`,
-    `leaked_sessions=${leaked}`,
-  ].join("\n") + "\n";
+  return {
+    leaked,
+    report: [
+      `events=${events}`,
+      `start_events=${startEvents}`,
+      `reconfigure_events=${reconfigureEvents}`,
+      `video_packets=${videoPackets}`,
+      `audio_packets=${audioPackets}`,
+      `zero_events=${zeroEvents}`,
+      `leaked_sessions=${leaked}`,
+    ].join("\n") + "\n",
+  };
 }
 
 const path = process.argv[2];
@@ -81,4 +84,6 @@ try {
   process.exit(1);
 }
 
-process.stdout.write(summarize(text));
+const { report, leaked } = summarize(text);
+process.stdout.write(report);
+if (leaked > 0) process.exitCode = 2;

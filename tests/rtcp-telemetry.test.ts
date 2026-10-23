@@ -22,7 +22,8 @@
  *    prints events=0. The summary ends with leaked_sessions. Each
  *    live_session_first_frame opens one window for its session id. Each
  *    rtcp_after_first_frame closes one. leaked_sessions is the number still
- *    open. A non-integer videoPackets or audioPackets adds 0.
+ *    open. A non-integer videoPackets or audioPackets adds 0. leaked_sessions
+ *    of 0 exits 0. leaked_sessions above 0 exits 2.
  * 7. After START is answered, an ffmpeg exit with code 1 and no signal, and
  *    no STOP request, calls forceStopStreamingSession once, writes one
  *    rtcp_after_first_frame line, and does not kill the process. A later
@@ -444,7 +445,7 @@ describe("RTCP after the first frame", () => {
       "",
     ].join("\n"));
     const counted = runCounts([log]);
-    expect(counted.status).toBe(0);
+    expect(counted.status).toBe(2);
     expect(counted.stdout).toBe([
       "events=2",
       "start_events=1",
@@ -461,6 +462,30 @@ describe("RTCP after the first frame", () => {
     expect(counted.stdout).not.toContain("s1");
     expect(counted.stdout).not.toContain("s2");
     expect(counted.stdout).not.toContain("s3");
+  });
+
+  it("exits 2 when a session leaks and 0 when every window is closed", () => {
+    const directory = mkdtempSync(join(tmpdir(), "argus-rtcp-gate-"));
+    const leaky = join(directory, "leaky.log");
+    writeFileSync(leaky, [
+      'ARGUS_TELEMETRY: {"event":"live_session_first_frame","metadata":{"sessionId":"open"}}',
+      "",
+    ].join("\n"));
+    const leaked = runCounts([leaky]);
+    expect(leaked.status).toBe(2);
+    expect(leaked.stdout).toContain("leaked_sessions=1\n");
+
+    const clean = join(directory, "clean.log");
+    writeFileSync(clean, [
+      'ARGUS_TELEMETRY: {"event":"live_session_first_frame","metadata":{"sessionId":"closed"}}',
+      'ARGUS_TELEMETRY: {"event":"rtcp_after_first_frame","metadata":{"spawn":"start","sessionId":"closed","videoPackets":1,"audioPackets":0}}',
+      "",
+    ].join("\n"));
+    const closed = runCounts([clean]);
+    expect(closed.status).toBe(0);
+    expect(closed.stdout).toContain("leaked_sessions=0\n");
+    expect(closed.stdout).not.toContain("closed");
+    expect(leaked.stdout).not.toContain("open");
   });
 
   it("calls forceStop when ffmpeg exits and nobody sent STOP", async () => {
