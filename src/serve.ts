@@ -42,11 +42,12 @@ export async function startArgusServer(
 ): Promise<ArgusServer> {
   HAPStorage.setCustomStoragePath(path.join(configDir, ".homekit"));
 
+  const passwords = config.cameras.map((camera) => camera.password);
   const supervisor: Go2RtcSupervisor = await startGo2Rtc(config, {
     configPath: path.join(configDir, "go2rtc.generated.yaml"),
     forceConfigOverwrite: true,
     binaryPath: config.go2rtc.binary,
-    stdio: "ignore",
+    stdio: "pipe",
   });
 
   const cache = new SnapshotCache(config, {
@@ -61,7 +62,6 @@ export async function startArgusServer(
   // profile stays available for on-demand consumers (boot resolution probe).
   let motion: MotionMonitor | undefined;
   const published: { unpublish(): void }[] = [];
-  const passwords = config.cameras.map((camera) => camera.password);
   try {
     cache.startPolling(10_000, ["main"]);
     deps?.afterGo2Rtc?.(passwords);

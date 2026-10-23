@@ -2,10 +2,11 @@ import { Buffer } from "node:buffer";
 import { spawn, type ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { access, chmod, mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
+import { constants, readFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
-import { constants } from "node:fs";
+import { PassThrough } from "node:stream";
 
 import { describe, expect, it, vi } from "vitest";
 import { parse as parseYaml } from "yaml";
@@ -19,6 +20,7 @@ import {
   type Go2RtcSpawn,
 } from "../src/go2rtc-supervisor.js";
 import { SnapshotCache } from "../src/snapshot-cache.js";
+import { redactCredentialHosts, redactKnownSecrets } from "../src/reolink.js";
 
 const CAMERA_PASSWORD = "fixture-camera-secret";
 const GO2RTC_BIN = process.env.GO2RTC_BIN ?? "/tmp/argus-go2rtc/go2rtc";
@@ -106,6 +108,8 @@ class FakeChildProcess extends EventEmitter implements Go2RtcChildProcess {
   public killed = false;
   public exitCode: number | null = null;
   public signalCode: NodeJS.Signals | null = null;
+  public readonly stdout = new PassThrough();
+  public readonly stderr = new PassThrough();
   public readonly kill = vi.fn((signal: NodeJS.Signals | number = "SIGTERM") => {
     this.killed = true;
     this.signalCode = typeof signal === "number" ? null : signal;
@@ -174,7 +178,11 @@ describe("go2rtc API credentials", () => {
       healthIntervalMs: 1,
     });
 
-    await supervisor.start();
+    try {
+      await supervisor.start();
+    } finally {
+      await supervisor.stop();
+    }
 
     const parsed: unknown = parseYaml(await readFile(configPath, "utf8"));
     const api =
@@ -205,5 +213,62 @@ describe("go2rtc API credentials", () => {
     const init = fetchMock.mock.calls[0]?.[1] as RequestInit | undefined;
     const expected = `Basic ${Buffer.from("argus:fixture-api-secret").toString("base64")}`;
     expect(new Headers(init?.headers).get("authorization")).toBe(expected);
+  });
+
+  it("redacts a go2rtc source URL before the line reaches the Argus log", async () => {
+    const raw = `dial rtsp://fixture-user:${CAMERA_PASSWORD}@192.0.2.1:554/h264Preview_01_main token ${CAMERA_PASSWORD}`;
+    const want = `[argus] go2rtc: ${redactCredentialHosts(redactKnownSecrets(raw, [CAMERA_PASSWORD]))}\n`;
+    const child = new FakeChildProcess();
+    const spawnMock = vi.fn(() => {
+      child.stdout.write(`${raw}\n`);
+      child.stderr.write(`${raw}\n`);
+      return child;
+    }) satisfies Go2RtcSpawn;
+    const logged: string[] = [];
+    const spy = vi.spyOn(process.stderr, "write").mockImplementation((chunk) => {
+      logged.push(String(chunk));
+      return true;
+    });
+    const directory = await tempDirectory();
+    const supervisor = createGo2RtcSupervisor(createConfig(1984), {
+      configPath: path.join(directory, "go2rtc.generated.yaml"),
+      spawn: spawnMock,
+      fetch: vi.fn(async () => new Response(JSON.stringify({ "front-door": {}, "front-door-sub": {} }), { status: 200 })) as unknown as typeof fetch,
+      startupTimeoutMs: 100,
+      healthIntervalMs: 1,
+      shutdownTimeoutMs: 20,
+    });
+    try {
+      await supervisor.start();
+      const deadline = Date.now() + 1_000;
+      while (logged.length < 2 && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      expect(logged).toEqual([want, want]);
+      expect(want.includes(CAMERA_PASSWORD)).toBe(false);
+      expect(want).toBe("[argus] go2rtc: dial rtsp://192.0.2.1:554/h264Preview_01_main token ***\n");
+    } finally {
+      spy.mockRestore();
+      await supervisor.stop();
+      child.stdout.destroy();
+      child.stderr.destroy();
+    }
+  });
+
+  it("lists camera passwords before go2rtc starts and does not ignore its pipes", () => {
+    const serve = readFileSync(new URL("../src/serve.ts", import.meta.url), "utf8");
+    const supervisor = readFileSync(new URL("../src/go2rtc-supervisor.ts", import.meta.url), "utf8");
+    const passwordsAt = serve.indexOf("const passwords = config.cameras.map((camera) => camera.password);");
+    const startAt = serve.indexOf("await startGo2Rtc(");
+    const capturedAt = supervisor.indexOf("const cameraPasswords = this.config.cameras.map((camera) => camera.password);");
+    const spawnAt = supervisor.indexOf("const child = spawnImpl(");
+    expect(passwordsAt).toBeGreaterThanOrEqual(0);
+    expect(startAt).toBeGreaterThan(passwordsAt);
+    expect(capturedAt).toBeGreaterThanOrEqual(0);
+    expect(spawnAt).toBeGreaterThan(capturedAt);
+    expect(serve.includes('stdio: "pipe"')).toBe(true);
+    expect(serve.includes('stdio: "ignore"')).toBe(false);
+    expect(supervisor.includes("redactKnownSecrets")).toBe(true);
+    expect(supervisor.includes("redactCredentialHosts")).toBe(true);
   });
 });

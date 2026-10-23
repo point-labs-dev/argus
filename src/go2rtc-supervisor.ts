@@ -1,6 +1,8 @@
 import { spawn as nodeSpawn } from "node:child_process";
 import { chmod, mkdir, writeFile } from "node:fs/promises";
 import * as path from "node:path";
+import { createInterface, type Interface } from "node:readline";
+import type { Readable } from "node:stream";
 
 import type { ArgusConfig } from "./config.js";
 import {
@@ -9,6 +11,7 @@ import {
   serializeGo2RtcConfig,
   type Go2RtcApiCredentials,
 } from "./go2rtc.js";
+import { redactCredentialHosts, redactKnownSecrets } from "./reolink.js";
 
 export type Go2RtcSupervisorErrorCode =
   | "CONFIG_EXISTS"
@@ -73,6 +76,8 @@ export interface Go2RtcChildProcess {
   once(event: "error", listener: (error: Error) => void): this;
   off(event: "exit", listener: (code: number | null, signal: NodeJS.Signals | null) => void): this;
   off(event: "error", listener: (error: Error) => void): this;
+  stdout?: Readable | null;
+  stderr?: Readable | null;
 }
 
 export type Go2RtcSpawn = (
@@ -134,6 +139,33 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function isProcessExited(child: Go2RtcChildProcess): boolean {
   return child.exitCode !== null || child.signalCode !== null;
+}
+
+function redactGo2RtcLogLine(line: string, secrets: readonly string[]): string {
+  return redactCredentialHosts(redactKnownSecrets(line, secrets));
+}
+
+function ignoreStreamError(): void {}
+
+function readGo2RtcPipe(
+  stream: Readable | null | undefined,
+  secrets: readonly string[],
+  readers: Interface[],
+): void {
+  if (!stream) {
+    return;
+  }
+
+  const lines = createInterface({ input: stream, crlfDelay: Infinity });
+  lines.on("line", (line) => {
+    if (line.length === 0) {
+      return;
+    }
+    process.stderr.write(`[argus] go2rtc: ${redactGo2RtcLogLine(line, secrets)}\n`);
+  });
+  lines.on("error", ignoreStreamError);
+  stream.on("error", ignoreStreamError);
+  readers.push(lines);
 }
 
 function sleep(ms: number): Promise<void> {
@@ -424,6 +456,7 @@ export class Go2RtcSupervisor {
   private child: Go2RtcChildProcess | undefined;
   private apiCredentialsValue: Go2RtcApiCredentials | undefined;
   private readonly apiBaseUrl: string;
+  private readonly logReaders: Interface[] = [];
 
   public constructor(
     private readonly config: ArgusConfig,
@@ -449,6 +482,9 @@ export class Go2RtcSupervisor {
       throw new Go2RtcSupervisorError("ALREADY_RUNNING", "go2rtc supervisor already has a running child process.");
     }
 
+    const cameraPasswords = this.config.cameras.map((camera) => camera.password);
+    this.closeLogReaders();
+
     const writeOptions: WriteGo2RtcConfigFileOptions = {};
     if (this.options.forceConfigOverwrite !== undefined) {
       writeOptions.force = this.options.forceConfigOverwrite;
@@ -459,6 +495,7 @@ export class Go2RtcSupervisor {
 
     const writeResult = await writeGo2RtcConfigFile(this.config, this.options.configPath, writeOptions);
     this.apiCredentialsValue = writeResult.api;
+    const logSecrets = [...cameraPasswords, writeResult.api.password];
 
     const spawnImpl = this.options.spawn ?? ((command, args, spawnOptions) => nodeSpawn(command, [...args], spawnOptions));
     const spawnOptions: { cwd?: string; stdio?: "ignore" | "inherit" | "pipe" } = {
@@ -470,6 +507,8 @@ export class Go2RtcSupervisor {
 
     const child = spawnImpl(this.options.binaryPath ?? this.config.go2rtc.binary, ["-config", writeResult.path], spawnOptions);
     this.child = child;
+    readGo2RtcPipe(child.stdout, logSecrets, this.logReaders);
+    readGo2RtcPipe(child.stderr, logSecrets, this.logReaders);
 
     let removeEarlyExitListeners: (() => void) | undefined;
     const earlyExit = new Promise<never>((_resolve, reject) => {
@@ -527,9 +566,17 @@ export class Go2RtcSupervisor {
       if (!isProcessExited(child)) {
         await terminateProcess(child, this.options.shutdownTimeoutMs ?? 5_000);
       }
+      this.closeLogReaders();
       this.child = undefined;
       throw error;
     }
+  }
+
+  private closeLogReaders(): void {
+    for (const reader of this.logReaders) {
+      reader.close();
+    }
+    this.logReaders.length = 0;
   }
 
   public async health(): Promise<Go2RtcHealthStatus> {
@@ -561,6 +608,7 @@ export class Go2RtcSupervisor {
     }
 
     const result = await terminateProcess(child, this.options.shutdownTimeoutMs ?? 5_000);
+    this.closeLogReaders();
     this.child = undefined;
     return result;
   }
