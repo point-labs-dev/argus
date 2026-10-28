@@ -24,11 +24,11 @@ import {
 import { buildRecordingFfmpegArgs } from "../src/recording.js";
 import { percentileOf, samplesForSpan } from "./notification-latency.mjs";
 
-const MEASURED_SHA = "eb1ede5e7922b57f5381a77b111050a0bde4fc4e";
 const FRAMES = 30;
 const FFMPEG_TIMEOUT_MS = 30_000;
 const LIVE_SOURCE = "testsrc2=size=640x360:rate=30:duration=1";
 const RECORDING_SOURCE = "testsrc2=size=1920x1080:rate=30:duration=1";
+const P720_SOURCE = "testsrc2=size=1280x720:rate=30:duration=1";
 
 const HKSV_P50_MS = 5300;
 const HKSV_P50_TOLERANCE_MS = 0;
@@ -42,11 +42,11 @@ const RECORDING_SPEC = "1080p30 H.264 Baseline L4.0 2Mbps";
 const LIVE_SSIM = 0.981368;
 const RECORDING_SSIM = 0.985117;
 const SSIM_TOLERANCE = 0.002;
-const LIVE_SSIM_TARGET = "0.989476@1280x720";
+const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
+const ROOT = join(SCRIPT_DIR, "..");
+const FIXTURE_LOG = join(SCRIPT_DIR, "fixtures", "field-latency.txt");
 
-const FIXTURE_LOG = join(dirname(fileURLToPath(import.meta.url)), "fixtures", "field-latency.txt");
-
-type Source = "field" | "fixture" | "skip";
+type Source = "fixture" | "skip";
 type Gate = "ok" | "fail" | "skip";
 
 interface MetricLine {
@@ -56,8 +56,39 @@ interface MetricLine {
   tolerance: string;
   target: string;
   source: Source;
+  measuredSha: string;
   gate: Gate;
   reason?: string;
+}
+
+function commitOf(path: string): string {
+  const result = spawnSync("git", ["log", "-1", "--format=%H", "--", path], {
+    cwd: ROOT,
+    encoding: "utf8",
+  });
+  const sha = (result.stdout ?? "").trim();
+  if (result.status !== 0 || !/^[0-9a-f]{40}$/.test(sha)) {
+    throw new Error(`frozen-benchmarks: no commit for ${path}`);
+  }
+  return sha;
+}
+
+function frozenGate(input: {
+  current: number;
+  baseline: number;
+  tolerance: number;
+  better: "lower" | "higher";
+  target: number;
+  targetExclusive?: boolean;
+}): Gate {
+  const meets = input.better === "lower"
+    ? (input.targetExclusive === true ? input.current < input.target : input.current <= input.target)
+    : input.current >= input.target;
+  if (meets) return "ok";
+  const regressed = input.better === "lower"
+    ? input.current > input.baseline + input.tolerance
+    : input.current < input.baseline - input.tolerance;
+  return regressed ? "fail" : "ok";
 }
 
 interface PictureScore {
@@ -75,17 +106,13 @@ export function formatMetric(metric: MetricLine): string {
     `tolerance=${metric.tolerance}`,
     `target=${token(metric.target)}`,
     `source=${metric.source}`,
-    `measured_sha=${MEASURED_SHA}`,
+    `measured_sha=${metric.measuredSha}`,
     `gate=${metric.gate}`,
   ].join(" ") + reason;
 }
 
 function token(value: string): string {
   return value.includes(" ") ? `"${value}"` : value;
-}
-
-function numericGate(current: number, baseline: number, tolerance: number): Gate {
-  return Math.abs(current - baseline) > tolerance ? "fail" : "ok";
 }
 
 function oneLine(text: string): string {
@@ -141,6 +168,40 @@ function withDefaultLiveEnv<T>(fn: () => T): T {
   }
 }
 
+function liveCodecArgs(width: number, height: number, fps: number, negotiatedKbps: number): string[] {
+  const input: LiveFfmpegInput = {
+    inputUrl: "rtsp://127.0.0.1:8554/fixture-sub",
+    targetAddress: "127.0.0.1",
+    videoMode: "transcode",
+    aspect: "16:9",
+    video: {
+      port: 1,
+      localRtcpPort: 2,
+      ssrc: 1,
+      payloadType: 99,
+      maxBitrateKbps: effectiveBitrateKbps(width, height, negotiatedKbps),
+      fps,
+      width,
+      height,
+      mtu: 1378,
+      profile: "baseline",
+      level: height >= 720 ? "4.0" : "3.1",
+      srtpParams: "unused",
+    },
+    audio: {
+      port: 3,
+      localRtcpPort: 4,
+      ssrc: 2,
+      payloadType: 110,
+      codec: AudioStreamingCodecType.OPUS,
+      sampleRateKhz: 24,
+      maxBitrateKbps: 24,
+      srtpParams: "unused",
+    },
+  };
+  return codecSlice(buildLiveFfmpegArgs(input, false), "-payload_type");
+}
+
 function liveOffer(): { height: number; codec: string[] } {
   return withDefaultLiveEnv(() => {
     const wide = buildCameraControllerOptions({ aspect: "16:9" } as never);
@@ -154,40 +215,14 @@ function liveOffer(): { height: number; codec: string[] } {
     if (!top || height === 0) {
       throw new Error("frozen-benchmarks: no live rung");
     }
-    const width = top[0];
-    const rungHeight = top[1];
-    const fps = top[2];
-    const input: LiveFfmpegInput = {
-      inputUrl: "rtsp://127.0.0.1:8554/fixture-sub",
-      targetAddress: "127.0.0.1",
-      videoMode: "transcode",
-      aspect: "16:9",
-      video: {
-        port: 1,
-        localRtcpPort: 2,
-        ssrc: 1,
-        payloadType: 99,
-        maxBitrateKbps: effectiveBitrateKbps(width, rungHeight, 1),
-        fps,
-        width,
-        height: rungHeight,
-        mtu: 1378,
-        profile: "baseline",
-        level: rungHeight >= 720 ? "4.0" : "3.1",
-        srtpParams: "unused",
-      },
-      audio: {
-        port: 3,
-        localRtcpPort: 4,
-        ssrc: 2,
-        payloadType: 110,
-        codec: AudioStreamingCodecType.OPUS,
-        sampleRateKhz: 24,
-        maxBitrateKbps: 24,
-        srtpParams: "unused",
-      },
-    };
-    return { height, codec: codecSlice(buildLiveFfmpegArgs(input, false), "-payload_type") };
+    return { height, codec: liveCodecArgs(top[0], top[1], top[2], 1) };
+  });
+}
+
+function p720Target(): string {
+  return withDefaultLiveEnv(() => {
+    const score = scoreRecipe(P720_SOURCE, liveCodecArgs(1280, 720, 30, 2000), false);
+    return `${score.ssim.toFixed(6)}@1280x720`;
   });
 }
 
@@ -216,6 +251,33 @@ function recordingConfig(): CameraRecordingConfiguration {
       bitrate: 64,
     },
   };
+}
+
+const PROFILE_RANK: Record<string, number> = { Baseline: 1, Main: 2, High: 3 };
+
+function parsePictureSpec(spec: string): { pixels: number; fps: number; rank: number; kbps: number } | undefined {
+  const match = spec.match(/^(1080p|\d+x\d+)(\d+) H\.264 (Baseline|Main|High) L[\d.]+ (\d+(?:Mbps|k))$/);
+  const size = match?.[1];
+  const profile = match?.[3];
+  const rateToken = match?.[4];
+  if (match?.[2] === undefined || size === undefined || profile === undefined || rateToken === undefined) return undefined;
+  const fps = Number(match[2]);
+  const rank = PROFILE_RANK[profile] ?? 0;
+  const kbps = rateToken.endsWith("Mbps") ? Number(rateToken.slice(0, -4)) * 1000 : Number(rateToken.slice(0, -1));
+  if (!Number.isFinite(fps) || rank === 0 || !Number.isFinite(kbps)) return undefined;
+  if (size === "1080p") return { pixels: 1920 * 1080, fps, rank, kbps };
+  const dims = size.match(/^(\d+)x(\d+)$/);
+  const width = dims?.[1];
+  const height = dims?.[2];
+  if (width === undefined || height === undefined) return undefined;
+  return { pixels: Number(width) * Number(height), fps, rank, kbps };
+}
+
+export function recordingHolds(spec: string): boolean {
+  const base = parsePictureSpec(RECORDING_SPEC);
+  const next = parsePictureSpec(spec);
+  if (base === undefined || next === undefined) return false;
+  return next.pixels >= base.pixels && next.fps >= base.fps && next.rank >= base.rank && next.kbps >= base.kbps;
 }
 
 function recordingSpec(args: readonly string[]): string {
@@ -321,9 +383,23 @@ function latencyLine(
   percentile: number,
   baseline: number,
   tolerance: number,
-  target: string,
+  targetMs: number,
+  measuredSha: string,
 ): MetricLine {
-  const value = samples.length === 0 ? undefined : percentileOf(samples, percentile);
+  const target = `<=${targetMs}ms`;
+  if (samples.length === 0) {
+    return {
+      id,
+      current: "missing",
+      baseline: `${baseline}ms`,
+      tolerance: `${tolerance}ms`,
+      target,
+      source: "fixture",
+      measuredSha,
+      gate: "fail",
+    };
+  }
+  const value = percentileOf(samples, percentile);
   if (value === undefined) {
     return {
       id,
@@ -331,7 +407,8 @@ function latencyLine(
       baseline: `${baseline}ms`,
       tolerance: `${tolerance}ms`,
       target,
-      source: "field",
+      source: "fixture",
+      measuredSha,
       gate: "fail",
     };
   }
@@ -342,12 +419,13 @@ function latencyLine(
     baseline: `${baseline}ms`,
     tolerance: `${tolerance}ms`,
     target,
-    source: "field",
-    gate: numericGate(current, baseline, tolerance),
+    source: "fixture",
+    measuredSha,
+    gate: frozenGate({ current, baseline, tolerance, better: "lower", target: targetMs }),
   };
 }
 
-function overLine(samples: number[]): MetricLine {
+function overLine(samples: number[], measuredSha: string): MetricLine {
   if (samples.length === 0) {
     return {
       id: "live_starts_over_2_5s",
@@ -355,7 +433,8 @@ function overLine(samples: number[]): MetricLine {
       baseline: `${LIVE_OVER_2_5_S.toFixed(1)}%`,
       tolerance: `${LIVE_OVER_TOLERANCE}%`,
       target: "<5%",
-      source: "field",
+      source: "fixture",
+      measuredSha,
       gate: "fail",
     };
   }
@@ -367,12 +446,27 @@ function overLine(samples: number[]): MetricLine {
     baseline: `${LIVE_OVER_2_5_S.toFixed(1)}%`,
     tolerance: `${LIVE_OVER_TOLERANCE}%`,
     target: "<5%",
-    source: "field",
-    gate: numericGate(current, LIVE_OVER_2_5_S, LIVE_OVER_TOLERANCE),
+    source: "fixture",
+    measuredSha,
+    gate: frozenGate({
+      current,
+      baseline: LIVE_OVER_2_5_S,
+      tolerance: LIVE_OVER_TOLERANCE,
+      better: "lower",
+      target: 5,
+      targetExclusive: true,
+    }),
   };
 }
 
-function ssimLine(id: string, baseline: number, target: string, score: PictureScore | undefined, error: string | undefined): MetricLine {
+function ssimLine(
+  id: string,
+  baseline: number,
+  target: string,
+  score: PictureScore | undefined,
+  error: string | undefined,
+  measuredSha: string,
+): MetricLine {
   if (error !== undefined || score === undefined) {
     return {
       id,
@@ -381,6 +475,7 @@ function ssimLine(id: string, baseline: number, target: string, score: PictureSc
       tolerance: String(SSIM_TOLERANCE),
       target,
       source: "fixture",
+      measuredSha,
       gate: "fail",
       reason: oneLine(error ?? "ssim failed"),
     };
@@ -393,11 +488,12 @@ function ssimLine(id: string, baseline: number, target: string, score: PictureSc
     tolerance: String(SSIM_TOLERANCE),
     target,
     source: "fixture",
-    gate: numericGate(current, baseline, SSIM_TOLERANCE),
+    measuredSha,
+    gate: frozenGate({ current, baseline, tolerance: SSIM_TOLERANCE, better: "higher", target: baseline }),
   };
 }
 
-function vmafLine(id: string, score: PictureScore | undefined, filterPresent: boolean): MetricLine {
+function vmafLine(id: string, score: PictureScore | undefined, filterPresent: boolean, measuredSha: string): MetricLine {
   if (!filterPresent) {
     return {
       id,
@@ -406,6 +502,7 @@ function vmafLine(id: string, score: PictureScore | undefined, filterPresent: bo
       tolerance: "skip",
       target: "unmeasured",
       source: "skip",
+      measuredSha,
       gate: "skip",
       reason: "ffmpeg has no libvmaf",
     };
@@ -418,6 +515,7 @@ function vmafLine(id: string, score: PictureScore | undefined, filterPresent: bo
       tolerance: "skip",
       target: "unmeasured",
       source: "skip",
+      measuredSha,
       gate: "skip",
       reason: score?.vmafReason ?? "libvmaf returned no score",
     };
@@ -429,12 +527,16 @@ function vmafLine(id: string, score: PictureScore | undefined, filterPresent: bo
     tolerance: "skip",
     target: "unmeasured",
     source: "skip",
+    measuredSha,
     gate: "skip",
     reason: "no frozen vmaf baseline",
   };
 }
 
 export function runFrozenBenchmarks(logContents: string): { lines: string[]; failed: boolean } {
+  const fixtureSha = commitOf("scripts/fixtures/field-latency.txt");
+  const liveSha = commitOf("src/homekit.ts");
+  const recordingSha = commitOf("src/recording.ts");
   const recordingSamples = samplesForSpan(logContents, "recording_start_to_first_fragment");
   const liveSamples = samplesForSpan(logContents, "live_session_start_to_first_frame");
   const offer = liveOffer();
@@ -444,6 +546,7 @@ export function runFrozenBenchmarks(logContents: string): { lines: string[]; fai
   );
   const spec = recordingSpec(recordingArgs);
   const vmaf = ffmpegHasLibvmaf();
+  const liveTarget = p720Target();
 
   let liveScore: PictureScore | undefined;
   let liveError: string | undefined;
@@ -461,32 +564,34 @@ export function runFrozenBenchmarks(logContents: string): { lines: string[]; fai
   }
 
   const metrics: MetricLine[] = [
-    latencyLine("hksv_first_fragment_p50", recordingSamples, 50, HKSV_P50_MS, HKSV_P50_TOLERANCE_MS, "<=2650ms"),
-    latencyLine("live_first_frame_p50", liveSamples, 50, LIVE_P50_MS, LIVE_MS_TOLERANCE, "<=650ms"),
-    latencyLine("live_first_frame_p95", liveSamples, 95, LIVE_P95_MS, LIVE_MS_TOLERANCE, "<=2100ms"),
-    overLine(liveSamples),
+    latencyLine("hksv_first_fragment_p50", recordingSamples, 50, HKSV_P50_MS, HKSV_P50_TOLERANCE_MS, 2650, fixtureSha),
+    latencyLine("live_first_frame_p50", liveSamples, 50, LIVE_P50_MS, LIVE_MS_TOLERANCE, 650, fixtureSha),
+    latencyLine("live_first_frame_p95", liveSamples, 95, LIVE_P95_MS, LIVE_MS_TOLERANCE, 2100, fixtureSha),
+    overLine(liveSamples, fixtureSha),
     {
       id: "live_picture_height",
       current: `${offer.height}p`,
       baseline: `${LIVE_HEIGHT}p`,
       tolerance: "0p",
       target: ">=720p",
-      source: "field",
-      gate: offer.height === LIVE_HEIGHT ? "ok" : "fail",
+      source: "fixture",
+      measuredSha: liveSha,
+      gate: frozenGate({ current: offer.height, baseline: LIVE_HEIGHT, tolerance: 0, better: "higher", target: 720 }),
     },
     {
       id: "recording_picture",
       current: spec,
       baseline: RECORDING_SPEC,
-      tolerance: "exact",
+      tolerance: "not-worse",
       target: "beyond 1080p30 H.264 Baseline 2Mbps",
-      source: "field",
-      gate: spec === RECORDING_SPEC ? "ok" : "fail",
+      source: "fixture",
+      measuredSha: recordingSha,
+      gate: recordingHolds(spec) ? "ok" : "fail",
     },
-    ssimLine("live_ssim", LIVE_SSIM, LIVE_SSIM_TARGET, liveScore, liveError),
-    ssimLine("recording_ssim", RECORDING_SSIM, "beyond 1080p30 H.264 Baseline 2Mbps", recordingScore, recordingError),
-    vmafLine("live_vmaf", liveScore, vmaf),
-    vmafLine("recording_vmaf", recordingScore, vmaf),
+    ssimLine("live_ssim", LIVE_SSIM, liveTarget, liveScore, liveError, liveSha),
+    ssimLine("recording_ssim", RECORDING_SSIM, "beyond 1080p30 H.264 Baseline 2Mbps", recordingScore, recordingError, recordingSha),
+    vmafLine("live_vmaf", liveScore, vmaf, liveSha),
+    vmafLine("recording_vmaf", recordingScore, vmaf, recordingSha),
   ];
   return {
     lines: metrics.map(formatMetric),

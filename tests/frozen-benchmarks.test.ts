@@ -5,6 +5,8 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 
+import { buildRecordingFfmpegArgs } from "../src/recording.js";
+
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const tsx = join(root, "node_modules", ".bin", "tsx");
 const script = join(root, "scripts", "frozen-benchmarks.ts");
@@ -41,7 +43,7 @@ const FROZEN_HEAD = [
   metric("live_first_frame_p95", "4265ms", "4265ms", "0ms", "<=2100ms", fixtureSha),
   metric("live_starts_over_2_5s", "28.4%", "28.4%", "0.05%", "<5%", fixtureSha),
   metric("live_picture_height", "480p", "480p", "0p", ">=720p", liveSha),
-  `recording_picture current="1080p30 H.264 Baseline L4.0 2Mbps" baseline="1080p30 H.264 Baseline L4.0 2Mbps" tolerance=exact target="beyond 1080p30 H.264 Baseline 2Mbps" source=fixture measured_sha=${recordingSha} gate=ok`,
+  `recording_picture current="1080p30 H.264 Baseline L4.0 2Mbps" baseline="1080p30 H.264 Baseline L4.0 2Mbps" tolerance=not-worse target="beyond 1080p30 H.264 Baseline 2Mbps" source=fixture measured_sha=${recordingSha} gate=ok`,
 ].join("\n");
 
 const RECORDING_SSIM =
@@ -106,6 +108,42 @@ function expectNoField(stdout: string): void {
 }
 
 describe("frozen benchmarks", () => {
+  it("puts sync-lookahead=0 on the recording x264 params", () => {
+    const args = buildRecordingFfmpegArgs("rtsp://127.0.0.1:8554/fixture-main", {
+      prebufferLength: 4000,
+      eventTriggerTypes: [],
+      mediaContainerConfiguration: { type: 0, fragmentLength: 4000 },
+      videoCodec: {
+        type: 0,
+        parameters: { profile: 0, level: 2, bitRate: 2000, iFrameInterval: 4000 },
+        resolution: [1920, 1080, 30],
+      },
+      audioCodec: { type: 0, audioChannels: 1, samplerate: 3, bitrate: 64 },
+    } as never, "16:9");
+    expect(args[args.indexOf("-x264-params") + 1]).toBe("sync-lookahead=0");
+  });
+
+  it("keeps a recording spec that matches or beats the frozen picture", () => {
+    const specs = [
+      "1080p30 H.264 Baseline L4.0 2Mbps",
+      "1080p30 H.264 Main L4.0 2Mbps",
+      "1080p30 H.264 High L4.0 4Mbps",
+      "1080p30 H.264 Baseline L4.0 2500k",
+      "1080p30 H.264 Baseline L4.0 1Mbps",
+      "1280x72030 H.264 High L4.0 8Mbps",
+      "1080p15 H.264 High L4.0 4Mbps",
+      "not a spec",
+    ];
+    const code = [
+      'import { recordingHolds } from "./scripts/frozen-benchmarks.ts";',
+      `const specs = ${JSON.stringify(specs)};`,
+      'process.stdout.write(specs.map((spec) => recordingHolds(spec) ? "1" : "0").join(""));',
+    ].join("\n");
+    const result = spawnSync(tsx, ["-e", code], { cwd: root, encoding: "utf8" });
+    expect(result.status).toBe(0);
+    expect(result.stdout).toBe("11110000");
+  });
+
   it("prints the fixture baseline and exits 0 while every 2x target is still missed", () => {
     const result = run();
     expect(result.stderr).toBe("");
