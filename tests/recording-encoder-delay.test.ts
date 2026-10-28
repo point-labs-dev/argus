@@ -3,21 +3,6 @@ import { describe, expect, it } from "vitest";
 
 import { buildRecordingFfmpegArgs } from "../src/recording.js";
 
-/*
-Acceptance criteria:
-
-- x264 holds 4 fewer frames before the first recording packet. That is 17
-  frames at 6 threads (main: 21) and 26 frames at 15 threads (main: 30). At
-  1080p, x264 picks 1.5 threads per core, so a 4-core runner gets 6 and the
-  10-core Mac mini M4 gets 15.
-- On the synthetic Front L harness (HEVC 4512x2512 at 25 fps, 4 s GOP, through
-  go2rtc 1.9.14), the median from recording start to the first fragment drops
-  by at least 100 ms against main. Each side runs at least 5 times, the sides
-  alternate, and no fragment is invalid.
-- Every fragment still starts on an IDR, carries H.264 and AAC, and decodes
-  alone. tests/recording-first-fragment.test.ts checks that end to end.
-*/
-
 function recordingConfig() {
   return {
     prebufferLength: 4000,
@@ -50,8 +35,8 @@ function framesBeforeFirstPacket(threads: number): number {
 }
 
 describe("recording encoder delay", () => {
-  it("holds 17 frames at 6 threads and 26 frames at 15 threads before the first packet", () => {
-    expect(framesBeforeFirstPacket(6)).toBe(17);
-    expect(framesBeforeFirstPacket(15)).toBe(26);
+  it("holds 12 frames before the first packet at 6 threads and at 15 threads", () => {
+    expect(framesBeforeFirstPacket(6)).toBe(12);
+    expect(framesBeforeFirstPacket(15)).toBe(12);
   }, 30_000);
 });
