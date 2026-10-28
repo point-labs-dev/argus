@@ -192,16 +192,30 @@ function formatSpan(id, samples) {
   return `${id} n=${sorted.length} min=${fmt(min)} p50=${fmt(percentile(sorted, 50))} p90=${fmt(percentile(sorted, 90))} max=${fmt(max)}`;
 }
 
+function samplesFromMarks(timingMarks, telemetryMarks, span) {
+  const timingSamples = samplesFor(timingMarks, span.from, span.to, span.pair);
+  if (timingSamples.length > 0) return timingSamples;
+  return samplesFor(telemetryMarks, span.from, span.to, span.pair);
+}
+
+export function samplesForSpan(logContents, spanId) {
+  const span = STAGE_SPANS.find((item) => item.id === spanId);
+  if (!span) return [];
+  const timingMarks = parsePrefixed(logContents, TIMING_LINE, parseTimingMark);
+  const telemetryMarks = parsePrefixed(logContents, TELEMETRY_LINE, parseTelemetryMark);
+  return samplesFromMarks(timingMarks, telemetryMarks, span);
+}
+
+export function percentileOf(samples, p) {
+  if (samples.length === 0) return undefined;
+  const sorted = [...samples].sort((a, b) => a - b);
+  return percentile(sorted, p);
+}
+
 export function formatNotificationReport(logContents) {
   const timingMarks = parsePrefixed(logContents, TIMING_LINE, parseTimingMark);
   const telemetryMarks = parsePrefixed(logContents, TELEMETRY_LINE, parseTelemetryMark);
-  const lines = STAGE_SPANS.map((span) => {
-    const timingSamples = samplesFor(timingMarks, span.from, span.to, span.pair);
-    const samples = timingSamples.length > 0
-      ? timingSamples
-      : samplesFor(telemetryMarks, span.from, span.to, span.pair);
-    return formatSpan(span.id, samples);
-  });
+  const lines = STAGE_SPANS.map((span) => formatSpan(span.id, samplesFromMarks(timingMarks, telemetryMarks, span)));
   return `${lines.join("\n")}\n`;
 }
 
