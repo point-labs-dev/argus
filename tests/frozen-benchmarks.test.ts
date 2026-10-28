@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { copyFileSync, lstatSync, mkdtempSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -118,21 +118,6 @@ function pictureArgs(width: number, height: number, kbps: number): string[] {
   ];
 }
 
-function unlinkIfSymlink(path: string): void {
-  try {
-    if (lstatSync(path).isSymbolicLink()) unlinkSync(path);
-  } catch (error) {
-    const code = error instanceof Error && "code" in error ? error.code : undefined;
-    if (code !== "ENOENT") throw error;
-  }
-}
-
-function removeTree(dir: string): void {
-  unlinkIfSymlink(join(dir, "repo", "node_modules"));
-  unlinkIfSymlink(join(dir, "node"));
-  rmSync(dir, { recursive: true, force: true });
-}
-
 describe("frozen benchmarks", () => {
   it("puts sync-lookahead=0 on the recording x264 params", () => {
     const args = buildRecordingFfmpegArgs("rtsp://127.0.0.1:8554/fixture-main", {
@@ -145,7 +130,7 @@ describe("frozen benchmarks", () => {
         resolution: [1920, 1080, 30],
       },
       audioCodec: { type: 0, audioChannels: 1, samplerate: 3, bitrate: 64 },
-    } as never, "16:9");
+    }, "16:9");
     expect(args[args.indexOf("-x264-params") + 1]).toBe("sync-lookahead=0");
   });
 
@@ -160,14 +145,7 @@ describe("frozen benchmarks", () => {
       "1080p15 H.264 High L4.0 4Mbps",
       "not a spec",
     ];
-    const code = [
-      'import { recordingHolds } from "./scripts/frozen-benchmarks.ts";',
-      `const specs = ${JSON.stringify(specs)};`,
-      'process.stdout.write(specs.map((spec) => recordingHolds(spec) ? "1" : "0").join(""));',
-    ].join("\n");
-    const result = spawnSync(tsx, ["-e", code], { cwd: root, encoding: "utf8" });
-    expect(result.status).toBe(0);
-    expect(result.stdout).toBe("11110000");
+    expect(specs.map((spec) => recordingHolds(spec) ? "1" : "0").join("")).toBe("11110000");
   });
 
   it("accepts a better non-1080p spec", () => {
@@ -198,29 +176,27 @@ describe("frozen benchmarks", () => {
 
   it("exits 1 when git is not on PATH", () => {
     const bin = mkdtempSync(join(tmpdir(), "argus-nogit-"));
-    try {
-      symlinkSync(process.execPath, join(bin, "node"));
-      const result = spawnSync(tsx, [script], {
-        cwd: root,
-        encoding: "utf8",
-        timeout: 20_000,
-        env: { ...process.env, PATH: bin },
-      });
-      expect(result.status).toBe(1);
-      expect(result.stdout).toBe("");
-      expect(result.stderr).toBe("frozen-benchmarks: git is not on PATH\n");
-    } finally {
-      removeTree(bin);
-    }
+    dirs.push(bin);
+    symlinkSync(process.execPath, join(bin, "node"));
+    const result = spawnSync(tsx, [script], {
+      cwd: root,
+      encoding: "utf8",
+      timeout: 20_000,
+      env: { ...process.env, PATH: bin },
+    });
+    expect(result.status).toBe(1);
+    expect(result.stdout).toBe("");
+    expect(result.stderr).toBe("frozen-benchmarks: git is not on PATH\n");
   });
 
   it("exits 1 on a depth-1 clone", () => {
-    const dir = mkdtempSync(join(tmpdir(), "argus-shallow-"));
-    const repo = join(dir, "repo");
-    try {
+    for (const depth of ["1", "2"]) {
+      const dir = mkdtempSync(join(tmpdir(), "argus-shallow-"));
+      dirs.push(dir);
+      const repo = join(dir, "repo");
       const cloned = spawnSync(
         "git",
-        ["clone", "--depth", "1", `file://${root}`, repo],
+        ["clone", "--depth", depth, `file://${root}`, repo],
         { encoding: "utf8", env: { ...process.env, GIT_TERMINAL_PROMPT: "0" } },
       );
       expect(cloned.status, cloned.stderr).toBe(0);
@@ -229,15 +205,13 @@ describe("frozen benchmarks", () => {
       const result = spawnSync(tsx, [join(repo, "scripts", "frozen-benchmarks.ts")], {
         cwd: repo,
         encoding: "utf8",
-        timeout: 60_000,
+        timeout: 20_000,
       });
       expect(result.status).toBe(1);
       expect(result.stdout).toBe("");
       expect(result.stderr).toBe(
-        "frozen-benchmarks: a depth-1 clone cannot name the commit for scripts/fixtures/field-latency.txt\n",
+        "frozen-benchmarks: a shallow clone cannot name the commit for scripts/fixtures/field-latency.txt\n",
       );
-    } finally {
-      removeTree(dir);
     }
   });
 

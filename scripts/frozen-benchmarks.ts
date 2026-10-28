@@ -61,16 +61,45 @@ interface MetricLine {
   reason?: string;
 }
 
-function commitOf(path: string): string {
-  const result = spawnSync("git", ["log", "-1", "--format=%H", "--", path], {
-    cwd: ROOT,
-    encoding: "utf8",
-  });
-  const sha = (result.stdout ?? "").trim();
-  if (result.status !== 0 || !/^[0-9a-f]{40}$/.test(sha)) {
-    throw new Error(`frozen-benchmarks: no commit for ${path}`);
+class StampError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "StampError";
   }
-  return sha;
+}
+
+function isEnoent(error: Error | undefined): boolean {
+  return error !== undefined && "code" in error && error.code === "ENOENT";
+}
+
+function gitResult(args: readonly string[]): { status: number | null; stdout: string; missing: boolean } {
+  const result = spawnSync("git", [...args], { cwd: ROOT, encoding: "utf8" });
+  return {
+    status: result.status,
+    stdout: (result.stdout ?? "").trim(),
+    missing: isEnoent(result.error),
+  };
+}
+
+function commitTouches(sha: string, path: string): boolean {
+  const diff = gitResult(["diff-tree", "--no-commit-id", "--name-only", "-r", sha, "--", path]);
+  if (diff.missing) throw new StampError("frozen-benchmarks: git is not on PATH");
+  return diff.status === 0 && diff.stdout.split("\n").includes(path);
+}
+
+function commitOf(path: string): string {
+  const log = gitResult(["log", "-1", "--format=%H", "--", path]);
+  if (log.missing) throw new StampError("frozen-benchmarks: git is not on PATH");
+  if (log.status !== 0 || !/^[0-9a-f]{40}$/.test(log.stdout)) {
+    throw new StampError(`frozen-benchmarks: no commit for ${path}`);
+  }
+  if (commitTouches(log.stdout, path)) return log.stdout;
+  const shallow = gitResult(["rev-parse", "--is-shallow-repository"]);
+  if (shallow.missing) throw new StampError("frozen-benchmarks: git is not on PATH");
+  if (shallow.stdout === "true") {
+    throw new StampError(`frozen-benchmarks: a shallow clone cannot name the commit for ${path}`);
+  }
+  throw new StampError(`frozen-benchmarks: no commit for ${path}`);
 }
 
 export function frozenGate(input: {
@@ -256,21 +285,17 @@ function recordingConfig(): CameraRecordingConfiguration {
 const PROFILE_RANK: Record<string, number> = { Baseline: 1, Main: 2, High: 3 };
 
 function parsePictureSpec(spec: string): { pixels: number; fps: number; rank: number; kbps: number } | undefined {
-  const match = spec.match(/^(1080p|\d+x\d+)(\d+) H\.264 (Baseline|Main|High) L[\d.]+ (\d+(?:Mbps|k))$/);
-  const size = match?.[1];
-  const profile = match?.[3];
-  const rateToken = match?.[4];
-  if (match?.[2] === undefined || size === undefined || profile === undefined || rateToken === undefined) return undefined;
-  const fps = Number(match[2]);
+  const match = spec.match(/^(?:1080p(\d+)|(\d+)x(\d+)@(\d+)) H\.264 (Baseline|Main|High) L[\d.]+ (\d+(?:Mbps|k))$/);
+  const profile = match?.[5];
+  const rateToken = match?.[6];
+  const fpsToken = match?.[1] ?? match?.[4];
+  if (match === null || profile === undefined || rateToken === undefined || fpsToken === undefined) return undefined;
+  const fps = Number(fpsToken);
   const rank = PROFILE_RANK[profile] ?? 0;
   const kbps = rateToken.endsWith("Mbps") ? Number(rateToken.slice(0, -4)) * 1000 : Number(rateToken.slice(0, -1));
   if (!Number.isFinite(fps) || rank === 0 || !Number.isFinite(kbps)) return undefined;
-  if (size === "1080p") return { pixels: 1920 * 1080, fps, rank, kbps };
-  const dims = size.match(/^(\d+)x(\d+)$/);
-  const width = dims?.[1];
-  const height = dims?.[2];
-  if (width === undefined || height === undefined) return undefined;
-  return { pixels: Number(width) * Number(height), fps, rank, kbps };
+  if (match[2] === undefined) return { pixels: 1920 * 1080, fps, rank, kbps };
+  return { pixels: Number(match[2]) * Number(match[3]), fps, rank, kbps };
 }
 
 export function recordingHolds(spec: string): boolean {
@@ -294,8 +319,8 @@ export function recordingSpec(args: readonly string[]): string {
   const kbps = bitrate.endsWith("k") ? Number(bitrate.slice(0, -1)) : Number.NaN;
   const rateLabel = Number.isInteger(kbps) && kbps % 1000 === 0 ? `${kbps / 1000}Mbps` : bitrate;
   const profileLabel = profile === "baseline" ? "Baseline" : profile === "main" ? "Main" : profile === "high" ? "High" : profile;
-  const sizeLabel = width === "1920" && height === "1080" ? "1080p" : `${width}x${height}`;
-  return `${sizeLabel}${rate} H.264 ${profileLabel} L${level} ${rateLabel}`;
+  const sizeAndFps = width === "1920" && height === "1080" ? `1080p${rate}` : `${width}x${height}@${rate}`;
+  return `${sizeAndFps} H.264 ${profileLabel} L${level} ${rateLabel}`;
 }
 
 function ffmpegHasLibvmaf(): boolean {
@@ -619,9 +644,18 @@ if (invoked) {
   } else {
     const contents = readLog(requested ?? FIXTURE_LOG);
     if (contents !== undefined) {
-      const result = runFrozenBenchmarks(contents);
-      process.stdout.write(`${result.lines.join("\n")}\n`);
-      if (result.failed) process.exitCode = 1;
+      try {
+        const result = runFrozenBenchmarks(contents);
+        process.stdout.write(`${result.lines.join("\n")}\n`);
+        if (result.failed) process.exitCode = 1;
+      } catch (error) {
+        if (error instanceof StampError) {
+          process.stderr.write(`${error.message}\n`);
+          process.exitCode = 1;
+        } else {
+          throw error;
+        }
+      }
     }
   }
 }
