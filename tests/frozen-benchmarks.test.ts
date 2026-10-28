@@ -103,6 +103,12 @@ function expectLiveSsim(line: string | undefined): void {
   expect(Math.abs(target - 0.989476)).toBeLessThanOrEqual(0.00005);
 }
 
+function encoderLine(threads: number, frames: number, baselineFrames: number): string {
+  const current = Math.round((frames * 1000) / 30);
+  const baseline = Math.round((baselineFrames * 1000) / 30);
+  return `recording_encoder_delay_t${threads} current=${current}ms baseline=${baseline}ms tolerance=0ms target=<=${current}ms source=encode measured_sha=${recordingSha} gate=ok reason="${threads} x264 threads, ${frames} frames at 30fps"`;
+}
+
 function expectNoField(stdout: string): void {
   expect(stdout).not.toContain("source=field");
   expect(stdout).not.toMatch(/srtp|unused|\d{3}-\d{2}-\d{3}/);
@@ -119,7 +125,7 @@ function pictureArgs(width: number, height: number, kbps: number): string[] {
 }
 
 describe("frozen benchmarks", () => {
-  it("puts sync-lookahead=0 on the recording x264 params", () => {
+  it("keeps sync-lookahead=0 and sets sliced-threads on the recording encode", () => {
     const args = buildRecordingFfmpegArgs("rtsp://127.0.0.1:8554/fixture-main", {
       prebufferLength: 4000,
       eventTriggerTypes: [],
@@ -131,7 +137,7 @@ describe("frozen benchmarks", () => {
       },
       audioCodec: { type: 0, audioChannels: 1, samplerate: 3, bitrate: 64 },
     }, "16:9");
-    expect(args[args.indexOf("-x264-params") + 1]).toBe("sync-lookahead=0");
+    expect(args[args.indexOf("-x264-params") + 1]).toBe("sync-lookahead=0:sliced-threads=1");
   });
 
   it("keeps a recording spec that matches or beats the frozen picture", () => {
@@ -186,6 +192,19 @@ describe("frozen benchmarks", () => {
     expect(gate(720)).toBe("ok");
     expect(gate(480)).toBe("ok");
     expect(gate(479)).toBe("fail");
+  });
+
+  it("passes an encoder delay below the frozen baseline", () => {
+    const gate = (current: number) => frozenGate({
+      current,
+      baseline: 867,
+      tolerance: 0,
+      better: "lower",
+      target: 400,
+    });
+    expect(gate(200)).toBe("ok");
+    expect(gate(500)).toBe("ok");
+    expect(gate(868)).toBe("fail");
   });
 
   it("exits 1 when git is not on PATH", () => {
@@ -250,7 +269,13 @@ describe("frozen benchmarks", () => {
       expect(liveVmaf).toBe(vmafSkip("live_vmaf", liveSha));
       expect(recordingVmaf).toBe(vmafSkip("recording_vmaf", recordingSha));
     }
-    expect(lines).toHaveLength(10);
+    expect(lines).toHaveLength(12);
+    expect(lines.find((line) => line.startsWith("recording_encoder_delay_t15 "))).toBe(
+      encoderLine(15, 12, 26),
+    );
+    expect(lines.find((line) => line.startsWith("recording_encoder_delay_t6 "))).toBe(
+      encoderLine(6, 12, 17),
+    );
     expectNoField(result.stdout);
   }, 60_000);
 

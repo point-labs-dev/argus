@@ -46,7 +46,7 @@ const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(SCRIPT_DIR, "..");
 const FIXTURE_LOG = join(SCRIPT_DIR, "fixtures", "field-latency.txt");
 
-type Source = "fixture" | "skip";
+type Source = "fixture" | "encode" | "skip";
 type Gate = "ok" | "fail" | "skip";
 
 interface MetricLine {
@@ -402,6 +402,70 @@ function scoreRecipe(source: string, codecArgs: readonly string[], withVmaf: boo
   }
 }
 
+function encoderDelayMs(frames: number): number {
+  return Math.round((frames * 1000) / 30);
+}
+
+function framesBeforeFirstPacket(codecArgs: readonly string[], threads: number): number {
+  const result = spawnSync("ffmpeg", [
+    "-hide_banner", "-loglevel", "info", "-debug_ts",
+    "-f", "lavfi", "-i", "testsrc2=size=1920x1080:rate=30:duration=2",
+    ...codecArgs,
+    "-threads", String(threads),
+    "-an",
+    "-f", "null", "-",
+  ], { encoding: "utf8", timeout: FFMPEG_TIMEOUT_MS });
+  if (result.error) throw new Error(oneLine(result.error.message));
+  if (result.status !== 0) {
+    throw new Error(oneLine(result.stderr || "") || `ffmpeg exited ${result.status}`);
+  }
+  const lines = (result.stderr ?? "").split("\n");
+  const firstPacket = lines.findIndex((line) => line.includes("encoder -> type:video"));
+  if (firstPacket < 0) throw new Error("encoder produced no packet");
+  const frames = lines.slice(0, firstPacket).filter((line) => line.includes("encoder <- type:video")).length;
+  if (frames === 0) throw new Error("encoder took no frames");
+  return frames;
+}
+
+function encoderDelayLine(
+  threads: 6 | 15,
+  baselineFrames: number,
+  codecArgs: readonly string[],
+  measuredSha: string,
+): MetricLine {
+  const id = `recording_encoder_delay_t${threads}`;
+  const baseline = encoderDelayMs(baselineFrames);
+  const targetMs = encoderDelayMs(12);
+  const target = `<=${targetMs}ms`;
+  try {
+    const frames = framesBeforeFirstPacket(codecArgs, threads);
+    const current = encoderDelayMs(frames);
+    return {
+      id,
+      current: `${current}ms`,
+      baseline: `${baseline}ms`,
+      tolerance: "0ms",
+      target,
+      source: "encode",
+      measuredSha,
+      gate: frozenGate({ current, baseline, tolerance: 0, better: "lower", target: targetMs }),
+      reason: `${threads} x264 threads, ${frames} frames at 30fps`,
+    };
+  } catch (error) {
+    return {
+      id,
+      current: "missing",
+      baseline: `${baseline}ms`,
+      tolerance: "0ms",
+      target,
+      source: "encode",
+      measuredSha,
+      gate: "fail",
+      reason: oneLine(error instanceof Error ? error.message : "encode failed"),
+    };
+  }
+}
+
 function latencyLine(
   id: string,
   samples: number[],
@@ -617,6 +681,8 @@ export function runFrozenBenchmarks(logContents: string): { lines: string[]; fai
     ssimLine("recording_ssim", RECORDING_SSIM, "beyond 1080p30 H.264 Baseline 2Mbps", recordingScore, recordingError, recordingSha),
     vmafLine("live_vmaf", liveScore, vmaf, liveSha),
     vmafLine("recording_vmaf", recordingScore, vmaf, recordingSha),
+    encoderDelayLine(15, 26, recordingArgs, recordingSha),
+    encoderDelayLine(6, 17, recordingArgs, recordingSha),
   ];
   return {
     lines: metrics.map(formatMetric),
