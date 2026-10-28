@@ -73,7 +73,7 @@ function commitOf(path: string): string {
   return sha;
 }
 
-function frozenGate(input: {
+export function frozenGate(input: {
   current: number;
   baseline: number;
   tolerance: number;
@@ -280,7 +280,7 @@ export function recordingHolds(spec: string): boolean {
   return next.pixels >= base.pixels && next.fps >= base.fps && next.rank >= base.rank && next.kbps >= base.kbps;
 }
 
-function recordingSpec(args: readonly string[]): string {
+export function recordingSpec(args: readonly string[]): string {
   const profile = flagValue(args, "-profile:v");
   const level = flagValue(args, "-level");
   const rate = flagValue(args, "-r");
