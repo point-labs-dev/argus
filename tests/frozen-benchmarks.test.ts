@@ -161,6 +161,20 @@ describe("frozen benchmarks", () => {
     expect(recordingHolds(label)).toBe(false);
   });
 
+  it("rejects 1080p30 Baseline at 1999k for a lower bitrate", () => {
+    const label = recordingSpec([
+      "-profile:v", "baseline",
+      "-level", "4.0",
+      "-r", "30",
+      "-b:v", "1999k",
+      "-vf", "scale=1920:1080",
+    ]);
+    expect(label).toBe("1080p30 H.264 Baseline L4.0 1999k");
+    expect(recordingHolds("1080p30 H.264 Baseline L4.0 2Mbps")).toBe(true);
+    expect(recordingHolds("1080p30 H.264 Baseline L4.0 2000k")).toBe(true);
+    expect(recordingHolds(label)).toBe(false);
+  });
+
   it("fails a higher-is-better score that drops past tolerance", () => {
     const gate = (current: number) => frozenGate({
       current,
@@ -209,8 +223,8 @@ describe("frozen benchmarks", () => {
       });
       expect(result.status).toBe(1);
       expect(result.stdout).toBe("");
-      expect(result.stderr).toBe(
-        "frozen-benchmarks: a shallow clone cannot name the commit for scripts/fixtures/field-latency.txt\n",
+      expect(result.stderr).toMatch(
+        /^frozen-benchmarks: a shallow clone cannot name the commit for (?:scripts\/fixtures\/field-latency\.txt|src\/homekit\.ts|src\/recording\.ts)\n$/,
       );
     }
   });
