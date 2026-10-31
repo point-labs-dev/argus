@@ -1,0 +1,29 @@
+#!/bin/sh
+set -u
+
+fail=0
+
+step() {
+  label=$1
+  shift
+  if "$@"; then
+    printf 'PASS %s\n' "$label"
+  else
+    printf 'FAIL %s\n' "$label"
+    fail=1
+  fi
+}
+
+step doctor bash .cursor/skills/verify-argus/doctor.sh
+step drive sh -c 'mkdir -p .cursor/skills/verify-argus/evidence && node .cursor/skills/verify-argus/exact-optional-probe.mjs > .cursor/skills/verify-argus/evidence/exact-optional.json'
+step typecheck-src npx tsc -p tsconfig.json --noEmit
+step typecheck-tests npx tsc -p tsconfig.check.json --noEmit
+step test npx vitest run
+step lint npm run lint
+
+if [ "$fail" -eq 0 ]; then
+  printf 'PASS summary\n'
+else
+  printf 'FAIL summary\n'
+fi
+exit "$fail"

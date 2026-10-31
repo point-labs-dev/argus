@@ -12,7 +12,7 @@
 - An agent adds an optional field on `LiveFfmpegInput` or on the prepareStream response.
 - `npm run build` runs `tsc` on `src` only. The probe is the check that does not require the Mini.
 
-## Driving it with the local contract
+## Driving it with the harness
 
 Preconditions:
 

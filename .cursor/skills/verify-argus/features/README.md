@@ -23,7 +23,7 @@ This map covers local stream-setup checks. It does not cover a live picture on a
 
 ## Feature entry contract
 
-Each feature file uses the four headings `Sub-features`, `How to get to it (user POV)`, `Driving it with the local contract`, and `Gotchas`.
+Each feature file uses the four headings `Sub-features`, `How to get to it (user POV)`, `Driving it with the harness`, and `Gotchas`.
 
 ## Features
 
