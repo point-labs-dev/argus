@@ -16,15 +16,15 @@ The local contract checks a prepareStream answer: the response echoes the contro
 - An agent changing `src/homekit.ts` hits the same function the test calls.
 - There is no local UI. The iPhone is not an entry point for this feature.
 
-## Driving it with the local contract
+## Driving it with the harness
 
 Preconditions:
 
 - Doctor printed `doctor=ok`.
 - The worktree does not need a camera or the Mini.
-- `tests/hap-setup-contract.test.ts` is in the tree. That file arrives with the stream-setup change.
+- `tests/hap-setup-contract.test.ts` is in this tree.
 
-- **Run the contract.** Run `npx vitest run tests/hap-setup-contract.test.ts > .cursor/skills/verify-argus/evidence/hap-setup.txt`. Exit code 0. The text file is the proof.
+- **Run the contract.** Run `mkdir -p .cursor/skills/verify-argus/evidence && npx vitest run tests/hap-setup-contract.test.ts > .cursor/skills/verify-argus/evidence/hap-setup.txt`. Exit code 0. The text file is the proof.
 - **Proof.** Leave that file in place. Do not replace it with a sentence that says the picture painted.
 
 ## Gotchas

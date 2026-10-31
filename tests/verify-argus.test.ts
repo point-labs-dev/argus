@@ -8,7 +8,7 @@ const SKILL = ".cursor/skills/verify-argus";
 const HEADINGS = [
   "## Sub-features",
   "## How to get to it (user POV)",
-  "## Driving it with the local contract",
+  "## Driving it with the harness",
   "## Gotchas",
 ];
 

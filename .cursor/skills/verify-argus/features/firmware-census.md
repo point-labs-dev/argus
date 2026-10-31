@@ -21,15 +21,15 @@ An advertisement change that leaves `ARGUS_FIRMWARE_REVISION` in place is `stale
 - The pull-request census warns and exits 0.
 - Nobody runs this against the Mini.
 
-## Driving it with the local contract
+## Driving it with the harness
 
 Preconditions:
 
 - Doctor printed `doctor=ok`.
-- `scripts/firmware-census.mjs` is in the tree. That file arrives with the CI change.
+- `scripts/firmware-census.mjs` is in this tree.
 - The churn commit object is present. The CI checkout fetches full history.
 
-- **Run the census.** Run `node scripts/firmware-census.mjs --commit 6117635239cb0e5bdcbd877160fe877967a1d99e > .cursor/skills/verify-argus/evidence/firmware-census.txt`. Exit code 1. The file contains `verdict=churn`.
+- **Run the census.** Run `mkdir -p .cursor/skills/verify-argus/evidence && node scripts/firmware-census.mjs --commit 6117635239cb0e5bdcbd877160fe877967a1d99e > .cursor/skills/verify-argus/evidence/firmware-census.txt`. Exit code 1. The file contains `verdict=churn`.
 - **Run the stale and recording fixtures.** Run `npx vitest run tests/firmware-census.test.ts`. The ladder fixture that leaves the firmware string at 1.3.16 exits 1. The unchanged tree exits 0. The recording-offer-only diff warns and exits 0.
 - **Proof.** Keep that text file. A churn line is not a license to bump the constant. `pr3_churn` is the historical count this gate is here to stop repeating. A stale line is not a license to edit the ladder without a bump.
 

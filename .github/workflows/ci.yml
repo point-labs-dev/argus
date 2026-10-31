@@ -30,14 +30,8 @@ jobs:
           curl -fsSL -o /tmp/argus-go2rtc/go2rtc https://github.com/AlexxIT/go2rtc/releases/download/v1.9.14/go2rtc_linux_amd64
           chmod +x /tmp/argus-go2rtc/go2rtc
 
-      - name: Typecheck src
-        run: npx tsc -p tsconfig.json --noEmit
-
-      - name: Typecheck src and tests
-        run: npx tsc -p tsconfig.check.json --noEmit
-
-      - name: Test
-        run: npx vitest run
+      - name: Verify
+        run: ./verify
 
       - name: Firmware census
         env:
