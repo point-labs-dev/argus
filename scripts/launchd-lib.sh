@@ -79,23 +79,36 @@ ensure_user_owned_dir() {
   fi
 }
 
+wait_until_gui_unloaded() {
+  local uid=$1
+  local label=$2
+  local deadline=$((SECONDS + 10))
+  while launchctl print "gui/${uid}/${label}" >/dev/null 2>&1; do
+    if (( SECONDS >= deadline )); then
+      return 1
+    fi
+    sleep 1
+  done
+  return 0
+}
+
 retire_gui_job() {
   local uid=$1
   local home=$2
   local label=$3
   local plist=$4
-  local disabled parked
+  local disabled bootout_rc
   disabled="$(disabled_agents_dir "$home")"
-  parked="${disabled}/$(basename "$plist")"
   ensure_user_owned_dir "$disabled"
-  if ! launchctl bootout "gui/${uid}/${label}"; then
-    if launchctl print "gui/${uid}/${label}" >/dev/null 2>&1 \
-      || [[ -f "$plist" || ! -f "$parked" ]]; then
+  bootout_rc=0
+  launchctl bootout "gui/${uid}/${label}" || bootout_rc=$?
+  if ! wait_until_gui_unloaded "$uid" "$label"; then
+    if [[ "$bootout_rc" -ne 0 ]]; then
       echo "bootout gui/${uid}/${label} failed. Not bootstrapping the system daemon." >&2
       exit 1
     fi
+    abort_if_gui_loaded "$uid" "$label"
   fi
-  abort_if_gui_loaded "$uid" "$label"
   launchctl disable "gui/${uid}/${label}" || true
   if [[ -n "$plist" && -f "$plist" ]]; then
     mv "$plist" "${disabled}/"

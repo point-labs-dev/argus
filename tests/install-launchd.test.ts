@@ -300,6 +300,176 @@ function cleanup(run: {
   rmSync(run.root, { recursive: true, force: true });
 }
 
+type CutoverRun = {
+  bin: string;
+  root: string;
+  home: string;
+  sudoHome: string;
+  installRoot: string;
+  launchctlLog: string;
+};
+
+type CutoverFiles = {
+  state: string;
+  disabled: string;
+  hold: string;
+  race: string;
+  raceCount: string;
+};
+
+function writeMinimalPlist(file: string, label: string) {
+  mkdirSync(path.dirname(file), { recursive: true });
+  writeFileSync(
+    file,
+    `<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0"><dict><key>Label</key><string>${label}</string></dict></plist>\n`,
+  );
+}
+
+function cutoverLayout() {
+  return renderDaemon("scripts/install-launchdaemon.sh", { SUDO_USER: "mini", SUDO_UID: "501" }, true, {
+    separateSudoHome: true,
+    includeAgentPlistEnv: false,
+  });
+}
+
+function installCutoverLaunchctl(run: CutoverRun, loaded: string[]): CutoverFiles {
+  const files: CutoverFiles = {
+    state: path.join(run.root, "launchctl.state"),
+    disabled: path.join(run.root, "launchctl.disabled"),
+    hold: path.join(run.root, "launchctl.hold"),
+    race: path.join(run.root, "launchctl.race"),
+    raceCount: path.join(run.root, "launchctl.race.count"),
+  };
+  writeFileSync(files.state, loaded.length ? `${loaded.join("\n")}\n` : "");
+  writeFileSync(files.disabled, "");
+  writeFileSync(files.raceCount, "0\n");
+  writeFileSync(run.launchctlLog, "");
+  const guiTarget = `gui/501/${LABEL}`;
+  const script = `#!/bin/bash
+printf '%s\\n' "\$*" >> ${JSON.stringify(run.launchctlLog)}
+cmd="\$1"
+shift
+state=${JSON.stringify(files.state)}
+disabled=${JSON.stringify(files.disabled)}
+hold=${JSON.stringify(files.hold)}
+race=${JSON.stringify(files.race)}
+race_count=${JSON.stringify(files.raceCount)}
+gui_target=${JSON.stringify(guiTarget)}
+remove_line() {
+  local file="\$1"
+  local line="\$2"
+  if [[ -f "\$file" ]]; then
+    grep -vxF "\$line" "\$file" > "\$file.tmp" || true
+    mv "\$file.tmp" "\$file"
+  fi
+}
+case "\$cmd" in
+  bootout)
+    target="\$1"
+    if grep -qxF "\$target" "\$state"; then
+      remove_line "\$state" "\$target"
+      exit 0
+    fi
+    echo "Boot-out failed: 3: No such process" >&2
+    exit 3
+    ;;
+  print)
+    target="\$1"
+    if [[ -f "\$hold" && "\$target" == gui/* ]]; then
+      echo "state = running"
+      exit 0
+    fi
+    if [[ -f "\$race" && "\$target" == "\$gui_target" ]]; then
+      limit="\$(cat "\$race")"
+      n="\$(cat "\$race_count")"
+      n=\$((n + 1))
+      printf '%s\\n' "\$n" > "\$race_count"
+      if [[ "\$n" -le "\$limit" ]]; then
+        echo "state = running"
+        exit 0
+      fi
+    fi
+    if grep -qxF "\$target" "\$state"; then
+      echo "state = running"
+      exit 0
+    fi
+    echo "Could not find service \\"\$target\\" in domain" >&2
+    exit 1
+    ;;
+  disable)
+    target="\$1"
+    if ! grep -qxF "\$target" "\$disabled"; then
+      printf '%s\\n' "\$target" >> "\$disabled"
+    fi
+    ;;
+  enable)
+    remove_line "\$disabled" "\$1"
+    ;;
+  bootstrap)
+    label="\$(python3 -c 'import plistlib,sys; print(plistlib.load(open(sys.argv[1],"rb"))["Label"])' "\$2")"
+    printf '%s/%s\\n' "\$1" "\$label" >> "\$state"
+    ;;
+  print-disabled)
+    domain="\$1"
+    printf 'disabled services = {\\n'
+    if [[ -s "\$disabled" ]]; then
+      while IFS= read -r target; do
+        case "\$target" in
+          "\$domain"/*)
+            printf '\\t"%s" => disabled\\n' "\${target#\$domain/}"
+            ;;
+        esac
+      done < "\$disabled"
+    fi
+    printf '}\\n'
+    ;;
+esac
+exit 0
+`;
+  writeFileSync(path.join(run.bin, "launchctl"), script);
+  chmodSync(path.join(run.bin, "launchctl"), 0o755);
+  return files;
+}
+
+function writeCutoverDaemons(installRoot: string) {
+  const daemonDir = path.join(installRoot, "Library", "LaunchDaemons");
+  writeMinimalPlist(path.join(daemonDir, `${LABEL}.plist`), LABEL);
+  writeMinimalPlist(path.join(daemonDir, `${LOGROTATE_LABEL}.plist`), LOGROTATE_LABEL);
+  return daemonDir;
+}
+
+function runCutoverScript(run: CutoverRun) {
+  return spawnSync("bash", ["scripts/cutover-launchdaemon.sh"], {
+    encoding: "utf8",
+    env: {
+      PATH: `${run.bin}:${process.env.PATH ?? ""}`,
+      HOME: run.home,
+      TMPDIR: run.root,
+      USER: "root",
+      LOGNAME: "root",
+      SHELL: "/bin/bash",
+      SUDO_USER: "mini",
+      SUDO_UID: "501",
+      ARGUS_INSTALL_ROOT: run.installRoot,
+    },
+  });
+}
+
+function writeLogrotateAgent(sudoHome: string) {
+  const rotateAgent = path.join(sudoHome, "Library", "LaunchAgents", "local.argus.logrotate.plist");
+  writeFileSync(
+    rotateAgent,
+    `<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+  <key>Label</key><string>local.argus.logrotate</string>
+  <key>ProgramArguments</key>
+  <array><string>${path.join(sudoHome, "bin", "argus-logrotate.sh")}</string></array>
+</dict></plist>
+`,
+  );
+  return rotateAgent;
+}
+
 function writtenJob(installRoot: string, domain: "LaunchAgents" | "LaunchDaemons") {
   return readPlist(path.join(installRoot, "Library", domain, `${LABEL}.plist`));
 }
@@ -711,7 +881,7 @@ exit 0
     } finally {
       cleanup(run);
     }
-  });
+  }, 30_000);
 
   it("aborts before bootstrapping the system daemon when gui bootout fails", () => {
     const run = renderDaemon("scripts/install-launchdaemon.sh", { SUDO_USER: "mini", SUDO_UID: "501" }, true, {
@@ -775,7 +945,7 @@ exit 0
     } finally {
       cleanup(run);
     }
-  });
+  }, 30_000);
 
   it("continues cutover when the gui job is already booted out and its plist is parked", () => {
     const run = renderDaemon("scripts/install-launchdaemon.sh", { SUDO_USER: "mini", SUDO_UID: "501" }, true, {
@@ -952,7 +1122,166 @@ exit 0
     } finally {
       cleanup(run);
     }
+  }, 30_000);
+});
+
+describe("gui bootout race", () => {
+  it("waits out a slow gui bootout before bootstrapping the system daemon", () => {
+    const run = cutoverLayout();
+    try {
+      const files = installCutoverLaunchctl(run, [`gui/501/${LABEL}`]);
+      writeFileSync(files.race, "3\n");
+      writeCutoverDaemons(run.installRoot);
+      const agent = path.join(run.sudoHome, "Library", "LaunchAgents", `${LABEL}.plist`);
+      const parked = path.join(run.sudoHome, "Library", "LaunchAgents-disabled", `${LABEL}.plist`);
+      const body = readFileSync(agent, "utf8");
+      const cutover = runCutoverScript(run);
+      expect(cutover.status, `${cutover.stdout}\n${cutover.stderr}`).toBe(0);
+      expect(cutover.stdout).toBe(`cut over ${LABEL}\n`);
+      expect(cutover.stderr).not.toContain("still loaded");
+      expect(cutover.stderr).not.toContain("Not bootstrapping");
+      expect(existsSync(agent)).toBe(false);
+      expect(readFileSync(parked, "utf8")).toBe(body);
+      expect(readFileSync(files.state, "utf8")).toBe(`system/${LABEL}\nsystem/${LOGROTATE_LABEL}\n`);
+      expect(readFileSync(files.disabled, "utf8")).toBe(`gui/501/${LABEL}\n`);
+    } finally {
+      cleanup(run);
+    }
+  }, 20_000);
+
+  it("finishes cutover when bootout says the gui job is already gone", () => {
+    const run = cutoverLayout();
+    try {
+      const files = installCutoverLaunchctl(run, []);
+      writeCutoverDaemons(run.installRoot);
+      const agent = path.join(run.sudoHome, "Library", "LaunchAgents", `${LABEL}.plist`);
+      const parked = path.join(run.sudoHome, "Library", "LaunchAgents-disabled", `${LABEL}.plist`);
+      const body = readFileSync(agent, "utf8");
+      const cutover = runCutoverScript(run);
+      expect(cutover.status, `${cutover.stdout}\n${cutover.stderr}`).toBe(0);
+      expect(cutover.stdout).toBe(`cut over ${LABEL}\n`);
+      expect(cutover.stderr).toContain("Boot-out failed: 3: No such process");
+      expect(cutover.stderr).not.toContain("Not bootstrapping");
+      expect(existsSync(agent)).toBe(false);
+      expect(readFileSync(parked, "utf8")).toBe(body);
+      expect(readFileSync(files.state, "utf8")).toBe(`system/${LABEL}\nsystem/${LOGROTATE_LABEL}\n`);
+      expect(readFileSync(files.disabled, "utf8")).toBe(`gui/501/${LABEL}\n`);
+    } finally {
+      cleanup(run);
+    }
   });
+
+  it("moves a gui plist that is present while its job is not loaded", () => {
+    const run = cutoverLayout();
+    try {
+      const files = installCutoverLaunchctl(run, []);
+      writeCutoverDaemons(run.installRoot);
+      const agent = path.join(run.sudoHome, "Library", "LaunchAgents", `${LABEL}.plist`);
+      const rotateAgent = writeLogrotateAgent(run.sudoHome);
+      const parked = path.join(run.sudoHome, "Library", "LaunchAgents-disabled", `${LABEL}.plist`);
+      const parkedRotate = path.join(run.sudoHome, "Library", "LaunchAgents-disabled", "local.argus.logrotate.plist");
+      const body = readFileSync(agent, "utf8");
+      const rotateBody = readFileSync(rotateAgent, "utf8");
+      const cutover = runCutoverScript(run);
+      expect(cutover.status, `${cutover.stdout}\n${cutover.stderr}`).toBe(0);
+      expect(cutover.stdout).toBe(`cut over ${LABEL}\n`);
+      expect(readdirSync(path.dirname(agent))).toEqual([]);
+      expect(readFileSync(parked, "utf8")).toBe(body);
+      expect(readFileSync(parkedRotate, "utf8")).toBe(rotateBody);
+      expect(readFileSync(files.state, "utf8")).toBe(`system/${LABEL}\nsystem/${LOGROTATE_LABEL}\n`);
+      const disabledText = execFileSync(path.join(run.bin, "launchctl"), ["print-disabled", "gui/501"], {
+        encoding: "utf8",
+      });
+      expect(disabledText).toBe(
+        'disabled services = {\n\t"dev.point-labs.argus" => disabled\n\t"local.argus.logrotate" => disabled\n}\n',
+      );
+    } finally {
+      cleanup(run);
+    }
+  });
+
+  it("finishes a rerun after a partial cutover left the gui plist in place", () => {
+    const run = cutoverLayout();
+    try {
+      const files = installCutoverLaunchctl(run, [`gui/501/${LABEL}`]);
+      writeFileSync(files.hold, "1\n");
+      writeCutoverDaemons(run.installRoot);
+      const agent = path.join(run.sudoHome, "Library", "LaunchAgents", `${LABEL}.plist`);
+      const parked = path.join(run.sudoHome, "Library", "LaunchAgents-disabled", `${LABEL}.plist`);
+      const body = readFileSync(agent, "utf8");
+      const first = runCutoverScript(run);
+      expect(first.status, `${first.stdout}\n${first.stderr}`).not.toBe(0);
+      expect(first.stderr).toContain(`gui/501/${LABEL} is still loaded. Not bootstrapping the system daemon.`);
+      expect(first.stdout).toBe("");
+      expect(existsSync(agent)).toBe(true);
+      expect(readFileSync(files.state, "utf8")).not.toContain(`system/${LABEL}`);
+      expect(readFileSync(files.disabled, "utf8")).toBe("");
+      rmSync(files.hold);
+      const second = runCutoverScript(run);
+      expect(second.status, `${second.stdout}\n${second.stderr}`).toBe(0);
+      expect(second.stdout).toBe(`cut over ${LABEL}\n`);
+      expect(second.stderr).toContain("Boot-out failed: 3: No such process");
+      expect(second.stderr).not.toContain("Not bootstrapping");
+      expect(existsSync(agent)).toBe(false);
+      expect(readFileSync(parked, "utf8")).toBe(body);
+      expect(readFileSync(files.disabled, "utf8")).toBe(`gui/501/${LABEL}\n`);
+      expect(readFileSync(files.state, "utf8")).toBe(`system/${LABEL}\nsystem/${LOGROTATE_LABEL}\n`);
+    } finally {
+      cleanup(run);
+    }
+  }, 40_000);
+
+  it("does not bootstrap again or re-enable the gui job on a second cutover", () => {
+    const run = cutoverLayout();
+    try {
+      const files = installCutoverLaunchctl(run, [`gui/501/${LABEL}`]);
+      writeFileSync(files.race, "3\n");
+      writeCutoverDaemons(run.installRoot);
+      const agent = path.join(run.sudoHome, "Library", "LaunchAgents", `${LABEL}.plist`);
+      const parked = path.join(run.sudoHome, "Library", "LaunchAgents-disabled", `${LABEL}.plist`);
+      const first = runCutoverScript(run);
+      expect(first.status, `${first.stdout}\n${first.stderr}`).toBe(0);
+      const state = readFileSync(files.state, "utf8");
+      const disabled = readFileSync(files.disabled, "utf8");
+      const parkedBody = readFileSync(parked, "utf8");
+      writeFileSync(run.launchctlLog, "");
+      const second = runCutoverScript(run);
+      expect(second.status, `${second.stdout}\n${second.stderr}`).toBe(0);
+      expect(second.stdout).toBe(`cut over ${LABEL}\n`);
+      expect(existsSync(agent)).toBe(false);
+      expect(readFileSync(parked, "utf8")).toBe(parkedBody);
+      expect(readFileSync(files.state, "utf8")).toBe(state);
+      expect(readFileSync(files.disabled, "utf8")).toBe(disabled);
+      const secondLog = readFileSync(run.launchctlLog, "utf8");
+      expect(secondLog).not.toContain("bootstrap ");
+      expect(secondLog).not.toContain(`enable gui/501/${LABEL}`);
+      expect(secondLog).not.toContain("bootstrap gui/");
+    } finally {
+      cleanup(run);
+    }
+  }, 20_000);
+
+  it("leaves the gui label disabled after cutover", () => {
+    const run = cutoverLayout();
+    try {
+      const files = installCutoverLaunchctl(run, [`gui/501/${LABEL}`]);
+      writeFileSync(files.race, "3\n");
+      writeCutoverDaemons(run.installRoot);
+      const agent = path.join(run.sudoHome, "Library", "LaunchAgents", `${LABEL}.plist`);
+      const cutover = runCutoverScript(run);
+      expect(cutover.status, `${cutover.stdout}\n${cutover.stderr}`).toBe(0);
+      expect(cutover.stdout).toBe(`cut over ${LABEL}\n`);
+      expect(readdirSync(path.dirname(agent))).toEqual([]);
+      const log = readFileSync(run.launchctlLog, "utf8");
+      expect(log).not.toContain(`enable gui/501/${LABEL}`);
+      const disabledText = execFileSync(path.join(run.bin, "launchctl"), ["print-disabled", "gui/501"], {
+        encoding: "utf8",
+      });
+      expect(disabledText).toBe('disabled services = {\n\t"dev.point-labs.argus" => disabled\n}\n');
+    } finally {
+      cleanup(run);
+    }
+  }, 20_000);
 });
 
 describe("install-launchd agent node pin", () => {
