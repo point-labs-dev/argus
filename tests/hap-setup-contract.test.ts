@@ -211,7 +211,7 @@ describe("HAP setup contract", () => {
     const ladder = buildCameraControllerOptions(delegate).streamingOptions.video.resolutions.map(
       (row) => `${row[0]}x${row[1]}`,
     );
-    expect(ladder).toEqual(["854x480"]);
+    expect(ladder).toEqual(["1920x1080", "1280x720", "854x480"]);
     await new Promise<void>((resolve, reject) => {
       delegate.prepareStream(streamRequest("front-l-wire"), (error) => (error ? reject(error) : resolve()));
     });
@@ -234,7 +234,7 @@ describe("HAP setup contract", () => {
     delegate.handleStreamRequest({ type: "stop", sessionID: "front-l-wire" } as never, () => {});
   });
 
-  it("sources MAIN for a full-screen START on an NVR channel that shares its host", async () => {
+  it("sources MAIN for a full-screen START and the sub for a tile START on an NVR channel that shares its host", async () => {
     const config = parseArgusConfig({
       ...configBody("16:9"),
       cameras: ["Front L", "Front R"].map((name, index) => ({
@@ -260,28 +260,41 @@ describe("HAP setup contract", () => {
     const { delegate } = createCameraAccessory(frontR, sources.liveUrl, sources.mainUrl, cache(), {
       spawnFn: spawnFn as never,
       verbose: false,
+      liveResolution: { width: 896, height: 512 },
       ...(sources.mainStreamUrl ? { mainStreamUrl: sources.mainStreamUrl } : {}),
     });
-    await new Promise<void>((resolve, reject) => {
-      delegate.prepareStream(streamRequest("front-r-main"), (error) => (error ? reject(error) : resolve()));
-    });
-    await new Promise<void>((resolve, reject) => {
-      delegate.handleStreamRequest(
-        {
-          type: "start",
-          sessionID: "front-r-main",
-          video: { pt: 99, max_bit_rate: 299, fps: 30, mtu: 1378, profile: 0, level: 2, width: 854, height: 480 },
-          audio: { pt: 110, sample_rate: 24, max_bit_rate: 24, codec: AudioStreamingCodecType.AAC_ELD },
-        } as never,
-        (error) => (error ? reject(error) : resolve()),
-      );
-    });
-    const args = (spawnFn as unknown as { mock: { calls: [string, string[]][] } }).mock.calls[0]?.[1];
-    if (!args) throw new Error("ffmpeg was not spawned");
-    expect(args.join(" ")).toContain("-i rtsp://127.0.0.1:8554/front-r ");
-    expect(args[args.indexOf("-vf") + 1]).toContain(MAIN_KEYFRAME_GATE);
-    expect(args.join(" ")).toContain("-b:v 600k");
-    delegate.handleStreamRequest({ type: "stop", sessionID: "front-r-main" } as never, () => {});
+    const start = async (sessionID: string, width: number, height: number): Promise<string[]> => {
+      await new Promise<void>((resolve, reject) => {
+        delegate.prepareStream(streamRequest(sessionID), (error) => (error ? reject(error) : resolve()));
+      });
+      await new Promise<void>((resolve, reject) => {
+        delegate.handleStreamRequest(
+          {
+            type: "start",
+            sessionID,
+            video: { pt: 99, max_bit_rate: 299, fps: 30, mtu: 1378, profile: 0, level: 2, width, height },
+            audio: { pt: 110, sample_rate: 24, max_bit_rate: 24, codec: AudioStreamingCodecType.AAC_ELD },
+          } as never,
+          (error) => (error ? reject(error) : resolve()),
+        );
+      });
+      const args = (spawnFn as unknown as { mock: { calls: [string, string[]][] } }).mock.calls.at(-1)?.[1];
+      if (!args) throw new Error("ffmpeg was not spawned");
+      delegate.handleStreamRequest({ type: "stop", sessionID } as never, () => {});
+      return args;
+    };
+
+    const full = await start("front-r-full", 1920, 1080);
+    expect(full.join(" ")).toContain("-i rtsp://127.0.0.1:8554/front-r ");
+    expect(full[full.indexOf("-vf") + 1]).toContain(MAIN_KEYFRAME_GATE);
+    expect(full[full.indexOf("-vf") + 1]).toContain("pad=1920:1080");
+    expect(full.join(" ")).toContain("-b:v 3000k");
+
+    const tile = await start("front-r-tile", 854, 480);
+    expect(tile.join(" ")).toContain("-i rtsp://127.0.0.1:8554/front-r-sub ");
+    expect(tile[tile.indexOf("-vf") + 1]).not.toContain(MAIN_KEYFRAME_GATE);
+    expect(tile[tile.indexOf("-vf") + 1]).toContain("pad=854:480");
+    expect(tile.join(" ")).toContain("-b:v 600k");
   });
 
   it("advertises from aspect, not from the camera name", () => {
@@ -289,7 +302,7 @@ describe("HAP setup contract", () => {
     const wide = buildCameraControllerOptions(wideGarage).streamingOptions.video.resolutions.map(
       (row) => `${row[0]}x${row[1]}`,
     );
-    expect(wide).toEqual(["854x480"]);
+    expect(wide).toEqual(["1920x1080", "1280x720", "854x480"]);
 
     const squareLeft = new ArgusStreamingDelegate("Backyard Left", "rtsp://x", cache(), { aspect: "4:3" });
     expect(buildCameraControllerOptions(squareLeft).streamingOptions.video.resolutions).toEqual([[640, 480, 30]]);

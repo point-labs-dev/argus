@@ -316,7 +316,7 @@ describe("buildCameraControllerOptions", () => {
     }
     expect(streaming.supportedCryptoSuites).toContain(0);
     const resolutions = opts.streamingOptions.video.resolutions.map((r) => `${r[0]}x${r[1]}`);
-    expect(resolutions).toEqual(["854x480"]);
+    expect(resolutions).toEqual(["1920x1080", "1280x720", "854x480"]);
     // Advertise both AAC-ELD (Apple's preference) and Opus
     expect(opts.streamingOptions.audio?.codecs).toHaveLength(2);
     expect(opts.streamingOptions.audio?.codecs?.[0]?.type).toBe("AAC-eld");
@@ -343,14 +343,13 @@ describe("buildCameraControllerOptions", () => {
     expect(opts.streamingOptions.video.resolutions).toEqual([[896, 512, 30]]);
   });
 
-  it("defaults to WiFi-friendly resolutions (June working pattern, Oct 2026+)", () => {
+  it("defaults 16:9 to 1080p and 720p for full screen and 854x480 for tiles", () => {
     const delegate = new ArgusStreamingDelegate("Backyard Left", "rtsp://x", cacheWith(Buffer.from([0xff, 0xd8])), { aspect: "16:9" });
     const opts = buildCameraControllerOptions(delegate, true, undefined, { width: 896, height: 672 }, "transcode");
 
     const resolutions = opts.streamingOptions.video.resolutions.map((r) => `${r[0]}x${r[1]}`);
-    // 1280x720 on a MacBook over WiFi ended in "No Response" (2026-10-02). An
-    // offered 640x360 is reused for full screen with no RECONFIGURE (2026-11-19).
-    expect(resolutions).toEqual(["854x480"]);
+    // An offered 640x360 is reused for full screen with no RECONFIGURE (2026-11-19).
+    expect(resolutions).toEqual(["1920x1080", "1280x720", "854x480"]);
     // Non-standard probed sizes are dead weight — never advertised.
     expect(resolutions).not.toContain("896x672");
   });
@@ -519,26 +518,79 @@ describe("ArgusStreamingDelegate", () => {
     delegate.handleStreamRequest({ type: "stop", sessionID } as never, () => {});
   }
 
-  it("sources MAIN for a full-screen ask even when the cap lowers the encode below 720p", async () => {
+  it("encodes a full-screen 1280x720 START from MAIN at 1280x720 and 2000k on a 132k ask", async () => {
     const spawnFn = vi.fn(() => Object.assign(new EventEmitter(), { kill: vi.fn() })) as unknown as typeof import("node:child_process").spawn;
     const delegate = new ArgusStreamingDelegate(
       "Backyard Left",
       "rtsp://127.0.0.1:8554/backyard-left-sub",
       cacheWith(Buffer.from([0xff, 0xd8])),
-      { aspect: "16:9",  spawnFn, mainStreamUrl: "rtsp://127.0.0.1:8554/backyard-left" },
+      {
+        aspect: "16:9",
+        spawnFn,
+        mainStreamUrl: "rtsp://127.0.0.1:8554/backyard-left",
+        liveResolution: { width: 640, height: 360 },
+      },
     );
 
-    // Home asks 1280x720; the cap lowers the ENCODE to 854x480, but the SOURCE
-    // follows the ask. Before 1.3.15 the source check compared the capped size,
-    // so MAIN was unreachable and full-screen upscaled the ≤640-wide sub (the
-    // field softness with ARGUS_LIVE_MAIN_SOURCE=1 that never took effect).
-    await prepareAndStart(delegate, "s3", { width: 1280, height: 720, max_bit_rate: 2000 });
+    await prepareAndStart(delegate, "s3", { width: 1280, height: 720, max_bit_rate: 132 });
 
     const args = (spawnFn as unknown as { mock: { calls: [string, string[]][] } }).mock.calls[0]![1].join(" ");
     expect(args).toContain("-i rtsp://127.0.0.1:8554/backyard-left ");
-    expect(args).toContain("scale=854:480:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=854:480");
+    expect(args).toContain("scale=1280:720:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=1280:720");
     expect(args).toContain("select=if(eq(key\\,1)\\,st(1\\,1)\\,ld(1))");
+    expect(args).toContain("-b:v 2000k");
     stopSession(delegate, "s3");
+  });
+
+  it("encodes a full-screen 1920x1080 START from MAIN at 1920x1080 and 3000k on a 299k ask, even with ARGUS_LIVE_CAP=854", async () => {
+    const spawnFn = vi.fn(() => Object.assign(new EventEmitter(), { kill: vi.fn() })) as unknown as typeof import("node:child_process").spawn;
+    process.env.ARGUS_LIVE_CAP = "854";
+    try {
+      const delegate = new ArgusStreamingDelegate(
+        "Front R",
+        "rtsp://127.0.0.1:8554/front-r-sub",
+        cacheWith(Buffer.from([0xff, 0xd8])),
+        {
+          aspect: "16:9",
+          spawnFn,
+          mainStreamUrl: "rtsp://127.0.0.1:8554/front-r",
+          liveResolution: { width: 896, height: 512 },
+        },
+      );
+
+      await prepareAndStart(delegate, "s3-1080", { width: 1920, height: 1080, max_bit_rate: 299 });
+
+      const args = (spawnFn as unknown as { mock: { calls: [string, string[]][] } }).mock.calls[0]![1].join(" ");
+      expect(args).toContain("-i rtsp://127.0.0.1:8554/front-r ");
+      expect(args).toContain("scale=1920:1080:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=1920:1080");
+      expect(args).toContain("-b:v 3000k");
+      expect(args).toContain("-maxrate 3000k");
+      stopSession(delegate, "s3-1080");
+    } finally {
+      delete process.env.ARGUS_LIVE_CAP;
+    }
+  });
+
+  it.each([
+    ["Front R", "front-r", { width: 896, height: 512 }],
+    ["Backyard Left", "backyard-left", { width: 640, height: 360 }],
+  ] as const)("keeps an 854x480 tile on %s's sub (%o) with a main grant", async (cameraName, slug, liveResolution) => {
+    const spawnFn = vi.fn(() => Object.assign(new EventEmitter(), { kill: vi.fn() })) as unknown as typeof import("node:child_process").spawn;
+    const delegate = new ArgusStreamingDelegate(
+      cameraName,
+      `rtsp://127.0.0.1:8554/${slug}-sub`,
+      cacheWith(Buffer.from([0xff, 0xd8])),
+      { aspect: "16:9", spawnFn, mainStreamUrl: `rtsp://127.0.0.1:8554/${slug}`, liveResolution },
+    );
+
+    await prepareAndStart(delegate, `${slug}-tile`, { width: 854, height: 480, max_bit_rate: 299 });
+
+    const args = (spawnFn as unknown as { mock: { calls: [string, string[]][] } }).mock.calls[0]![1].join(" ");
+    expect(args).toContain(`-i rtsp://127.0.0.1:8554/${slug}-sub `);
+    expect(args).not.toContain("select=");
+    expect(args).toContain("pad=854:480");
+    expect(args).toContain("-b:v 600k");
+    stopSession(delegate, `${slug}-tile`);
   });
 
   it("keeps tile sessions (640x360 ask) on the sub stream even with a main grant", async () => {
@@ -606,11 +658,12 @@ describe("ArgusStreamingDelegate", () => {
     expect(firstArgs).not.toContain("select=");
     expect(secondArgs).toContain("-i rtsp://127.0.0.1:8554/backyard-left ");
     expect(secondArgs).toContain("select=if(eq(key\\,1)\\,st(1\\,1)\\,ld(1))");
-    expect(secondArgs).toContain("scale=854:480:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=854:480");
+    expect(secondArgs).toContain("scale=1280:720:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=1280:720");
+    expect(secondArgs).toContain("-b:v 2000k");
     stopSession(delegate, "s6");
   });
 
-  it("respawns on MAIN and logs the 1920x1080 RECONFIGURE", async () => {
+  it("respawns a 1920x1080 RECONFIGURE from an 854x480 tile on MAIN at 1920x1080 and 3000k, and logs it", async () => {
     const lines: string[] = [];
     const spy = vi.spyOn(process.stderr, "write").mockImplementation((chunk) => {
       lines.push(String(chunk));
@@ -621,24 +674,35 @@ describe("ArgusStreamingDelegate", () => {
       "Backyard Left",
       "rtsp://127.0.0.1:8554/backyard-left-sub",
       cacheWith(Buffer.from([0xff, 0xd8])),
-      { aspect: "16:9", spawnFn, mainStreamUrl: "rtsp://127.0.0.1:8554/backyard-left" },
+      {
+        aspect: "16:9",
+        spawnFn,
+        mainStreamUrl: "rtsp://127.0.0.1:8554/backyard-left",
+        liveResolution: { width: 640, height: 360 },
+      },
     );
     try {
-      await prepareAndStart(delegate, "s7", { width: 640, height: 360, max_bit_rate: 132 });
+      await prepareAndStart(delegate, "s7", { width: 854, height: 480, max_bit_rate: 299 });
       await new Promise<void>((resolve, reject) => {
         delegate.handleStreamRequest(
           { type: "reconfigure", sessionID: "s7",
-            video: { width: 1920, height: 1080, fps: 30, max_bit_rate: 3000, rtcp_interval: 0.5 } } as never,
+            video: { width: 1920, height: 1080, fps: 30, max_bit_rate: 299, rtcp_interval: 0.5 } } as never,
           (error) => (error ? reject(error) : resolve()),
         );
       });
 
       expect(spawnFn).toHaveBeenCalledTimes(2);
-      const respawn = (spawnFn as unknown as { mock: { calls: [string, string[]][] } }).mock.calls[1]![1].join(" ");
+      const calls = (spawnFn as unknown as { mock: { calls: [string, string[]][] } }).mock.calls;
+      expect(calls[0]![1].join(" ")).toContain("-i rtsp://127.0.0.1:8554/backyard-left-sub ");
+      const respawn = calls[1]![1].join(" ");
       expect(respawn).toContain("-i rtsp://127.0.0.1:8554/backyard-left ");
+      expect(respawn).toContain("pad=1920:1080");
+      expect(respawn).toContain("-b:v 3000k");
       const reconfigure = lines.find((line) => line.includes("HomeKit reconfigure"));
       expect(reconfigure).toBeDefined();
-      expect(reconfigure).toContain("1920x1080");
+      expect(reconfigure).toContain("asked=1920x1080@30 serving=1920x1080");
+      expect(reconfigure).toContain("asked=299k serving=3000k");
+      expect(reconfigure).toContain("source=rtsp://127.0.0.1:8554/backyard-left ");
       stopSession(delegate, "s7");
     } finally {
       spy.mockRestore();
@@ -807,7 +871,7 @@ describe("ArgusStreamingDelegate", () => {
     }
   });
 
-  it("advertises firmware and Model 1.3.17 for the 854x480-only ladder", () => {
+  it("advertises firmware and Model 1.3.17 for the 1080p, 720p and 854x480 ladder", () => {
     expect(ARGUS_FIRMWARE_REVISION).toBe("1.3.17");
     const config = parseArgusConfig({
       cameras: [{ name: "Garage Door", aspect: "4:3", host: "10.0.0.9", channel: 0, mainCodec: "h265",
@@ -1110,8 +1174,8 @@ describe("4:3 cameras keep an undistorted live frame", () => {
     "%s center-crops a cached 16:9 ask without stretching",
     async (cameraName) => {
       for (const ask of [
-        { width: 640, height: 360, box: [640, 360] },
-        { width: 1280, height: 720, box: [854, 480] },
+        { width: 640, height: 360, box: [640, 360], tier: "sub" },
+        { width: 1280, height: 720, box: [1280, 720], tier: "main" },
       ]) {
         const args = await ffmpegArgsFor(cameraName, ask);
         const vf = args[args.indexOf("-vf") + 1]!;
@@ -1119,7 +1183,7 @@ describe("4:3 cameras keep an undistorted live frame", () => {
         const slug = cameraName.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
         const input = args[args.indexOf("-i") + 1];
         expect(input).toBe(
-          ask.width > 640
+          ask.tier === "main"
             ? `rtsp://127.0.0.1:8554/${slug}`
             : `rtsp://127.0.0.1:8554/${slug}-sub`,
         );
