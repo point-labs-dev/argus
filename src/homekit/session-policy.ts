@@ -3,7 +3,7 @@
  * 
  * Purpose: Prevent post-cap policy bugs (MAIN unreachable under CAP, RECONFIGURE bypassed cap).
  * What it prevents (from 1.3.15 fix):
- * - MAIN source unreachable: checks pre-cap requestedWidth > 640, not post-cap
+ * - MAIN source unreachable: source follows the pre-cap ask, not the capped encode
  * - RECONFIGURE bypassed cap: both START and RECONFIGURE call plan(), so cap+source can't drift
  * - Bitrate confusion: floor vs passthrough decision explicit with reasoning
  */
@@ -42,10 +42,12 @@ export interface SessionPlan {
 }
 
 export interface PolicyEngineConfig {
-  /** Maximum width before cap (ARGUS_LIVE_CAP, default 854). */
+  /** Widest sub-sourced encode (ARGUS_LIVE_CAP, default 854). MAIN sessions encode the negotiated box. */
   capWidth: number;
   /** go2rtc restream of camera's sub stream (tiles and default). */
   subStreamUrl: string;
+  /** The sub's native width, probed from a snapshot at startup. */
+  subWidth?: number;
   /** go2rtc restream of camera's main stream (full-screen when granted). */
   mainStreamUrl?: string;
   /** "transcode" (default) or "copy" (experimental). */
@@ -54,6 +56,18 @@ export interface PolicyEngineConfig {
   bitrateFloors: boolean;
   /** Controller addresses to pass through negotiated bitrate (hub relays). */
   hubAddresses: string[];
+}
+
+/** iOS tiles take the smallest advertised 16:9 size, 854x480 on the default ladder. */
+export const TILE_WIDTH = 854;
+
+/**
+ * Widest ask the sub serves. A wider ask is full screen and reads MAIN when
+ * granted. A tile never does, even over a 640-wide sub: decoding a 4K or 12MP
+ * HEVC main per grid tile is the cost this keeps off the grid.
+ */
+export function subServesUpTo(subWidth?: number): number {
+  return Math.max(TILE_WIDTH, subWidth ?? 0);
 }
 
 /**
@@ -88,17 +102,19 @@ export class SessionPolicyEngine {
       controllerAddress: request.controllerAddress,
     };
 
-    // Apply cap (WiFi safety, ARGUS_LIVE_CAP default 854)
-    const capWidth = Math.min(request.width, this.config.capWidth);
-    const capHeight = Math.min(request.height, Math.round((this.config.capWidth / 16) * 9));
-
-    // Source selection: check PRE-CAP ask to detect full-screen intent
-    // (1.3.15 fix: requestedWidth > 640, not post-cap width)
-    const fullScreenAsk = request.width > 640;
+    // Source selection reads the PRE-CAP ask (1.3.15 fix)
+    const subLimit = subServesUpTo(this.config.subWidth);
+    const fullScreenAsk = request.width > subLimit;
     const canUseMain = this.config.videoMode === "transcode" && this.config.mainStreamUrl !== undefined;
     const useMain = canUseMain && fullScreenAsk;
     const streamUrl = useMain ? this.config.mainStreamUrl! : this.config.subStreamUrl;
     const tier: "main" | "sub" = useMain ? "main" : "sub";
+
+    // ARGUS_LIVE_CAP bounds sub encodes only; MAIN encodes the negotiated box
+    const capWidth = useMain ? request.width : Math.min(request.width, this.config.capWidth);
+    const capHeight = useMain
+      ? request.height
+      : Math.min(request.height, Math.round((this.config.capWidth / 16) * 9));
 
     // Bitrate: apply floors unless controller is a hub relay
     const isHubRelay = this.config.hubAddresses.includes(request.controllerAddress);
@@ -127,6 +143,7 @@ export class SessionPolicyEngine {
       capped: request.width !== capWidth || request.height !== capHeight,
       floored: shouldFloor && bitrateKbps !== request.bitrateKbps,
       fullScreenAsk,
+      subLimit,
       isHubRelay,
     });
 
@@ -150,7 +167,7 @@ export class SessionPolicyEngine {
   private buildReasoning(
     intent: SessionIntent,
     policy: SessionPolicy,
-    meta: { capped: boolean; floored: boolean; fullScreenAsk: boolean; isHubRelay: boolean },
+    meta: { capped: boolean; floored: boolean; fullScreenAsk: boolean; subLimit: number; isHubRelay: boolean },
   ): string {
     const parts: string[] = [];
 
@@ -165,15 +182,14 @@ export class SessionPolicyEngine {
     }
 
     // Source selection
+    const asked = `${intent.requested.width}x${intent.requested.height}`;
     if (policy.source.tier === "main") {
-      parts.push(
-        `source: MAIN (asked ${intent.requested.width}x${intent.requested.height} = full-screen)`
-      );
+      parts.push(`source: MAIN (asked ${asked}, wider than ${meta.subLimit} = full-screen)`);
     } else {
       parts.push(
         meta.fullScreenAsk
           ? `source: sub (full-screen ask but no main grant)`
-          : `source: sub (tile ask)`
+          : `source: sub (asked ${asked}, ${meta.subLimit} wide or less = tile)`
       );
     }
 

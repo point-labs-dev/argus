@@ -132,8 +132,8 @@ export function redactFfmpegArgsForLog(args: readonly string[]): string {
 export interface LiveFfmpegInput {
   /**
    * go2rtc local restream, e.g. rtsp://127.0.0.1:8554/backyard-left-sub.
-   * Full-screen transcode sessions (ask >640 wide) get the camera's MAIN
-   * restream instead — the sub has no pixels above 640 (see planLiveSession).
+   * Full-screen transcode sessions (ask wider than the sub and the 854 tile)
+   * get the camera's MAIN restream instead (see SessionPolicyEngine.plan).
    */
   inputUrl: string;
   targetAddress: string;
@@ -509,20 +509,20 @@ export interface StreamingDelegateOptions {
   videoMode?: "copy" | "transcode";
   /**
    * go2rtc restream of the camera's full-res MAIN stream. When set, transcode
-   * sessions whose ASK is above the tile tier (>640 wide) source from it, even
-   * when ARGUS_LIVE_CAP lowers the encode below 720p — upscaling the ≤640-wide
-   * sub is why full-screen looked the same as the tile. Tiles stay on the sub:
-   * cheaper to decode, and its 1s keyframes start faster than untuned mains'
-   * 4s (run scripts/tune-substreams.mjs --apply to pin standalone mains at
-   * gop=1 so main-sourced sessions start inside the 1s budget).
+   * sessions whose ASK is wider than the sub and the 854 tile source from it
+   * and encode the negotiated box (ARGUS_LIVE_CAP bounds sub sessions only).
+   * Tiles stay on the sub: cheaper to decode, and its 1s keyframes start
+   * faster than untuned mains' 4s (run scripts/tune-substreams.mjs --apply to
+   * pin standalone mains at gop=1 so main-sourced sessions start inside the
+   * 1s budget).
    */
   mainStreamUrl?: string;
   /**
-   * The live source's native resolution (probed from a snapshot at startup).
-   * Used by COPY mode only, where it is the single advertised size — what
-   * arrives IS this stream, so the advertisement must match. Transcode mode
-   * ignores it: Apple clients only ever negotiate their own standard ladder
-   * (measured 2026-06-11 — non-standard sizes are dead weight).
+   * The live (sub) source's native resolution, probed from a snapshot at
+   * startup. COPY mode advertises it as the single size — what arrives IS
+   * this stream, so the advertisement must match. Transcode mode never
+   * advertises it (Apple clients only negotiate their own standard ladder,
+   * measured 2026-06-11) and reads its width as the widest ask the sub serves.
    */
   liveResolution?: { width: number; height: number };
   /**
@@ -613,6 +613,7 @@ export class ArgusStreamingDelegate implements CameraStreamingDelegate {
       bitrateFloors,
       hubAddresses,
       ...(this.mainStreamUrl !== undefined && { mainStreamUrl: this.mainStreamUrl }),
+      ...(options.liveResolution && { subWidth: options.liveResolution.width }),
     };
     this.policyEngine = new SessionPolicyEngine(policyConfig);
   }
@@ -1190,9 +1191,12 @@ export function buildCameraControllerOptions(
   // Transcode mode advertises Apple-ladder sizes only: the probed 896-wide
   // sizes were advertised for a day and never once negotiated (2026-06-12).
   //
-  // The default 16:9 ladder is 854x480 alone:
-  // - Nothing above it. MacBook Home negotiating 1280x720@30 over WiFi ended in
-  //   "No Response" after a ~30s spinner despite a healthy encode (2026-10-02).
+  // The default 16:9 ladder is 1920x1080, 1280x720 and 854x480:
+  // - Full screen asks 1280x720 or 1920x1080 and reads the main (session-policy).
+  //   A MacBook's 1280x720@30 over WiFi ended in "No Response" after a ~30s
+  //   spinner (2026-10-02); without ARGUS_LIVE_MAIN_SOURCE those asks get the
+  //   sub capped at ARGUS_LIVE_CAP.
+  // - Tiles take the smallest size, 854x480, and read the sub.
   // - No 640. iOS takes an offered 640x360 for the tile, reuses that session for
   //   full screen, and does not reconfigure, so full screen stays a 640-wide sub
   //   picture (2026-06-11). Measured again on the Mini on 2026-11-19: every
@@ -1200,17 +1204,16 @@ export function buildCameraControllerOptions(
   //
   // ARGUS_LIVE_LADDER:
   // - "hires": [1920x1080, 1280x720] only
-  // - default: [854x480] (June Garage Door working resolution)
+  // - default: [1920x1080, 1280x720, 854x480]
   // - "compat": full ladder [1920x1080 down to 320x240], including 640x480 and
   //   640x360 for clients that refuse the default
   const hiResSet: [number, number, number][] = [
     [1920, 1080, 30],
     [1280, 720, 30],
   ];
-  const wifiSet: [number, number, number][] = [[854, 480, 30]];
+  const defaultSet: [number, number, number][] = [...hiResSet, [854, 480, 30]];
   const compatSet: [number, number, number][] = [
-    ...hiResSet,
-    ...wifiSet,
+    ...defaultSet,
     [640, 480, 30],
     [640, 360, 30],
     [480, 270, 30],
@@ -1226,7 +1229,7 @@ export function buildCameraControllerOptions(
           ? hiResSet
           : process.env.ARGUS_LIVE_LADDER === "compat"
             ? compatSet
-            : wifiSet;  // Default to WiFi-friendly caps (Oct 2026+)
+            : defaultSet;
 
   return {
     cameraStreamCount: 2, // allow two concurrent viewers

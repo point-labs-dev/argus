@@ -160,7 +160,7 @@ describe("firmware census", () => {
     const directory = mkdtempSync(join(tmpdir(), "argus-census-rename-"));
     const before = join(directory, "before.ts");
     const after = join(directory, "after.ts");
-    const renamed = source.replaceAll("wifiSet", "lanSet");
+    const renamed = source.replaceAll("defaultSet", "lanSet");
     writeFileSync(before, source);
     writeFileSync(after, renamed);
     expect(renamed).toContain("lanSet");

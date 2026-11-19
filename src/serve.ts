@@ -13,6 +13,7 @@ import { loadArgusConfig, type ArgusConfig, type CameraConfig } from "./config.j
 import { buildGo2RtcStreamNames } from "./go2rtc.js";
 import { startGo2Rtc, type Go2RtcSupervisor } from "./go2rtc-supervisor.js";
 import { createCameraAccessory, getHapBindAddress } from "./homekit.js";
+import { subServesUpTo } from "./homekit/session-policy.js";
 import { MotionMonitor, writeMotionPollError, type MotionEdge } from "./motion.js";
 import { parseJpegDimensions, SnapshotCache } from "./snapshot-cache.js";
 import { emitTelemetry } from "./telemetry.js";
@@ -142,8 +143,9 @@ export async function startArgusServer(
       // (needs the probed resolution; macOS Home kills mismatched copy sessions).
       const videoMode =
         process.env.ARGUS_LIVE_COPY === "1" && liveResolution ? "copy" : "transcode";
+      const fullScreenSource = mainStreamUrl ? `main above ${subServesUpTo(liveResolution?.width)} wide` : "sub";
       process.stdout.write(
-        `[argus ${camera.name}] live mode: ${videoMode}${videoMode === "transcode" ? ` (≥720p source: ${mainStreamUrl ? "main" : "sub"})` : ""}\n`,
+        `[argus ${camera.name}] live mode: ${videoMode}${videoMode === "transcode" ? ` (full-screen source: ${fullScreenSource})` : ""}\n`,
       );
       const { accessory, setMotion } = createCameraAccessory(camera, liveUrl, mainUrl, cache, {
         includeAudio,
