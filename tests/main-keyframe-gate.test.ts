@@ -18,6 +18,7 @@ const RATE = 20;
 const OUTPUT_FPS = 30;
 const GOP_SECONDS = 2;
 const GOP_FRAMES = RATE * GOP_SECONDS;
+const NVR_GOP_SECONDS = 4;
 const CLEAN_SAT = 80;
 
 function input(options: {
@@ -242,6 +243,8 @@ describe("MAIN keyframe gate pictures", () => {
   let gated: FrameStats;
   let onKeyUngated: FrameStats;
   let onKeyGated: FrameStats;
+  let nvrUngated: FrameStats;
+  let nvrGated: FrameStats;
   let sub: FrameStats;
   let encodedSats: number[] = [];
   let encodedFrames: string[] = [];
@@ -256,14 +259,21 @@ describe("MAIN keyframe gate pictures", () => {
     const midHevc = join(dir, "main-mid.hevc");
     const midH264 = join(dir, "sub-mid.h264");
     const onKey = join(dir, "main.mp4");
+    const nvr = join(dir, "nvr.hevc");
+    const midNvr = join(dir, "nvr-mid.hevc");
     const encoded = join(dir, "delivered.ts");
-    run("ffmpeg", [
-      "-y", "-hide_banner", "-loglevel", "error",
-      "-f", "lavfi", "-i", `testsrc2=size=640x360:rate=${RATE}:duration=5`,
-      "-c:v", "libx265", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
-      "-x265-params", `keyint=${GOP_FRAMES}:min-keyint=${GOP_FRAMES}:scenecut=0:bframes=0:open-gop=0:repeat-headers=1`,
-      "-f", "hevc", hevc,
-    ]);
+    const hevcSource = (gopSeconds: number, file: string): void => {
+      const keyint = RATE * gopSeconds;
+      run("ffmpeg", [
+        "-y", "-hide_banner", "-loglevel", "error",
+        "-f", "lavfi", "-i", `testsrc2=size=640x360:rate=${RATE}:duration=${2 * gopSeconds + 1}`,
+        "-c:v", "libx265", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+        "-x265-params", `keyint=${keyint}:min-keyint=${keyint}:scenecut=0:bframes=0:open-gop=0:repeat-headers=1`,
+        "-f", "hevc", file,
+      ]);
+    };
+    hevcSource(GOP_SECONDS, hevc);
+    hevcSource(NVR_GOP_SECONDS, nvr);
     run("ffmpeg", [
       "-y", "-hide_banner", "-loglevel", "error",
       "-f", "lavfi", "-i", `testsrc2=size=640x360:rate=${RATE}:duration=5`,
@@ -271,7 +281,10 @@ describe("MAIN keyframe gate pictures", () => {
       "-g", String(GOP_FRAMES), "-keyint_min", String(GOP_FRAMES), "-sc_threshold", "0", "-bf", "0",
       "-f", "h264", h264,
     ]);
-    writeFileSync(midHevc, sliceAfterFirstVcl(readFileSync(hevc), (buf, offset) => (buf[offset]! >> 1) & 0x3f, (type) => type <= 1 || (type >= 19 && type <= 21)));
+    const hevcType = (buf: Buffer, offset: number): number => (buf[offset]! >> 1) & 0x3f;
+    const hevcVcl = (type: number): boolean => type <= 1 || (type >= 19 && type <= 21);
+    writeFileSync(midHevc, sliceAfterFirstVcl(readFileSync(hevc), hevcType, hevcVcl));
+    writeFileSync(midNvr, sliceAfterFirstVcl(readFileSync(nvr), hevcType, hevcVcl));
     writeFileSync(midH264, sliceAfterFirstVcl(readFileSync(h264), (buf, offset) => buf[offset]! & 0x1f, (type) => type === 1 || type === 5));
     run("ffmpeg", ["-y", "-hide_banner", "-loglevel", "error", "-i", hevc, "-c", "copy", "-tag:v", "hvc1", onKey]);
 
@@ -314,6 +327,8 @@ describe("MAIN keyframe gate pictures", () => {
     gated = measure(mainHead, midHevc, mainVf);
     onKeyUngated = measure(subHead, onKey, subVf);
     onKeyGated = measure(mainHead, onKey, mainVf);
+    nvrUngated = measure(subHead, midNvr, subVf);
+    nvrGated = measure(mainHead, midNvr, mainVf);
     sub = measure(subHead, midH264, subVf);
 
     const an = mainArgs.indexOf("-an");
@@ -334,6 +349,16 @@ describe("MAIN keyframe gate pictures", () => {
   it("withholds fewer than one 2s GOP and the first MAIN frame is a real picture", () => {
     assertHeld(ungated, gated);
     assertHeld(onKeyUngated, onKeyGated);
+  });
+
+  it("withholds fewer than one 4s NVR GOP on a mid-GOP MAIN join", () => {
+    expect(nvrGated.sats[0]).toBeGreaterThanOrEqual(CLEAN_SAT);
+    expect(Math.min(...nvrGated.sats)).toBeGreaterThanOrEqual(CLEAN_SAT);
+    const dropped = nvrUngated.sats.length - nvrGated.sats.length;
+    expect(dropped).toBeGreaterThanOrEqual(0);
+    expect(dropped).toBeLessThan(RATE * NVR_GOP_SECONDS);
+    expect(nvrGated.pts[0]).toBeGreaterThan(GOP_SECONDS);
+    expect(nvrGated.pts[0]).toBeLessThanOrEqual(NVR_GOP_SECONDS);
   });
 
   it("leaves an H.264 mid-GOP sub picture clean from the first frame", () => {

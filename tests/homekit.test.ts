@@ -316,9 +316,7 @@ describe("buildCameraControllerOptions", () => {
     }
     expect(streaming.supportedCryptoSuites).toContain(0);
     const resolutions = opts.streamingOptions.video.resolutions.map((r) => `${r[0]}x${r[1]}`);
-    // Default WiFi-friendly ladder (Oct 2026+): cap at 854x480 for MacBook accept
-    expect(resolutions).toContain("854x480");
-    expect(resolutions).toContain("640x480");
+    expect(resolutions).toEqual(["854x480"]);
     // Advertise both AAC-ELD (Apple's preference) and Opus
     expect(opts.streamingOptions.audio?.codecs).toHaveLength(2);
     expect(opts.streamingOptions.audio?.codecs?.[0]?.type).toBe("AAC-eld");
@@ -350,10 +348,9 @@ describe("buildCameraControllerOptions", () => {
     const opts = buildCameraControllerOptions(delegate, true, undefined, { width: 896, height: 672 }, "transcode");
 
     const resolutions = opts.streamingOptions.video.resolutions.map((r) => `${r[0]}x${r[1]}`);
-    // Oct 2026 field evidence: MacBook Home negotiating 1280x720@30 → "No Response"
-    // after 30s despite healthy encode. June working (c5b368c): cap 640x480/854x480.
-    // Default "wifi" ladder avoids high-res that MacBook accept can't handle over WiFi.
-    expect(resolutions).toEqual(["854x480", "640x480", "640x360"]);
+    // 1280x720 on a MacBook over WiFi ended in "No Response" (2026-10-02). An
+    // offered 640x360 is reused for full screen with no RECONFIGURE (2026-11-19).
+    expect(resolutions).toEqual(["854x480"]);
     // Non-standard probed sizes are dead weight — never advertised.
     expect(resolutions).not.toContain("896x672");
   });
@@ -364,9 +361,15 @@ describe("buildCameraControllerOptions", () => {
     try {
       const opts = buildCameraControllerOptions(delegate, true, undefined, undefined, "transcode");
       const resolutions = opts.streamingOptions.video.resolutions.map((r) => `${r[0]}x${r[1]}`);
-      expect(resolutions).toContain("1920x1080");
-      expect(resolutions).toContain("640x360");
-      expect(resolutions).toContain("320x240");
+      expect(resolutions).toEqual([
+        "1920x1080",
+        "1280x720",
+        "854x480",
+        "640x480",
+        "640x360",
+        "480x270",
+        "320x240",
+      ]);
     } finally {
       delete process.env.ARGUS_LIVE_LADDER;
     }
@@ -605,6 +608,41 @@ describe("ArgusStreamingDelegate", () => {
     expect(secondArgs).toContain("select=if(eq(key\\,1)\\,st(1\\,1)\\,ld(1))");
     expect(secondArgs).toContain("scale=854:480:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=854:480");
     stopSession(delegate, "s6");
+  });
+
+  it("respawns on MAIN and logs the 1920x1080 RECONFIGURE", async () => {
+    const lines: string[] = [];
+    const spy = vi.spyOn(process.stderr, "write").mockImplementation((chunk) => {
+      lines.push(String(chunk));
+      return true;
+    });
+    const spawnFn = vi.fn(() => Object.assign(new EventEmitter(), { kill: vi.fn() })) as unknown as typeof import("node:child_process").spawn;
+    const delegate = new ArgusStreamingDelegate(
+      "Backyard Left",
+      "rtsp://127.0.0.1:8554/backyard-left-sub",
+      cacheWith(Buffer.from([0xff, 0xd8])),
+      { aspect: "16:9", spawnFn, mainStreamUrl: "rtsp://127.0.0.1:8554/backyard-left" },
+    );
+    try {
+      await prepareAndStart(delegate, "s7", { width: 640, height: 360, max_bit_rate: 132 });
+      await new Promise<void>((resolve, reject) => {
+        delegate.handleStreamRequest(
+          { type: "reconfigure", sessionID: "s7",
+            video: { width: 1920, height: 1080, fps: 30, max_bit_rate: 3000, rtcp_interval: 0.5 } } as never,
+          (error) => (error ? reject(error) : resolve()),
+        );
+      });
+
+      expect(spawnFn).toHaveBeenCalledTimes(2);
+      const respawn = (spawnFn as unknown as { mock: { calls: [string, string[]][] } }).mock.calls[1]![1].join(" ");
+      expect(respawn).toContain("-i rtsp://127.0.0.1:8554/backyard-left ");
+      const reconfigure = lines.find((line) => line.includes("HomeKit reconfigure"));
+      expect(reconfigure).toBeDefined();
+      expect(reconfigure).toContain("1920x1080");
+      stopSession(delegate, "s7");
+    } finally {
+      spy.mockRestore();
+    }
   });
 
   it("does not stop ffmpeg during 40s of silence after one RTCP packet", async () => {

@@ -17,7 +17,9 @@ import {
 } from "../src/homekit.js";
 import { prepareAnswer } from "../src/homekit/prepare-answer.js";
 import { SessionStateMachine } from "../src/homekit/session-state-machine.js";
+import { cameraLiveSources } from "../src/serve.js";
 import { SnapshotCache } from "../src/snapshot-cache.js";
+import { MAIN_KEYFRAME_GATE } from "../src/video-filter.js";
 
 function configBody(aspect?: string, name = "Garage Door") {
   const camera: Record<string, unknown> = {
@@ -209,7 +211,7 @@ describe("HAP setup contract", () => {
     const ladder = buildCameraControllerOptions(delegate).streamingOptions.video.resolutions.map(
       (row) => `${row[0]}x${row[1]}`,
     );
-    expect(ladder).toEqual(["854x480", "640x480", "640x360"]);
+    expect(ladder).toEqual(["854x480"]);
     await new Promise<void>((resolve, reject) => {
       delegate.prepareStream(streamRequest("front-l-wire"), (error) => (error ? reject(error) : resolve()));
     });
@@ -232,12 +234,62 @@ describe("HAP setup contract", () => {
     delegate.handleStreamRequest({ type: "stop", sessionID: "front-l-wire" } as never, () => {});
   });
 
+  it("sources MAIN for a full-screen START on an NVR channel that shares its host", async () => {
+    const config = parseArgusConfig({
+      ...configBody("16:9"),
+      cameras: ["Front L", "Front R"].map((name, index) => ({
+        name,
+        aspect: "16:9",
+        host: "10.0.0.13",
+        channel: 2 + index,
+        mainCodec: "h265",
+        username: "admin",
+        password: "x",
+        transport: "auto",
+        streams: { main: "main", sub: "sub" },
+      })),
+    });
+    const frontR = config.cameras[1];
+    if (!frontR) throw new Error("missing Front R");
+    expect(cameraLiveSources(config.cameras, 1, {}).mainStreamUrl).toBeUndefined();
+    const sources = cameraLiveSources(config.cameras, 1, { ARGUS_LIVE_MAIN_SOURCE: "1" });
+    expect(sources.liveUrl).toBe("rtsp://127.0.0.1:8554/front-r-sub");
+    expect(sources.mainStreamUrl).toBe("rtsp://127.0.0.1:8554/front-r");
+
+    const spawnFn = vi.fn(() => Object.assign(new EventEmitter(), { kill: vi.fn() }));
+    const { delegate } = createCameraAccessory(frontR, sources.liveUrl, sources.mainUrl, cache(), {
+      spawnFn: spawnFn as never,
+      verbose: false,
+      ...(sources.mainStreamUrl ? { mainStreamUrl: sources.mainStreamUrl } : {}),
+    });
+    await new Promise<void>((resolve, reject) => {
+      delegate.prepareStream(streamRequest("front-r-main"), (error) => (error ? reject(error) : resolve()));
+    });
+    await new Promise<void>((resolve, reject) => {
+      delegate.handleStreamRequest(
+        {
+          type: "start",
+          sessionID: "front-r-main",
+          video: { pt: 99, max_bit_rate: 299, fps: 30, mtu: 1378, profile: 0, level: 2, width: 854, height: 480 },
+          audio: { pt: 110, sample_rate: 24, max_bit_rate: 24, codec: AudioStreamingCodecType.AAC_ELD },
+        } as never,
+        (error) => (error ? reject(error) : resolve()),
+      );
+    });
+    const args = (spawnFn as unknown as { mock: { calls: [string, string[]][] } }).mock.calls[0]?.[1];
+    if (!args) throw new Error("ffmpeg was not spawned");
+    expect(args.join(" ")).toContain("-i rtsp://127.0.0.1:8554/front-r ");
+    expect(args[args.indexOf("-vf") + 1]).toContain(MAIN_KEYFRAME_GATE);
+    expect(args.join(" ")).toContain("-b:v 600k");
+    delegate.handleStreamRequest({ type: "stop", sessionID: "front-r-main" } as never, () => {});
+  });
+
   it("advertises from aspect, not from the camera name", () => {
     const wideGarage = new ArgusStreamingDelegate("Garage Door", "rtsp://x", cache(), { aspect: "16:9" });
     const wide = buildCameraControllerOptions(wideGarage).streamingOptions.video.resolutions.map(
       (row) => `${row[0]}x${row[1]}`,
     );
-    expect(wide).toEqual(["854x480", "640x480", "640x360"]);
+    expect(wide).toEqual(["854x480"]);
 
     const squareLeft = new ArgusStreamingDelegate("Backyard Left", "rtsp://x", cache(), { aspect: "4:3" });
     expect(buildCameraControllerOptions(squareLeft).streamingOptions.video.resolutions).toEqual([[640, 480, 30]]);
