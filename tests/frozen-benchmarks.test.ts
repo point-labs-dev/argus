@@ -43,7 +43,7 @@ const FROZEN_HEAD = [
   metric("live_first_frame_p50", "1281ms", "1281ms", "0ms", "<=650ms", fixtureSha),
   metric("live_first_frame_p95", "4265ms", "4265ms", "0ms", "<=2100ms", fixtureSha),
   metric("live_starts_over_2_5s", "28.4%", "28.4%", "0.05%", "<5%", fixtureSha),
-  metric("live_picture_height", "480p", "480p", "0p", ">=720p", liveSha),
+  metric("live_picture_height", "1080p", "480p", "0p", ">=720p", liveSha),
   `recording_picture current="1080p30 H.264 Baseline L4.0 2Mbps" baseline="1080p30 H.264 Baseline L4.0 2Mbps" tolerance=not-worse target="beyond 1080p30 H.264 Baseline 2Mbps" source=fixture measured_sha=${recordingSha} gate=ok`,
 ].join("\n");
 
@@ -96,7 +96,7 @@ function span(eventStart: string, eventEnd: string, key: "streamId" | "sessionId
 function expectLiveSsim(line: string | undefined): void {
   expect(line).toMatch(
     new RegExp(
-      `^live_ssim current=0\\.981368 baseline=0\\.981368 tolerance=0\\.002 target=([0-9]+\\.[0-9]{6})@1280x720 source=fixture measured_sha=${liveSha} gate=ok$`,
+      `^live_ssim current=0\\.993999 baseline=0\\.981368 tolerance=0\\.002 target=([0-9]+\\.[0-9]{6})@1280x720 source=fixture measured_sha=${liveSha} gate=ok$`,
     ),
   );
   const target = Number(line?.match(/target=([0-9.]+)@1280x720/)?.[1]);

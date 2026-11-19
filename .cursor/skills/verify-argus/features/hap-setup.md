@@ -9,6 +9,7 @@ The local contract checks a prepareStream answer: the response echoes the contro
 - `hap-double` checks that a second prepareStream does not answer again.
 - `hap-filter` checks the crop filter for `4:3` and the pad filter for `16:9`.
 - `hap-wire` checks that `createCameraAccessory` passes the parsed aspect into the crop.
+- `hap-source` checks that an NVR channel with an 896-wide sub reads MAIN for a 1920x1080 START, encoded at 1920x1080, and reads the sub for an 854x480 tile START.
 
 ## How to get to it (user POV)
 

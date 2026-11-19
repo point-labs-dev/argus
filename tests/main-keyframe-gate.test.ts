@@ -13,11 +13,13 @@ import {
   type LiveFfmpegInput,
 } from "../src/homekit.js";
 import { buildAspectScaleFilter, MAIN_KEYFRAME_GATE } from "../src/video-filter.js";
+import { sliceAfterFirstVcl } from "./helpers/annexb.js";
 
 const RATE = 20;
 const OUTPUT_FPS = 30;
 const GOP_SECONDS = 2;
 const GOP_FRAMES = RATE * GOP_SECONDS;
+const NVR_GOP_SECONDS = 4;
 const CLEAN_SAT = 80;
 
 function input(options: {
@@ -88,7 +90,7 @@ describe("MAIN keyframe gate", () => {
     const copy = buildLiveFfmpegArgs(input({ tier: "main", videoMode: "copy" }));
     expect(copy.join(" ")).not.toContain("select=");
     expect(copy).not.toContain("-vf");
-    expect(ARGUS_FIRMWARE_REVISION).toBe("1.3.16");
+    expect(ARGUS_FIRMWARE_REVISION).toBe("1.3.17");
   });
 
   it("adds the gate for MAIN and removes it when the session returns to the sub", async () => {
@@ -183,38 +185,6 @@ function frameStats(text: string): FrameStats {
   };
 }
 
-function nalStarts(buf: Buffer): number[] {
-  const starts: number[] = [];
-  for (let i = 0; i < buf.length - 3; i += 1) {
-    if (buf[i] === 0 && buf[i + 1] === 0 && buf[i + 2] === 1) {
-      starts.push(i > 0 && buf[i - 1] === 0 ? i - 1 : i);
-      i += 2;
-    }
-  }
-  starts.push(buf.length);
-  return starts;
-}
-
-function sliceAfterFirstVcl(buf: Buffer, nalType: (buf: Buffer, offset: number) => number, isVcl: (type: number) => boolean): Buffer {
-  const starts = nalStarts(buf);
-  const nals = [];
-  for (let i = 0; i < starts.length - 1; i += 1) {
-    const start = starts[i]!;
-    const end = starts[i + 1]!;
-    let offset = start;
-    while (offset < end && buf[offset] === 0) offset += 1;
-    if (buf[offset] === 1) offset += 1;
-    nals.push({ start, end, type: nalType(buf, offset) });
-  }
-  const vcl = nals.filter((nal) => isVcl(nal.type));
-  const first = vcl[0];
-  const second = vcl[1];
-  if (!first || !second) throw new Error("bitstream has fewer than two video frames");
-  const parts = nals.filter((nal) => nal.start < first.start).map((nal) => buf.subarray(nal.start, nal.end));
-  parts.push(buf.subarray(second.start));
-  return Buffer.concat(parts);
-}
-
 function assertHeld(ungated: FrameStats, gated: FrameStats): void {
   expect(gated.sats.length).toBeGreaterThan(ungated.sats.length / 2);
   expect(gated.sats[0]).toBeGreaterThanOrEqual(CLEAN_SAT);
@@ -240,8 +210,13 @@ describe("MAIN keyframe gate pictures", () => {
   const dir = mkdtempSync(join(tmpdir(), "argus-gray-"));
   let ungated: FrameStats;
   let gated: FrameStats;
+  let allUngated: FrameStats;
+  let allGated: FrameStats;
   let onKeyUngated: FrameStats;
   let onKeyGated: FrameStats;
+  let nvrGated: FrameStats;
+  let nvrAllUngated: FrameStats;
+  let nvrAllGated: FrameStats;
   let sub: FrameStats;
   let encodedSats: number[] = [];
   let encodedFrames: string[] = [];
@@ -256,14 +231,21 @@ describe("MAIN keyframe gate pictures", () => {
     const midHevc = join(dir, "main-mid.hevc");
     const midH264 = join(dir, "sub-mid.h264");
     const onKey = join(dir, "main.mp4");
+    const nvr = join(dir, "nvr.hevc");
+    const midNvr = join(dir, "nvr-mid.hevc");
     const encoded = join(dir, "delivered.ts");
-    run("ffmpeg", [
-      "-y", "-hide_banner", "-loglevel", "error",
-      "-f", "lavfi", "-i", `testsrc2=size=640x360:rate=${RATE}:duration=5`,
-      "-c:v", "libx265", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
-      "-x265-params", `keyint=${GOP_FRAMES}:min-keyint=${GOP_FRAMES}:scenecut=0:bframes=0:open-gop=0:repeat-headers=1`,
-      "-f", "hevc", hevc,
-    ]);
+    const hevcSource = (gopSeconds: number, file: string): void => {
+      const keyint = RATE * gopSeconds;
+      run("ffmpeg", [
+        "-y", "-hide_banner", "-loglevel", "error",
+        "-f", "lavfi", "-i", `testsrc2=size=640x360:rate=${RATE}:duration=${2 * gopSeconds + 1}`,
+        "-c:v", "libx265", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+        "-x265-params", `keyint=${keyint}:min-keyint=${keyint}:scenecut=0:bframes=0:open-gop=0:repeat-headers=1`,
+        "-f", "hevc", file,
+      ]);
+    };
+    hevcSource(GOP_SECONDS, hevc);
+    hevcSource(NVR_GOP_SECONDS, nvr);
     run("ffmpeg", [
       "-y", "-hide_banner", "-loglevel", "error",
       "-f", "lavfi", "-i", `testsrc2=size=640x360:rate=${RATE}:duration=5`,
@@ -271,8 +253,9 @@ describe("MAIN keyframe gate pictures", () => {
       "-g", String(GOP_FRAMES), "-keyint_min", String(GOP_FRAMES), "-sc_threshold", "0", "-bf", "0",
       "-f", "h264", h264,
     ]);
-    writeFileSync(midHevc, sliceAfterFirstVcl(readFileSync(hevc), (buf, offset) => (buf[offset]! >> 1) & 0x3f, (type) => type <= 1 || (type >= 19 && type <= 21)));
-    writeFileSync(midH264, sliceAfterFirstVcl(readFileSync(h264), (buf, offset) => buf[offset]! & 0x1f, (type) => type === 1 || type === 5));
+    writeFileSync(midHevc, sliceAfterFirstVcl(readFileSync(hevc), "hevc"));
+    writeFileSync(midNvr, sliceAfterFirstVcl(readFileSync(nvr), "hevc"));
+    writeFileSync(midH264, sliceAfterFirstVcl(readFileSync(h264), "h264"));
     run("ffmpeg", ["-y", "-hide_banner", "-loglevel", "error", "-i", hevc, "-c", "copy", "-tag:v", "hvc1", onKey]);
 
     const mainArgs = buildLiveFfmpegArgs(input({ tier: "main" }));
@@ -310,10 +293,19 @@ describe("MAIN keyframe gate pictures", () => {
       }
       return stats;
     };
+    // ffmpeg 8 withholds the pictures before the first HEVC keyframe in the
+    // decoder; ffmpeg 6 and 7 emit them. +showall makes every version emit
+    // them, so these runs see what the gate itself drops.
+    const everyPicture = (head: string[]): string[] => [...head, "-flags2", "+showall"];
     ungated = measure(subHead, midHevc, subVf);
     gated = measure(mainHead, midHevc, mainVf);
+    allUngated = measure(everyPicture(subHead), midHevc, subVf);
+    allGated = measure(everyPicture(mainHead), midHevc, mainVf);
     onKeyUngated = measure(subHead, onKey, subVf);
     onKeyGated = measure(mainHead, onKey, mainVf);
+    nvrGated = measure(mainHead, midNvr, mainVf);
+    nvrAllUngated = measure(everyPicture(subHead), midNvr, subVf);
+    nvrAllGated = measure(everyPicture(mainHead), midNvr, mainVf);
     sub = measure(subHead, midH264, subVf);
 
     const an = mainArgs.indexOf("-an");
@@ -334,6 +326,24 @@ describe("MAIN keyframe gate pictures", () => {
   it("withholds fewer than one 2s GOP and the first MAIN frame is a real picture", () => {
     assertHeld(ungated, gated);
     assertHeld(onKeyUngated, onKeyGated);
+  });
+
+  it("drops every picture before the first keyframe when the decoder emits them", () => {
+    expect(allUngated.pts[0]).toBe(0);
+    expect(allGated.sats.length).toBeLessThan(allUngated.sats.length);
+    expect(allGated.pts[0]).toBeGreaterThan(0);
+    expect(allGated.pts[0]).toBeLessThanOrEqual(GOP_SECONDS);
+    expect(allGated.sats[0]).toBeGreaterThanOrEqual(CLEAN_SAT);
+    expect(Math.min(...allGated.sats)).toBeGreaterThanOrEqual(CLEAN_SAT);
+  });
+
+  it("withholds fewer than one 4s NVR GOP on a mid-GOP MAIN join", () => {
+    expect(nvrAllUngated.pts[0]).toBe(0);
+    expect(nvrAllGated.pts[0]).toBeGreaterThan(GOP_SECONDS);
+    expect(nvrAllGated.pts[0]).toBeLessThanOrEqual(NVR_GOP_SECONDS);
+    expect(Math.min(...nvrAllGated.sats)).toBeGreaterThanOrEqual(CLEAN_SAT);
+    expect(nvrGated.sats[0]).toBeGreaterThanOrEqual(CLEAN_SAT);
+    expect(Math.min(...nvrGated.sats)).toBeGreaterThanOrEqual(CLEAN_SAT);
   });
 
   it("leaves an H.264 mid-GOP sub picture clean from the first frame", () => {
