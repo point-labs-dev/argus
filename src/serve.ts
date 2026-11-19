@@ -9,7 +9,7 @@ import { Categories, HAPStorage } from "hap-nodejs";
 
 import { formatError } from "./cli.js";
 import { warnShortPasswords } from "./reolink.js";
-import { loadArgusConfig, type ArgusConfig } from "./config.js";
+import { loadArgusConfig, type ArgusConfig, type CameraConfig } from "./config.js";
 import { buildGo2RtcStreamNames } from "./go2rtc.js";
 import { startGo2Rtc, type Go2RtcSupervisor } from "./go2rtc-supervisor.js";
 import { createCameraAccessory, getHapBindAddress } from "./homekit.js";
@@ -25,6 +25,33 @@ function macFromName(name: string): string {
   const bytes = [...createHash("sha256").update(`argus:camera:${name}`).digest().subarray(0, 6)];
   bytes[0] = (bytes[0]! & 0xfe) | 0x02; // locally administered, unicast
   return bytes.map((b) => b.toString(16).padStart(2, "0").toUpperCase()).join(":");
+}
+
+export interface CameraLiveSources {
+  liveUrl: string;
+  mainUrl: string;
+  mainStreamUrl?: string;
+}
+
+/**
+ * go2rtc restreams for camera `index`. The sub feeds live view. The main feeds
+ * HKSV recording and, with ARGUS_LIVE_MAIN_SOURCE=1, full-screen live view on
+ * every camera. NVR channels are included: the NVR pins main and sub at the same
+ * 4s GOP, and the MAIN keyframe gate ends the wait at the first keyframe, so the
+ * keyframe wait on the main matches the sub it replaces.
+ */
+export function cameraLiveSources(
+  cameras: readonly CameraConfig[],
+  index: number,
+  env: NodeJS.ProcessEnv = process.env,
+): CameraLiveSources {
+  const names = buildGo2RtcStreamNames(cameras)[index];
+  if (!names) throw new Error(`No camera at index ${index}`);
+  const liveUrl = `${RTSP_RESTREAM_BASE}/${names.sub}`;
+  const mainUrl = `${RTSP_RESTREAM_BASE}/${names.main}`;
+  return env.ARGUS_LIVE_MAIN_SOURCE === "1"
+    ? { liveUrl, mainUrl, mainStreamUrl: mainUrl }
+    : { liveUrl, mainUrl };
 }
 
 export interface ArgusServer {
@@ -95,7 +122,6 @@ export async function startArgusServer(
       }),
     );
 
-    const streamNames = buildGo2RtcStreamNames(config.cameras);
     const setMotionByCamera = new Map<string, (detected: boolean, edge?: MotionEdge) => void>();
   
     // Get HAP bind address for interface pinning (dual-NIC safety + prepareStream addressOverride).
@@ -106,9 +132,7 @@ export async function startArgusServer(
     }
   
     config.cameras.forEach((camera, index) => {
-      const names = streamNames[index]!;
-      const liveUrl = `${RTSP_RESTREAM_BASE}/${names.sub}`; // live view = light sub stream
-      const mainUrl = `${RTSP_RESTREAM_BASE}/${names.main}`; // HKSV recording = full-res main stream
+      const { liveUrl, mainUrl, mainStreamUrl } = cameraLiveSources(config.cameras, index);
       // ARGUS_AUDIO=0 publishes video-only accessories (diagnostic isolation).
       const includeAudio = process.env.ARGUS_AUDIO !== "0";
       const liveResolution = liveResolutions.get(camera.name);
@@ -118,14 +142,8 @@ export async function startArgusServer(
       // (needs the probed resolution; macOS Home kills mismatched copy sessions).
       const videoMode =
         process.env.ARGUS_LIVE_COPY === "1" && liveResolution ? "copy" : "transcode";
-      // Standalone cameras (their own host) source ≥720p live from the main stream.
-      // NVR-fronted channels don't: their mains keyframe every 4s (hard limit) and
-      // the D1200s encode 12MP HEVC — both blow the live start-time budget. Their
-      // ≥720p sessions upscale the 896-wide sub source instead.
-      const standalone = config.cameras.filter((c) => c.host === camera.host).length === 1;
-      const mainEnabled = standalone && process.env.ARGUS_LIVE_MAIN_SOURCE === "1";
       process.stdout.write(
-        `[argus ${camera.name}] live mode: ${videoMode}${videoMode === "transcode" ? ` (≥720p source: ${mainEnabled ? "main" : "sub"})` : ""}\n`,
+        `[argus ${camera.name}] live mode: ${videoMode}${videoMode === "transcode" ? ` (≥720p source: ${mainStreamUrl ? "main" : "sub"})` : ""}\n`,
       );
       const { accessory, setMotion } = createCameraAccessory(camera, liveUrl, mainUrl, cache, {
         includeAudio,
@@ -135,7 +153,7 @@ export async function startArgusServer(
         // HomeKit snapshot requests serve the full-res main-stream stills the
         // cache polls — the 640-wide sub stills read as "pixelated" on the grid.
         snapshotProfile: "main",
-        ...(standalone && process.env.ARGUS_LIVE_MAIN_SOURCE === "1" ? { mainStreamUrl: mainUrl } : {}),
+        ...(mainStreamUrl ? { mainStreamUrl } : {}),
         ...(liveResolution ? { liveResolution } : {}),
       });
       setMotionByCamera.set(camera.name, setMotion);

@@ -89,7 +89,7 @@ describe("MAIN keyframe gate", () => {
     const copy = buildLiveFfmpegArgs(input({ tier: "main", videoMode: "copy" }));
     expect(copy.join(" ")).not.toContain("select=");
     expect(copy).not.toContain("-vf");
-    expect(ARGUS_FIRMWARE_REVISION).toBe("1.3.16");
+    expect(ARGUS_FIRMWARE_REVISION).toBe("1.3.17");
   });
 
   it("adds the gate for MAIN and removes it when the session returns to the sub", async () => {

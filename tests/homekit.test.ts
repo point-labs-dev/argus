@@ -558,7 +558,7 @@ describe("ArgusStreamingDelegate", () => {
     stopSession(delegate, "s4");
   });
 
-  it("serves full-screen asks from the sub when no main grant exists (NVR channels)", async () => {
+  it("serves full-screen asks from the sub when no main grant exists", async () => {
     const spawnFn = vi.fn(() => Object.assign(new EventEmitter(), { kill: vi.fn() })) as unknown as typeof import("node:child_process").spawn;
     const delegate = new ArgusStreamingDelegate(
       "Backyard Left",
@@ -807,8 +807,8 @@ describe("ArgusStreamingDelegate", () => {
     }
   });
 
-  it("advertises firmware version 1.3.16 so controllers re-read the 4:3 ladder", () => {
-    expect(ARGUS_FIRMWARE_REVISION).toBe("1.3.16");
+  it("advertises firmware and Model 1.3.17 for the 854x480-only ladder", () => {
+    expect(ARGUS_FIRMWARE_REVISION).toBe("1.3.17");
     const config = parseArgusConfig({
       cameras: [{ name: "Garage Door", aspect: "4:3", host: "10.0.0.9", channel: 0, mainCodec: "h265",
         username: "admin", password: "x", transport: "auto", streams: { main: "main", sub: "sub" } }],
@@ -824,8 +824,8 @@ describe("ArgusStreamingDelegate", () => {
       cacheWith(Buffer.from([0xff, 0xd8])),
     );
     const info = accessory.getService(Service.AccessoryInformation)!;
-    expect(info.getCharacteristic(Characteristic.FirmwareRevision).value).toBe("1.3.16");
-    expect(info.getCharacteristic(Characteristic.Model).value).toBe("Argus 1.3.16");
+    expect(info.getCharacteristic(Characteristic.FirmwareRevision).value).toBe("1.3.17");
+    expect(info.getCharacteristic(Characteristic.Model).value).toBe("Argus 1.3.17");
   });
 
   it("prevents double-callback crash (swallows duplicate calls)", async () => {

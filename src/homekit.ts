@@ -1187,39 +1187,32 @@ export function buildCameraControllerOptions(
 ): CameraControllerOptions {
   // Copy mode advertises ONLY the probed native resolution (a negotiation/stream
   // mismatch is fatal: macOS rendered one frame and stopped the session).
-  // Transcode mode advertises HIGH RESOLUTIONS ONLY (1080p/720p). Two measured
-  // findings drive this (2026-06-11/12):
-  // - Apple clients pick exclusively from their OWN ladder and the TILE player
-  //   takes 640x360 whenever it is offered. With grid live tiles always running,
-  //   iOS then REUSES that small session for full-screen and (since the bitrate
-  //   floors) never reconfigures up — every "full screen" was an upscaled
-  //   640x360. No small sizes on offer = every session starts ≥720p, sourced
-  //   from the camera main, with no upgrade moment at all.
-  // - The probed non-standard sizes (896-wide) were advertised for a day and
-  //   never once negotiated — only Apple-ladder entries matter.
-  // 
-  // UPDATE 2026-10-02: Field evidence shows MacBook Home negotiating 1280x720@30
-  // leads to "No Response" after ~30s spinner even with healthy encode/first_frame.
-  // June working path (c5b368c) capped at 640x480 for WiFi, then Garage Door 854x480.
-  // RTCP starvation observed: one video pkt, no audio, nothing after first_frame.
-  // Theory: 720p over WiFi to MacBook exceeds accept threshold; Home kills session.
-  // 
+  // Transcode mode advertises Apple-ladder sizes only: the probed 896-wide
+  // sizes were advertised for a day and never once negotiated (2026-06-12).
+  //
+  // The default 16:9 ladder is 854x480 alone:
+  // - Nothing above it. MacBook Home negotiating 1280x720@30 over WiFi ended in
+  //   "No Response" after a ~30s spinner despite a healthy encode (2026-10-02).
+  // - No 640. iOS takes an offered 640x360 for the tile, reuses that session for
+  //   full screen, and does not reconfigure, so full screen stays a 640-wide sub
+  //   picture (2026-06-11). Measured again on the Mini on 2026-11-19: every
+  //   session since 2026-10-20 asked 640x360 or 640x480 and none reconfigured.
+  //
   // ARGUS_LIVE_LADDER:
-  // - "hires" (default pre-Oct): [1920x1080, 1280x720] only
-  // - "wifi" (default Oct+): [854x480, 640x480, 640x360] WiFi-friendly June pattern
-  // - "compat": full ladder [1920x1080 down to 320x240]
+  // - "hires": [1920x1080, 1280x720] only
+  // - default: [854x480] (June Garage Door working resolution)
+  // - "compat": full ladder [1920x1080 down to 320x240], including 640x480 and
+  //   640x360 for clients that refuse the default
   const hiResSet: [number, number, number][] = [
     [1920, 1080, 30],
     [1280, 720, 30],
   ];
-  const wifiSet: [number, number, number][] = [
-    [854, 480, 30],   // June Garage Door working resolution
-    [640, 480, 30],   // June WiFi unlock ceiling (c5b368c)
-    [640, 360, 30],
-  ];
+  const wifiSet: [number, number, number][] = [[854, 480, 30]];
   const compatSet: [number, number, number][] = [
     ...hiResSet,
     ...wifiSet,
+    [640, 480, 30],
+    [640, 360, 30],
     [480, 270, 30],
     [320, 240, 15],
   ];
@@ -1276,7 +1269,7 @@ export function buildCameraControllerOptions(
   };
 }
 
-export const ARGUS_FIRMWARE_REVISION = "1.3.16";
+export const ARGUS_FIRMWARE_REVISION = "1.3.17";
 
 export interface CameraAccessoryHandle {
   accessory: Accessory;
@@ -1303,13 +1296,12 @@ export function createCameraAccessory(
   accessory
     .getService(Service.AccessoryInformation)!
     .setCharacteristic(Characteristic.Manufacturer, "Point Labs")
-    .setCharacteristic(Characteristic.Model, "Argus 1.3.16")
+    .setCharacteristic(Characteristic.Model, `Argus ${ARGUS_FIRMWARE_REVISION}`)
     .setCharacteristic(Characteristic.SerialNumber, `argus-${camera.host}-${camera.channel}`)
     .setCharacteristic(Characteristic.FirmwareRevision, ARGUS_FIRMWARE_REVISION);
 
-  // Whether live ≥720p sessions may source the main restream is the caller's call
-  // (serve grants it to standalone cameras only — the NVR mains' 4s GOP + 12MP
-  // HEVC decode cannot meet the live start-time bar; recording still uses them).
+  // Whether full-screen sessions may source the main restream is the caller's call
+  // (serve grants it to every camera with ARGUS_LIVE_MAIN_SOURCE=1).
   const delegate = new ArgusStreamingDelegate(camera.name, liveUrl, snapshots, {
     ...options,
     aspect: camera.aspect,

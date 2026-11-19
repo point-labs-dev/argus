@@ -20,7 +20,7 @@ Acceptance criteria:
 - The next fragment still arrives about one negotiated 4000ms fragment later.
 - Each of those fragments starts on an IDR, carries H.264 and AAC, and decodes.
 - The offered fragment length stays 4000 and prebufferLength stays at least 4000.
-- Firmware stays 1.3.16. A 4:3 1920x1080 recording still uses the pad filter.
+- Firmware stays 1.3.17. A 4:3 1920x1080 recording still uses the pad filter.
 - scripts/recording-first-fragment.mjs prints n, p50, and p90 for that metric
   and nothing from the log.
 */
@@ -188,7 +188,7 @@ describe("recording first fragment", () => {
     const container = options.mediaContainerConfiguration;
     const fragmentLength = Array.isArray(container) ? container[0]?.fragmentLength : container.fragmentLength;
     expect(fragmentLength).toBe(4000);
-    expect(ARGUS_FIRMWARE_REVISION).toBe("1.3.16");
+    expect(ARGUS_FIRMWARE_REVISION).toBe("1.3.17");
     const args = buildRecordingFfmpegArgs(
       "rtsp://x/main",
       recordingConfig([1920, 1080, 30]),

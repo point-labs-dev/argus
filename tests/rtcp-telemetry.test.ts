@@ -14,7 +14,7 @@
  *    videoPackets 0, audioPackets 0, videoLastAt null, and audioLastAt null.
  * 4. The first packet on a socket still logs one "RTCP arrived" line. Later
  *    packets do not log that line again. Every packet still emits "packet".
- * 5. The abandon timer stays 900000 ms. Firmware stays 1.3.16. A counted
+ * 5. The abandon timer stays 900000 ms. Firmware stays 1.3.17. A counted
  *    packet does not stop ffmpeg. Stop still uses SIGKILL.
  * 6. scripts/rtcp-counts.mjs prints log=missing and exits 1 when the log
  *    path is absent. That output does not contain events=0. When the file
@@ -248,7 +248,7 @@ function expectLast(packets: number, lastAt: number | null): void {
 describe("RTCP after the first frame", () => {
   it("keeps the abandon timer and firmware where they are", () => {
     expect(NO_RTCP_CONSUMER_ABANDON_MS).toBe(15 * 60 * 1000);
-    expect(ARGUS_FIRMWARE_REVISION).toBe("1.3.16");
+    expect(ARGUS_FIRMWARE_REVISION).toBe("1.3.17");
   });
 
   it("logs the first packet once and emits every packet", () => {

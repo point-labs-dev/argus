@@ -393,7 +393,7 @@ fi
 | 4 | `state = running` after `cutover-launchdaemon.sh`, **or** `Could not find service` while the gui agent is still the live job | `Could not find service` here **and** in section 3 means Argus is not loaded |
 | 5 | `RunAtLoad` true, `KeepAlive` true, log paths under the repo | `ARGUS_AUDIO = 0` is video-only mode. Send the line if present |
 | 6 | One `dist/serve.js` and one `go2rtc` | No matching lines means the bridge is not running |
-| 7 | `camera_count=7` and seven name/host/channel rows; firmware line contains `1.3.16` | A count other than 7, or a missing `argus.yaml`, is the inventory mismatch |
+| 7 | `camera_count=7` and seven name/host/channel rows; firmware line contains `1.3.17` | A count other than 7, or a missing `argus.yaml`, is the inventory mismatch |
 | 8 | `stream_count=14`, `up_count=14`, every line `UP` plus codec/width/height, `stream_health_exit=0` | A `DOWN` line is that restream failing. Exit 1 is unhealthy. This is not an API call |
 | 8b | `api_streams_http=401` and `auth_check=expected` | `200` means the API is open (do not dump the body). Unreachable means go2rtc is not listening |
 | 9 | Each `*-sub` line is `jpeg` | `DOWN` or `not-jpeg` is that camera’s sub restream failing. Mains are separate rows in section 8 |
