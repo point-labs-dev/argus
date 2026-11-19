@@ -15,6 +15,7 @@ import {
 import { buildAspectScaleFilter, MAIN_KEYFRAME_GATE } from "../src/video-filter.js";
 
 const RATE = 20;
+const OUTPUT_FPS = 30;
 const GOP_SECONDS = 2;
 const GOP_FRAMES = RATE * GOP_SECONDS;
 const CLEAN_SAT = 80;
@@ -38,7 +39,7 @@ function input(options: {
       ssrc: 1,
       payloadType: 99,
       maxBitrateKbps: 600,
-      fps: 30,
+      fps: OUTPUT_FPS,
       width: options.width ?? 640,
       height: options.height ?? 360,
       mtu: 1378,
@@ -344,7 +345,15 @@ describe("MAIN keyframe gate pictures", () => {
     expect(encodedSats[0]).toBeGreaterThanOrEqual(CLEAN_SAT);
     expect(Math.min(...encodedSats)).toBeGreaterThanOrEqual(CLEAN_SAT);
     expect(encodedSats.length).toBeGreaterThan(gated.sats.length);
-    expect(encodedSats.length).toBeLessThan(ungated.sats.length * 1.2);
+    // Clean pictures only. ffmpeg 6 and 7 also emit corrupt frames before the
+    // next IRAP; those stay under CLEAN_SAT. -r OUTPUT_FPS resamples the rest
+    // from RATE, and the 1.2 slack is unchanged.
+    const realPictures = ungated.sats.filter((value) => value >= CLEAN_SAT).length;
+    const ceiling = realPictures * (OUTPUT_FPS / RATE) * 1.2;
+    expect(
+      encodedSats.length,
+      `real=${realPictures} ungated=${ungated.sats.length} gated=${gated.sats.length}`,
+    ).toBeLessThan(ceiling);
     expect(encodedFrames[0]?.startsWith("1,")).toBe(true);
     const pts = encodedFrames.map((row) => Number(row.split(",")[1]));
     const first = pts[0] ?? 0;
