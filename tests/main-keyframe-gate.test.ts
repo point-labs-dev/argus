@@ -352,13 +352,15 @@ describe("MAIN keyframe gate pictures", () => {
   });
 
   it("withholds fewer than one 4s NVR GOP on a mid-GOP MAIN join", () => {
+    // ffmpeg 8 withholds the pre-IRAP pictures in the decoder and restarts pts,
+    // so count withheld frames against the joined source, not by timestamp.
+    const joined = RATE * (2 * NVR_GOP_SECONDS + 1) - 1;
+    const clean = nvrUngated.sats.filter((value) => value >= CLEAN_SAT).length;
+    expect(joined - clean).toBeGreaterThan(RATE * GOP_SECONDS);
     expect(nvrGated.sats[0]).toBeGreaterThanOrEqual(CLEAN_SAT);
     expect(Math.min(...nvrGated.sats)).toBeGreaterThanOrEqual(CLEAN_SAT);
-    const dropped = nvrUngated.sats.length - nvrGated.sats.length;
-    expect(dropped).toBeGreaterThanOrEqual(0);
-    expect(dropped).toBeLessThan(RATE * NVR_GOP_SECONDS);
-    expect(nvrGated.pts[0]).toBeGreaterThan(GOP_SECONDS);
-    expect(nvrGated.pts[0]).toBeLessThanOrEqual(NVR_GOP_SECONDS);
+    expect(joined - nvrGated.sats.length).toBeGreaterThanOrEqual(0);
+    expect(joined - nvrGated.sats.length).toBeLessThan(RATE * NVR_GOP_SECONDS);
   });
 
   it("leaves an H.264 mid-GOP sub picture clean from the first frame", () => {
